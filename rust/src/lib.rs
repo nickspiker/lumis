@@ -1,5 +1,5 @@
 // mod debayer;
-mod calibration;
+// Calibration now comes from the `chameleon` crate (see Cargo.toml), not a local copy.
 mod image;
 mod jni_camera;
 mod jni_menu;

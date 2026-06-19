@@ -1,5 +1,6 @@
-use crate::calibration::chameleon::*;
-use crate::image::dng::RawInfo;
+use chameleon::{
+    encode_settings, get_settings, scan_target, verichrome_dir, write_settings, ImageData, RawInfo,
+};
 use crate::image::integrator::TimeBase;
 use crate::shared_memory::*;
 use crate::ui::arrows::ArrowBuffers;
@@ -116,12 +117,18 @@ pub struct UserInterface {
     // Cropped target-scan overlay (w, h, RGB bytes) from the last successful calibration.
     // When present, it replaces the calibration button as a visual "calibrated" indicator.
     pub calibration_overlay: Arc<ArcSwap<Option<(u32, u32, Vec<u8>)>>>,
-    // Full uncropped scan (w, h, RGB) to hold FULL-SCREEN after calibration until the user
-    // taps. Set by the calibration thread on success; cleared on the next touch.
-    pub calibration_hold: Arc<ArcSwap<Option<(u32, u32, Vec<u8>)>>>,
+    // scan_target's live_overlay, held over the frozen frame after calibration until the
+    // user taps: (min_x, min_y, width, height, rgba_f32). Coords are in the full-res sensor
+    // frame at 2x scale (as chameleon produces); RGBA linear 0..1. Composited in-place in
+    // the fit-to-screen render loop. Cleared on the next touch.
+    pub calibration_hold: Arc<ArcSwap<Option<(usize, usize, usize, usize, Vec<f32>)>>>,
     // Image counter snapshotted when calibration starts, so the feed freezes on that frame
     // while Chameleon computes (None = live).
     pub frozen_image_counter: Option<u64>,
+    // Snapshot of the frozen slot's image data (avg+diff interleaved like image_buffer's
+    // 2-slice layout) taken at calibration start. The camera thread keeps overwriting the
+    // live slots, so we render from this copy to truly hold the frame. Empty = no freeze.
+    pub frozen_image: Vec<u16>,
     // Tracks whether the full-screen hold was shown last frame, to force a clean repaint on
     // the frame it's dismissed.
     pub previous_hold_present: bool,
@@ -472,6 +479,7 @@ impl UserInterface {
             calibration_overlay: Arc::new(ArcSwap::from_pointee(None)),
             calibration_hold: Arc::new(ArcSwap::from_pointee(None)),
             frozen_image_counter: None,
+            frozen_image: Vec::new(),
             previous_hold_present: false,
             arrow_buffers,
             button_buffers,
@@ -640,6 +648,11 @@ impl UserInterface {
                 self.frozen_image_counter = Some(image_counter);
                 let current_slot = (image_counter & 3) as usize;
                 let pixel_count = self.sensor_x_size * self.sensor_y_size;
+                // Snapshot the frozen slot's avg+diff data so the camera thread overwriting
+                // the live slots can't change what we display while held.
+                let slot_start = (current_slot * 2) * pixel_count;
+                self.frozen_image =
+                    self.image_buffer[slot_start..slot_start + 2 * pixel_count].to_vec();
 
                 // Calculate quad rolling buffer offsets: [slot0_avg, slot0_diff, slot1_avg, slot1_diff, ...]
                 let avg_offset = (current_slot * 2) * pixel_count;
@@ -732,7 +745,14 @@ impl UserInterface {
                             &settings,
                             true,
                         ) {
-                            Some((overlaywidth, overlayheight, overlayimage, _report, _warning)) => {
+                            Some((
+                                overlaywidth,
+                                overlayheight,
+                                overlayimage,
+                                _report,
+                                _warning,
+                                live_overlay,
+                            )) => {
                                 // Write computed cam2terminal9 matrix to shared memory for live display
                                 unsafe {
                                     let magic9_ptr = magic_9_display_addr as *mut f32;
@@ -742,14 +762,12 @@ impl UserInterface {
                                     *gamma_ptr = settings.terminal9[9];
                                 }
 
-                                // Hold the full scan full-screen until the user taps...
-                                calibration_hold.store(Arc::new(Some((
-                                    overlaywidth,
-                                    overlayheight,
-                                    overlayimage.clone(),
-                                ))));
-                                // ...and keep it in the calibration button as the persistent
-                                // "calibrated" indicator.
+                                // Hold the in-place live overlay over the frozen frame until tap.
+                                if let Some(lo) = live_overlay {
+                                    calibration_hold.store(Arc::new(Some(lo)));
+                                }
+                                // Keep the cropped scan in the calibration button as the
+                                // persistent "calibrated" indicator.
                                 calibration_overlay.store(Arc::new(Some((
                                     overlaywidth,
                                     overlayheight,
@@ -762,10 +780,9 @@ impl UserInterface {
                                 );
 
                                 let data = encode_settings(&settings);
-                                if let Some(mut settingsfile) = photon_dir() {
-                                    settingsfile.push("settings.cfg");
-                                    write_settings(data, &settingsfile);
-                                }
+                                let mut settingsfile = verichrome_dir();
+                                settingsfile.push("settings.cfg");
+                                write_settings(data, &settingsfile);
                                 log::info!("Calibration completed successfully");
                             }
                             None => {
@@ -895,6 +912,7 @@ impl UserInterface {
         {
             self.calibration_hold.store(std::sync::Arc::new(None));
             self.frozen_image_counter = None;
+            self.frozen_image = Vec::new();
             draw = true;
         }
 

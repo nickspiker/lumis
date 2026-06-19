@@ -28,10 +28,10 @@ pub fn draw_screen(ui: &mut UserInterface, window: &NativeWindow, mut full_draw:
     // Check for new image by comparing counters - determines full vs partial draw
     let current_image_counter = ui.header[IMAGE_COUNTER_IDX];
 
-    // While the full-screen calibration scan is held, force full draws so it actually
-    // paints (the image counter is frozen, so the normal new-frame trigger won't fire) and
-    // so the frame it's dismissed repaints the live feed.
-    let hold_present = ui.calibration_hold.load().is_some();
+    // While the feed is frozen for calibration (and the overlay held), force full draws: the
+    // image counter is frozen so the normal new-frame trigger won't fire, and we need the
+    // frozen frame + overlay to paint, then a clean repaint on dismiss.
+    let hold_present = ui.calibration_hold.load().is_some() || ui.frozen_image_counter.is_some();
     if hold_present || ui.previous_hold_present {
         full_draw = true;
     }
@@ -193,14 +193,9 @@ fn spawn_histogram_calculation(ui: &UserInterface, image_counter: u64) {
 }
 
 fn draw_full_screen(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_Buffer) {
-    // After calibration, hold the full scan over the whole image area (controls still draw
-    // on top) until the user taps. Takes priority over histogram/camera image.
-    let hold = ui.calibration_hold.load();
-    if let Some((ow, oh, img)) = hold.as_ref() {
-        draw_fullscreen_scan(ui, pixels, buffer, *ow, *oh, img);
-    } else {
-        draw_camera_or_histogram(ui, pixels, buffer);
-    }
+    // Draw the camera image (frozen during calibration). When a calibration hold is active,
+    // the in-place live overlay is composited per-pixel inside the fit-to-screen loop.
+    draw_camera_or_histogram(ui, pixels, buffer);
 
     if ui.controls_visible {
         draw_controls(ui, pixels, buffer);
@@ -234,19 +229,26 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
             }
         }
     } else {
-        // Get current image slot from SharedMemory header. While calibration is running we
-        // freeze on the snapshotted frame so the feed holds still (the GUI stays live).
-        let image_counter = ui.frozen_image_counter.unwrap_or(ui.header[IMAGE_COUNTER_IDX]);
-        let current_slot = (image_counter & 3) as usize;
         let pixel_count = ui.sensor_x_size * ui.sensor_y_size;
 
-        // Calculate quad rolling buffer offsets: [slot0_avg, slot0_diff, slot1_avg, slot1_diff, ...]
-        let avg_offset = (current_slot * 2) * pixel_count;
-        let diff_offset = (current_slot * 2 + 1) * pixel_count;
-
-        // Slice the image buffer for current slot
-        let raw_average = &ui.image_buffer[avg_offset..avg_offset + pixel_count];
-        let raw_difference = &ui.image_buffer[diff_offset..diff_offset + pixel_count];
+        // While calibration holds the feed, render from the snapshot taken at freeze time
+        // (avg at 0, diff at pixel_count) so the camera thread can't change it. Otherwise
+        // read the current live slot.
+        let frozen = ui.frozen_image_counter.is_some() && ui.frozen_image.len() >= 2 * pixel_count;
+        let (raw_average, raw_difference) = if frozen {
+            (
+                &ui.frozen_image[0..pixel_count],
+                &ui.frozen_image[pixel_count..2 * pixel_count],
+            )
+        } else {
+            let current_slot = (ui.header[IMAGE_COUNTER_IDX] & 3) as usize;
+            let avg_offset = (current_slot * 2) * pixel_count;
+            let diff_offset = (current_slot * 2 + 1) * pixel_count;
+            (
+                &ui.image_buffer[avg_offset..avg_offset + pixel_count],
+                &ui.image_buffer[diff_offset..diff_offset + pixel_count],
+            )
+        };
 
         // Select data source based on current mode
         let current_mode = RawMode::from(ui.header[CURRENT_MODE_IDX] as u8);
@@ -369,6 +371,12 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
                 }
             }
         } else {
+            // In-place calibration overlay (live_overlay): held until tap, composited per
+            // sensor pixel below. (min_x, min_y, ov_w, ov_h are full-res sensor coords at 2x
+            // scale; rgba_f32 linear 0..1.)
+            let cal_hold = ui.calibration_hold.load();
+            let cal_overlay = cal_hold.as_ref().as_ref();
+
             // Normal fit-to-screen view with debayering
             // Calculate scale to fit rotated sensor (if needed) in display while maintaining aspect ratio
             let scale_x = ui.screen_run as f32 / effective_width as f32;
@@ -592,7 +600,31 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
                     // LINEAR space (mixes channels), then sqrt-encode for the BT.2020
                     // surface. Average mode is colour (debayered) so colour-correct;
                     // diff/motion are monochrome magnitudes - leave them unmixed.
-                    let (lr, lg, lb) = (r as f32 * scale, g as f32 * scale, b as f32 * scale);
+                    let (mut lr, mut lg, mut lb) =
+                        (r as f32 * scale, g as f32 * scale, b as f32 * scale);
+
+                    // Composite the in-place calibration overlay in linear space, before the
+                    // display matrix. Overlay coords are in raw sensor frame (1x); map this
+                    // pixel's sensor coord directly into it.
+                    if let Some((min_x, min_y, ov_w, ov_h, overlay)) = cal_overlay {
+                        let ox = sensor_x;
+                        let oy = sensor_y;
+                        if ox >= *min_x && ox < min_x + ov_w && oy >= *min_y && oy < min_y + ov_h {
+                            let ov_idx = ((oy - min_y) * ov_w + (ox - min_x)) * 4;
+                            if ov_idx + 3 < overlay.len() {
+                                let alpha = overlay[ov_idx + 3];
+                                if alpha > 0.0 {
+                                    // Overlay 0..1 linear -> lumis linear units (white * scale).
+                                    let k = 65535.0 * scale;
+                                    let ia = 1.0 - alpha;
+                                    lr = overlay[ov_idx] * k * alpha + lr * ia;
+                                    lg = overlay[ov_idx + 1] * k * alpha + lg * ia;
+                                    lb = overlay[ov_idx + 2] * k * alpha + lb * ia;
+                                }
+                            }
+                        }
+                    }
+
                     let (lr, lg, lb) = if current_mode == RawMode::Average {
                         apply_display_matrix(ui, lr, lg, lb)
                     } else {
@@ -605,50 +637,6 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
             }
         } // End of fit-to-screen mode
     } // End of image rendering block
-}
-
-// Hold the full calibration scan over the image area, scaled to fit the screen preserving
-// the scan's aspect (letterboxed black). Source is RGB, src_w x src_h.
-fn draw_fullscreen_scan(
-    ui: &UserInterface,
-    pixels: &mut [u8],
-    buffer: &ANativeWindow_Buffer,
-    src_w: u32,
-    src_h: u32,
-    src: &[u8],
-) {
-    let sw = ui.screen_run;
-    let sh = ui.screen_rise;
-    if src_w == 0 || src_h == 0 || src.len() < (src_w * src_h * 3) as usize {
-        return;
-    }
-    // Fit src into the screen preserving aspect.
-    let (fit_w, fit_h) = if src_w as usize * sh >= src_h as usize * sw {
-        (sw, sw * src_h as usize / src_w as usize) // width-limited
-    } else {
-        (sh * src_w as usize / src_h as usize, sh) // height-limited
-    };
-    let off_x = (sw - fit_w) / 2;
-    let off_y = (sh - fit_h) / 2;
-    let stride = buffer.stride as usize;
-
-    for y in 0..sh {
-        for x in 0..sw {
-            let dst_idx = (y * stride + x) * 3;
-            if x < off_x || x >= off_x + fit_w || y < off_y || y >= off_y + fit_h {
-                pixels[dst_idx] = 0;
-                pixels[dst_idx + 1] = 0;
-                pixels[dst_idx + 2] = 0;
-                continue;
-            }
-            let sx = ((x - off_x) as u32 * src_w / fit_w as u32).min(src_w - 1);
-            let sy = ((y - off_y) as u32 * src_h / fit_h as u32).min(src_h - 1);
-            let s = ((sy * src_w + sx) * 3) as usize;
-            pixels[dst_idx] = src[s];
-            pixels[dst_idx + 1] = src[s + 1];
-            pixels[dst_idx + 2] = src[s + 2];
-        }
-    }
 }
 
 fn debug_draw_margins(ui: &UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_Buffer) {

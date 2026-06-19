@@ -1,5 +1,5 @@
-use crate::calibration::chameleon::set_android_config_dir;
 use crate::shared_memory::*;
+use chameleon::{set_config_dir, set_machine_id};
 use jni::{
     objects::{JClass, JObject, JString},
     sys::{jboolean, jfloat, jint, jlong},
@@ -21,7 +21,21 @@ pub extern "C" fn Java_com_lumis_camera_UserInterface_nativeSetConfigDir(
         return;
     };
     let path_str = path.to_string_lossy();
-    set_android_config_dir(&path_str);
+    set_config_dir(std::path::PathBuf::from(path_str.as_ref()));
+}
+
+/// Provide the OS device id (Android: ANDROID_ID) for calibration-file device binding.
+#[no_mangle]
+pub extern "C" fn Java_com_lumis_camera_UserInterface_nativeSetMachineId(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    machine_id: JString<'_>,
+) {
+    let Ok(id) = env.get_string(&machine_id) else {
+        error!("Failed to get machine id string from JNI");
+        return;
+    };
+    set_machine_id(id.to_string_lossy().into_owned());
 }
 
 /// Tag a native window's buffers as Rec.2020 (BT.2020 primaries, sRGB transfer, full

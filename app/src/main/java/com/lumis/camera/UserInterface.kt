@@ -224,6 +224,7 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
    
    // UI JNI functions
    external fun nativeSetConfigDir(configDir: String)
+   external fun nativeSetMachineId(machineId: String)
    external fun nativeUIInit(sharedMemoryFd: Int, sharedMemorySize: Long, surface: Surface, width: Int, height: Int, density: Int): Long
    external fun nativeUIDraw(
        contextPtr: Long, 
@@ -261,6 +262,12 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
 
        // Set the config directory for Rust calibration code
        nativeSetConfigDir(filesDir.absolutePath)
+       // Provide ANDROID_ID for calibration-file device binding (machine_uid has no
+       // Android backend; the Rust/chameleon side uses this instead).
+       val androidId = android.provider.Settings.Secure.getString(
+           contentResolver, android.provider.Settings.Secure.ANDROID_ID
+       ) ?: ""
+       nativeSetMachineId(androidId)
        
        Log.i("UserInterface", "Starting in MENU state")
        currentState = UIState.MENU
