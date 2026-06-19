@@ -1,0 +1,20 @@
+# Rust
+/rust/target/
+**/*.rs.bk
+
+# Gradle / Android build
+/.gradle/
+/app/build/
+/build/
+local.properties
+
+# APKs / signing artifacts
+*.apk
+*.aab
+*.keystore
+*.jks
+*.hprof
+
+# OS / editor
+.DS_Store
+*.swp

@@ -1,0 +1,89 @@
+## Key Features:
+
+1. **Memory Safety**: No manual memory management - Rust's ownership system handles everything safely
+2. **Performance**: Pre-allocated buffers and efficient flat vector storage
+3. **Flexibility**: The CFA pattern is configurable via a closure, making it easy to support different sensor patterns
+4. **Clean API**: Encapsulated in a `RawImage` struct with a simple `rcd_demosaic()` method
+5. **Bounds Checking**: Safe array access with proper bounds checking thruout
+
+## Design Decisions:
+
+- Used `Vec<Vec<[u16; 3]>>` for image storage to maintain clarity while still being efficient
+- Separated complex statistical calculations into helper methods for readability
+- Used `saturating_sub()` for safe subtraction in loop bounds
+- Implemented proper border interpolation at the end
+- Added a test module with a basic example
+
+## Usage Example:
+
+```rust
+// Create image with RGGB Bayer pattern
+let mut raw_image = RawImage::new(width, height, Box::new(bayer_rggb));
+
+// Load your raw sensor data into raw_image.data
+// ...
+
+// Apply RCD demosaicing
+raw_image.rcd_demosaic();
+
+// Now raw_image.data contains full RGB values for every pixel
+```
+
+The algorithm maintains the same mathematical precision as the original C code while being much safer and more maintainable. The Rust version eliminates all the pointer arithmetic and manual memory management, replacing them with safe, idiomatic Rust patterns.
+
+Would you like me to add any additional features, such as:
+- Support for different bit depths
+- Parallel processing with Rayon
+- Additional CFA patterns (GBRG, GRBG, BGGR)
+- Integration with image processing libraries?
+
+## Linear vs Non-linear Operations in RCD:
+
+### Mostly Linear Operations:
+1. **The statistics calculations** (V_Stat, H_Stat, P_Stat, Q_Stat) - These are sums of products, all linear
+2. **Gradient calculations** - Just absolute differences, linear operations
+3. **Weighted averages** - Linear combinations of pixel values
+
+### The Key Non-linearity:
+The critical non-linear operation is the **ratio division**:
+```rust
+VH_Dir[indx] = V_Stat / (V_Stat + H_Stat);
+PQ_Dir[indx] = P_Stat / (P_Stat + Q_Stat);
+```
+
+## Does Black Level Affect the Output?
+
+**YES, it does!** Here's why:
+
+1. **The statistics are scale-dependent**: If you have a black level of 500, your actual signal might be [500, 4095] instead of [0, 3595]. This changes the magnitude of the statistics.
+
+2. **The ratio calculation**: 
+   - With black level: `V_Stat_with_BL / (V_Stat_with_BL + H_Stat_with_BL)`
+   - Without black level: `V_Stat / (V_Stat + H_Stat)`
+   - These ratios are **different** because the black level adds a constant offset to all calculations
+
+3. **The low-pass filter** also uses ratios:
+   ```rust
+   N_Est = cfa[indx - w1] * (1.0 + (lpf[indx] - lpf[indx - w2]) / (eps + lpf[indx] + lpf[indx - w2]));
+   ```
+   The division here makes it sensitive to absolute values.
+
+## Practical Impact:
+
+- **Small black levels** (like 50-200 on a 14-bit sensor): Minimal impact, might not be visually noticeable
+- **Large black levels** (like 500-1000): Could noticeably affect the interpolation quality, especially in shadows
+- **The algorithm assumes** the black regions represent "zero energy" for its statistical decisions
+
+## Optimization Notes for Future:
+
+1. **Pre-subtract black level** is probably best - keeps the algorithm assumptions valid
+2. **If integrating black level handling**, you'd want to:
+   ```rust
+   // At the start of conversion
+   cfa[indx] = (self.data[row][col][fc].saturating_sub(black_level)) as f32 / (white_level - black_level) as f32;
+   ```
+3. **Consider caching** the expensive statistic calculations - they're used multiple times
+4. **SIMD potential**: Those long statistic calculations are perfect for vectorization
+5. **The `eps` checks** could potentially be removed if you ensure no divide-by-zero thru black level handling
+
+The algorithm's assumptions work best with black-level-corrected data where "0" truly means "no light". Including uncorrected data changes the interpretation of what constitutes a "gradient" or "edge".

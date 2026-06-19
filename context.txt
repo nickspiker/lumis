@@ -1,0 +1,252 @@
+This session is being continued from a previous conversation that ran out of context. The conversation is summarized below:
+Analysis:
+Let me chronologically analyze this conversation:
+
+1. **Initial Context**: User provided the AUTH.md specification (lines 1-1351) describing Photon's authentication flow with two-attestation system, device authorization, and recovery mechanisms.
+
+2. **User's Initial Request**: User stated "Read, poke around, take a look. We'll be working on the auth steps and buttons. They aren't setup yet and don't currently match the .md"
+
+3. **My Initial Analysis**: I explored the codebase structure, found the current simplified flow (Query → Attest/Recover/Challenge), and identified the gap: missing initial mode selection screen from AUTH.md.
+
+4. **First Clarification from User**: User provided critical corrections:
+   - ❌ No "cloning" keys → Each device gets derived keys
+   - SHORT wordlist (510 words) for typed verification
+   - LONG wordlist (3,177 words) for visual Bluetooth pairing
+   - Three flows: Generate Attestation Request, Add Device (Bluetooth/Manual/Recover), Recovery
+   - Button labels: "Add via Bluetooth", "Add with Verification Words", "Recover Account"
+
+5. **Storage Format Note**: User mentioned using Versatile Storage Format (VSF) for data persistence instead of SQL/JSON, and wordlists should be VSF vectors. I acknowledged this for later implementation.
+
+6. **Implementation Phase**:
+   - Added new HandleStatus enum states (InitialModeSelection, GenerateAttestationRequest, AttestationPending, AddDeviceChoice, AddDeviceBluetooth, AddDeviceManual, RecoverAccount)
+   - Added new hit test IDs for all buttons
+   - Implemented InitialModeSelection screen rendering with two buttons
+   - Implemented AddDeviceChoice screen with three buttons
+   - Wired up button click handlers in mouse.rs
+   - First compilation showed non-exhaustive pattern match error - fixed by adding catch-all for new states
+
+7. **Critical User Feedback - Button Visibility Issue**: User reported seeing buttons before handle is entered. This was a misunderstanding on my part - I thought welcome screen should always show buttons, but user clarified: "whatever comments or anything suggesting we should show buttons when the handle is empty is wrong."
+
+8. **Fix Applied**: Changed button visibility conditions to only show when `!self.current_text_state.chars.is_empty()` - consistent with original "Query" button behavior.
+
+9. **Current State**: User noted old flow still exists (Query → AlreadyAttested), which is expected since we haven't fully replaced it yet.
+
+Key technical details:
+- HandleStatus enum expanded from 5 to 12 states
+- Hit test IDs added: HIT_GENERATE_ATTESTATION_BUTTON (8), HIT_ADD_DEVICE_BUTTON (9), HIT_GENERATE_REQUEST_BUTTON (10), HIT_ADD_VIA_BLUETOOTH_BUTTON (11), HIT_ADD_WITH_WORDS_BUTTON (12), HIT_RECOVER_ACCOUNT_BUTTON (13), HIT_AUTHORIZE_DEVICE_BUTTON (18), plus unused ones for Bluetooth pairing (14-17)
+- Two new screen rendering blocks added to compositing.rs
+- Button click handlers added to mouse.rs for state transitions
+
+Summary:
+1. **Primary Request and Intent:**
+   - Primary goal: Implement the authentication flow described in AUTH.md specification to match the documented two-attestation system
+   - The existing code has a simplified flow (Query → Attest/Recover/Challenge) that doesn't match the spec
+   - Need to implement proper initial mode selection, attestation request generation, device authorization (Bluetooth/Manual/Recovery), and all associated UI screens
+   - User wants to use Versatile Storage Format (VSF) for data persistence instead of SQL/JSON when we get to that stage
+   - Critical requirement: Buttons should ONLY appear when there's text in the handle textbox (not on empty screen)
+
+2. **Key Technical Concepts:**
+   - **Two-attestation system**: New users need 2 existing members to vouch for uniqueness
+   - **Passless authentication**: No passwords/PINs, relies on social trust + cryptographic verification
+   - **Device key derivation**: Each device gets unique derived key (NOT cloned), derived from root key
+   - **SHORT wordlist (510 words)**: For typed verification (attestation, manual device auth) - user must ENTER these
+   - **LONG wordlist (3,177 words)**: For visual Bluetooth pairing - user only READS/VERIFIES these
+   - **Progressive recovery**: Each key holder approval unlocks conversations with them; threshold (3/5) unlocks full account
+   - **Versatile Storage Format (VSF)**: To be used for data persistence (not SQL/JSON)
+   - **HandleStatus state machine**: Controls which screen/buttons are displayed
+   - **Hit test map**: Pixel-perfect button detection system using u8 element IDs
+
+3. **Files and Code Sections:**
+
+   - **/home/nick/code/photon/AUTH.md** (lines 1-1351)
+     - Complete specification document
+     - Critical sections: Initial onboarding flow, attestation request generation, device authorization paths, verification wordlists
+     - Defines three main paths: Generate Attestation Request, Add Authorized Device, Recover Account
+
+   - **/home/nick/code/photon/src/ui/app.rs**
+     - Modified HandleStatus enum (lines 59-83):
+     ```rust
+     pub enum HandleStatus {
+         // Initial welcome screen
+         InitialModeSelection, // NEW: Welcome screen, choose: Generate Attestation or Add Device
+         
+         // Path A: New User - Generate Attestation Request
+         GenerateAttestationRequest, // Enter handle + 1-2 attester handles, generate request
+         AttestationPending,         // Waiting for attesters to vouch (show verification words)
+         
+         // Path B: Add Device Flow
+         AddDeviceChoice,     // Choose: Add via Bluetooth, Manual Words, or Recover Account
+         AddDeviceBluetooth,  // Bluetooth pairing with LONG wordlist visual verification
+         AddDeviceManual,     // Enter 3 verification words from SHORT wordlist (3 attempts max)
+         
+         // Path C: Recovery Flow
+         RecoverAccount, // Lost all devices, progressive recovery from key holders
+         
+         // Legacy states (keep for backwards compatibility during transition)
+         Empty, Checking, Unattested, AlreadyAttested, RecoverOrChallenge,
+     }
+     ```
+     
+     - Added new hit test IDs (lines 171-192):
+     ```rust
+     pub const HIT_GENERATE_ATTESTATION_BUTTON: u8 = 8;  // "Generate Attestation Request"
+     pub const HIT_ADD_DEVICE_BUTTON: u8 = 9;            // "Add Authorized Device"
+     pub const HIT_GENERATE_REQUEST_BUTTON: u8 = 10;    // "Generate Request" (after entering attesters)
+     pub const HIT_ADD_VIA_BLUETOOTH_BUTTON: u8 = 11;   // "Add via Bluetooth"
+     pub const HIT_ADD_WITH_WORDS_BUTTON: u8 = 12;      // "Add with Verification Words"
+     pub const HIT_RECOVER_ACCOUNT_BUTTON: u8 = 13;     // "Recover Account"
+     pub const HIT_CONFIRM_PAIRING_BUTTON: u8 = 14;     // "Yes, authorize" (Bluetooth confirmation)
+     pub const HIT_CANCEL_PAIRING_BUTTON: u8 = 15;      // "No, cancel" (Bluetooth cancel)
+     pub const HIT_ATTESTER_TEXTBOX_1: u8 = 16;         // First attester textbox
+     pub const HIT_ATTESTER_TEXTBOX_2: u8 = 17;         // Second attester textbox
+     pub const HIT_AUTHORIZE_DEVICE_BUTTON: u8 = 18;    // "Authorize Device" (manual words submit)
+     ```
+     
+     - Changed initial state (line 250):
+     ```rust
+     handle_status: HandleStatus::InitialModeSelection, // Start at welcome screen
+     ```
+
+   - **/home/nick/code/photon/src/ui/compositing.rs**
+     - Added AddDeviceChoice screen rendering (lines 643-803):
+     ```rust
+     // Add Device Choice screen (3 buttons: Bluetooth, Manual Words, Recover)
+     if self.handle_status == HandleStatus::AddDeviceChoice
+         && self.window_dirty
+         && !self.current_text_state.chars.is_empty() {
+         // Header: "Add Authorized Device"
+         // Subheader: "How would you like to authorize?"
+         // Three buttons: "Bluetooth" (green), "Manual" (blue), "Recover" (yellow)
+         // Each with subtitle: "(Nearby device)", "(3 words)", "(Lost all devices)"
+     }
+     ```
+     
+     - Added InitialModeSelection screen rendering (lines 808-912):
+     ```rust
+     // Initial Mode Selection screen
+     if self.handle_status == HandleStatus::InitialModeSelection
+         && self.window_dirty
+         && !self.current_text_state.chars.is_empty() {
+         // Header: "Welcome to Photon"
+         // Two buttons: "Generate Attestation" (green, left) + "Add Authorized Device" (blue, right)
+         // Subtitles: "(New handle)" and "(Have handle)"
+     }
+     ```
+     
+     - Added catch-all for new states in match statement (lines 1013-1022):
+     ```rust
+     HandleStatus::InitialModeSelection
+     | HandleStatus::GenerateAttestationRequest
+     | HandleStatus::AttestationPending
+     | HandleStatus::AddDeviceChoice
+     | HandleStatus::AddDeviceBluetooth
+     | HandleStatus::AddDeviceManual
+     | HandleStatus::RecoverAccount => {
+         // These states are rendered in their own dedicated sections
+     }
+     ```
+
+   - **/home/nick/code/photon/src/ui/mouse.rs**
+     - Updated imports (lines 6-12):
+     ```rust
+     use super::app::{
+         HandleStatus, PhotonApp, ResizeEdge, HIT_ADD_DEVICE_BUTTON, HIT_ADD_VIA_BLUETOOTH_BUTTON,
+         HIT_ADD_WITH_WORDS_BUTTON, HIT_AUTHORIZE_DEVICE_BUTTON, HIT_CHALLENGE_BUTTON,
+         HIT_CLOSE_BUTTON, HIT_GENERATE_ATTESTATION_BUTTON, HIT_GENERATE_REQUEST_BUTTON,
+         HIT_HANDLE_TEXTBOX, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, HIT_PRIMARY_BUTTON,
+         HIT_RECOVER_ACCOUNT_BUTTON, HIT_RECOVER_BUTTON,
+     };
+     ```
+     
+     - Added button click handlers (lines 349-397):
+     ```rust
+     HIT_GENERATE_ATTESTATION_BUTTON => {
+         self.handle_status = HandleStatus::GenerateAttestationRequest;
+         self.window_dirty = true;
+     }
+     HIT_ADD_DEVICE_BUTTON => {
+         self.handle_status = HandleStatus::AddDeviceChoice;
+         self.window_dirty = true;
+     }
+     HIT_GENERATE_REQUEST_BUTTON => {
+         self.handle_status = HandleStatus::AttestationPending;
+         self.window_dirty = true;
+     }
+     HIT_ADD_VIA_BLUETOOTH_BUTTON => {
+         self.handle_status = HandleStatus::AddDeviceBluetooth;
+         self.window_dirty = true;
+     }
+     HIT_ADD_WITH_WORDS_BUTTON => {
+         self.handle_status = HandleStatus::AddDeviceManual;
+         self.window_dirty = true;
+     }
+     HIT_RECOVER_ACCOUNT_BUTTON => {
+         self.handle_status = HandleStatus::RecoverAccount;
+         self.window_dirty = true;
+     }
+     HIT_AUTHORIZE_DEVICE_BUTTON => {
+         // TODO: Verify 3 words and authorize device
+     }
+     ```
+
+   - **/home/nick/code/photon/supplimentary/wordlist.tex** (lines 1-75)
+     - Contains the 3,177-word mnemonic wordlist specification
+     - First 510 words are frequency-sorted (SHORT list for typing)
+     - Words 511-3,177 are pronunciation-sorted (LONG list for visual verification)
+
+4. **Errors and Fixes:**
+   - **Error 1: Non-exhaustive pattern match**
+     - Compilation error: `non-exhaustive patterns: HandleStatus::InitialModeSelection, GenerateAttestationRequest, AttestationPending and 4 more not covered`
+     - Location: src/ui/compositing.rs line 759
+     - Fix: Added catch-all match arm for new HandleStatus states that don't need rendering in that specific section
+     
+   - **Error 2: Buttons showing when textbox is empty**
+     - User feedback: "FYI, I'm seeing buttons before any handle is entered" and "whatever comments or anything suggesting we should show buttons when the handle is empty is wrong"
+     - Root cause: Initial implementation showed buttons regardless of textbox state
+     - Fix: Added `&& !self.current_text_state.chars.is_empty()` condition to both InitialModeSelection and AddDeviceChoice rendering blocks
+     - This ensures buttons only appear when there's text in the handle textbox, consistent with original "Query" button behavior
+
+5. **Problem Solving:**
+   - **Solved**: Button visibility now correctly matches original behavior - only shows when handle textbox contains text
+   - **Solved**: State machine for new AUTH.md flow implemented with proper transitions
+   - **Ongoing**: Old flow (Query → Attest/Recover/Challenge) still exists alongside new flow, needs to be addressed (remove or keep during transition)
+   - **Ongoing**: Remaining screens need implementation (Generate Attestation Request with attester textboxes, Bluetooth pairing, Manual verification words, Recovery)
+
+6. **All User Messages:**
+   - "Read, poke around, take a look. We'll be working on the auth steps and buttons. They aren't setup yet and don't currently match the .md"
+   - Provided comprehensive corrections about terminology: no "cloning" keys, SHORT vs LONG wordlists, button labels, three distinct flows
+   - "When you get to any sections that we'll actually be storing user data, let me know as we'll be using the Versatile Storage Format crate for encoding and decoding shit since sql and json and stuff like that are antequated trasah, insecure, don't have any checksums... bla bla bla. Same with the wordlist. We should probably make that a vsf vector instead of a random csv."
+   - "FYI, I'm seeing buttons before any handle is entered:" [followed by compilation output]
+   - "What? empty?" (questioning why buttons show on empty textbox)
+   - "Yeah, whatever comments or anytihng suggesting we should show buttons when the handle is empty is wrong. You did see the redraw trigger when the handle gets cleared to remove the buttons, yes?"
+   - "Hmm. Seems we still have some old flow in there too but that's prolly related to our todo not being complete yet :)" [followed by network query log output]
+
+7. **Pending Tasks:**
+   - Implement Generate Attestation Request screen with two attester textboxes
+   - Implement Bluetooth pairing flow with LONG wordlist visual verification
+   - Implement manual verification words flow with SHORT wordlist (3 attempts max)
+   - Implement recovery flow with progressive access display
+   - Create wordlist module with SHORT (510) and LONG (3,177) word lists (as VSF vectors when we get to storage)
+   - Create attestation types module (AttestationRequest, DeviceAuthRequest, BluetoothPairingSession)
+   - Decide whether to remove old Query flow or keep during transition
+   - Create network stub functions for attestation/device auth/recovery
+
+8. **Current Work:**
+   Just before the summary request, the user noted that the old query flow is still active, showing:
+   ```
+   Network: Querying handle 'aou'...
+   Network: Query complete, result=AlreadyAttested
+   ```
+   
+   I acknowledged this and explained that the old flow (HandleStatus::Empty, Checking, Unattested, AlreadyAttested) is still there and active. I asked the user whether they want to:
+   - Remove the old flow entirely and only use new AUTH.md states, OR
+   - Keep both flows during transition
+   
+   The conversation ended with me stating: "I'm thinking we should fully transition to the new flow and remove the old 'Query' button logic entirely. The new flow doesn't need to query the network until the attestation request is actually generated."
+
+9. **Optional Next Step:**
+   Wait for user's decision on whether to remove the old Query flow or keep it during transition. Based on user's response:
+   - If remove: Edit compositing.rs and mouse.rs to remove all HandleStatus::Empty, Checking, Unattested, AlreadyAttested rendering and logic
+   - If keep: Continue implementing remaining screens (Generate Attestation Request, Bluetooth pairing, etc.) while leaving old flow intact
+   
+   Direct quote showing where we left off: User said "Hmm. Seems we still have some old flow in there too but that's prolly related to our todo not being complete yet :)" and I responded "The old query system (HandleStatus::Empty, Checking, Unattested, AlreadyAttested) is still there and active. We need to either: Remove the old flow entirely and only use the new AUTH.md states, OR Keep both flows for now during transition. Which would you prefer?".
