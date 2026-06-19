@@ -18,3 +18,4 @@ local.properties
 # OS / editor
 .DS_Store
 *.swp
+/app/libs/
