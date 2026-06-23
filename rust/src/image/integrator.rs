@@ -71,6 +71,38 @@ impl TimeBase {
     }
 }
 
+/// Unpack Android RAW10 (MIPI CSI-2 packing) into 2-bytes-per-pixel little-endian u16 values (0..=1023). RAW10 stores 4 pixels in 5 bytes: 4 high bytes then a 5th byte holding the 2 low bits of each, and each row is padded to `row_stride` bytes. Output is tightly packed width*height*2 bytes (no row padding), matching the layout the integrator's loops read.
+fn unpack_raw10(packed: &[u8], width: usize, height: usize, row_stride: usize) -> Vec<u8> {
+    let mut out = vec![0u8; width * height * 2];
+    for y in 0..height {
+        let row = &packed[y * row_stride..];
+        let out_row = y * width * 2;
+        let groups = width / 4;
+        for g in 0..groups {
+            let p = g * 5;
+            // Guard against a short final group / truncated buffer.
+            if p + 5 > row.len() {
+                break;
+            }
+            let lo = row[p + 4];
+            // pixel = (high_byte << 2) | (its 2 low bits). Values are 0..=1023.
+            let px = [
+                ((row[p] as u16) << 2) | ((lo & 0x03) as u16),
+                ((row[p + 1] as u16) << 2) | (((lo >> 2) & 0x03) as u16),
+                ((row[p + 2] as u16) << 2) | (((lo >> 4) & 0x03) as u16),
+                ((row[p + 3] as u16) << 2) | (((lo >> 6) & 0x03) as u16),
+            ];
+            let o = out_row + g * 8;
+            for (k, &v) in px.iter().enumerate() {
+                let b = v.to_le_bytes();
+                out[o + k * 2] = b[0];
+                out[o + k * 2 + 1] = b[1];
+            }
+        }
+    }
+    out
+}
+
 pub struct CameraIntegrator {
     shared_memory: SharedMemory, // Keep SharedMemory alive
     pub header: &'static mut [u64],
@@ -149,13 +181,7 @@ impl CameraIntegrator {
         header[EXPOSURE_START_NANOS_IDX] = 0;
         header[FPS_IDX] = 0f64.to_bits();
 
-        // Seed ISO and per-frame shutter from the one-shot auto-exposure result that
-        // Kotlin metered before creating this integrator, clamped to the sensor's range.
-        // This makes the opening preview usable on any device/lighting without hardcoding
-        // a value (sensor ranges vary wildly: min ISO 16 here could be 1 elsewhere, and
-        // max exposure ≈16s here could be a full day). A bad seed previously defaulted
-        // shutter to max_exposure_ns, so the feed delivered one frame every ~16s and
-        // looked frozen. Fall back to min when the AE value is missing (<= 0).
+        // Seed ISO and per-frame shutter from the one-shot auto-exposure result that Kotlin metered before creating this integrator, clamped to the sensor's range. This makes the opening preview usable on any device/lighting without hardcoding a value (sensor ranges vary wildly: min ISO 16 here could be 1 elsewhere, and max exposure ≈16s here could be a full day). A bad seed previously defaulted shutter to max_exposure_ns, so the feed delivered one frame every ~16s and looked frozen. Fall back to min when the AE value is missing (<= 0).
         let seed_iso = if initial_iso > 0.0 {
             initial_iso.clamp(min_iso, max_iso)
         } else {
@@ -222,11 +248,22 @@ impl CameraIntegrator {
 
     pub fn process_frame(
         &mut self,
-        frame_data: &[u8],
+        frame_data_in: &[u8],
         _captured_iso: i32,
         _captured_shutter_ns: i64,
         _captured_focus: f32,
+        // RAW10 path: when true, frame_data_in is MIPI-packed RAW10 (4 px / 5 bytes, rows padded to row_stride bytes). We depack it once into 16-bit LE here so the rest of the pipeline (which reads 2 bytes/pixel) is unchanged. row_stride is in BYTES.
+        raw10: bool,
+        row_stride: usize,
     ) -> (i32, i64, f32) {
+        // Depack RAW10 -> the same 2-bytes-per-pixel little-endian layout the integrator's accumulation loops expect (value 0..=1023, since white_level is 10-bit). Done once per frame on the camera thread; pixels are read many times downstream.
+        let unpacked: Vec<u8>;
+        let frame_data: &[u8] = if raw10 {
+            unpacked = unpack_raw10(frame_data_in, self.width, self.height, row_stride);
+            &unpacked
+        } else {
+            frame_data_in
+        };
         // Calculate FPS based on frame timing
         let now = Instant::now();
         let frame_duration = now.duration_since(self.last_frame_time).as_secs_f64();
@@ -355,11 +392,7 @@ impl CameraIntegrator {
             let device_orientation = self.header[SENSOR_ORIENTATION_IDX] as u16;
             let pixel_count = self.width * self.height;
             let save_format = self.header[SAVE_FORMAT_IDX];
-            // XYZ matrix for RGB exports, and the magic9inv bytes for the DNG ColorMatrix1.
-            // magic_9_dng_xyz lives in zero-initialized shared memory and is only populated by
-            // a calibration scan. Pre-calibration it is all zeros, which would multiply every
-            // exported pixel to black; fall back to identity so uncalibrated RGB exports show
-            // the raw debayered scene (accuracy doesn't matter until calibrated anyway).
+            // XYZ matrix for RGB exports, and the magic9inv bytes for the DNG ColorMatrix1. magic_9_dng_xyz lives in zero-initialized shared memory and is only populated by a calibration scan. Pre-calibration it is all zeros, which would multiply every exported pixel to black; fall back to identity so uncalibrated RGB exports show the raw debayered scene (accuracy doesn't matter until calibrated anyway).
             let xyz_matrix = {
                 let m = *self.magic_9_dng_xyz;
                 if m.iter().all(|&v| v == 0.) {
@@ -368,9 +401,7 @@ impl CameraIntegrator {
                     m
                 }
             };
-            // RGB exports (JPEG/TIFF/JXL) are tagged Rec.2020 to match the on-screen preview,
-            // so they use the camera->Rec.2020 display matrix, NOT the DNG's XYZ matrix. Same
-            // zero-fallback to identity for the uncalibrated case.
+            // RGB exports (JPEG/TIFF/JXL) are tagged Rec.2020 to match the on-screen preview, so they use the camera->Rec.2020 display matrix, NOT the DNG's XYZ matrix. Same zero-fallback to identity for the uncalibrated case.
             let display_matrix = {
                 let m = unsafe {
                     *(self.header.as_ptr().add(MAGIC_9_DISPLAY_IDX) as *const [f32; 9])
@@ -387,10 +418,7 @@ impl CameraIntegrator {
                 std::ptr::copy_nonoverlapping(p, a.as_mut_ptr(), 8 * 9);
                 a
             };
-            // magic9inv is the DNG ColorMatrix1 (9 SRATIONALs, num/den i32 pairs). It is only
-            // written by a calibration scan; pre-calibration shared memory is all zeros, which
-            // is a degenerate (0/0) matrix that raw converters reject. Fall back to the identity
-            // SRATIONAL pattern so uncalibrated DNGs remain valid.
+            // magic9inv is the DNG ColorMatrix1 (9 SRATIONALs, num/den i32 pairs). It is only written by a calibration scan; pre-calibration shared memory is all zeros, which is a degenerate (0/0) matrix that raw converters reject. Fall back to the identity SRATIONAL pattern so uncalibrated DNGs remain valid.
             if magic9inv.iter().all(|&b| b == 0) {
                 magic9inv = [
                     1, 0, 0, 0, 1, 0, 0, 0, //
@@ -414,12 +442,26 @@ impl CameraIntegrator {
             // Convert Android bayer pattern to CFA pattern
             // Android: 0=RGGB, 1=GRBG, 2=GBRG, 3=BGGR
             // CFA values: 0=Red, 1=Green, 2=Blue
-            let bayer_pattern_vec = match bayer_pattern {
-                0 => vec![0, 1, 1, 2], // RGGB
-                1 => vec![1, 0, 2, 1], // GRBG
-                2 => vec![1, 2, 0, 1], // GBRG
-                3 => vec![2, 1, 1, 0], // BGGR
-                _ => vec![0, 1, 1, 2], // Default to RGGB
+            let base_cfa = match bayer_pattern {
+                0 => [0u8, 1, 1, 2], // RGGB
+                1 => [1, 0, 2, 1],   // GRBG
+                2 => [1, 2, 0, 1],   // GBRG
+                3 => [2, 1, 1, 0],   // BGGR
+                _ => [0, 1, 1, 2],   // Default to RGGB
+            };
+            // RAW10 max-res on this device is a quad-Bayer (Tetracell) sensor: each base colour covers a 2x2 cluster, so the CFA is a 4x4 tile (each base cell expanded to 2x2). Tag the DNG with the real 4x4 pattern so a quad-Bayer-aware raw converter can demosaic it. Binned mode stays the standard 2x2 pattern.
+            let bayer_pattern_vec: Vec<u8> = if raw10 {
+                // base is [c00,c01,c10,c11] over a 2x2; expand to 4x4 row-major.
+                let (c00, c01, c10, c11) =
+                    (base_cfa[0], base_cfa[1], base_cfa[2], base_cfa[3]);
+                vec![
+                    c00, c00, c01, c01, //
+                    c00, c00, c01, c01, //
+                    c10, c10, c11, c11, //
+                    c10, c10, c11, c11, //
+                ]
+            } else {
+                base_cfa.to_vec()
             };
 
             // Calculate data location based on mode
@@ -469,9 +511,7 @@ impl CameraIntegrator {
                 millis
             );
 
-            // Copy the slot's raw u16 data for the save thread (the camera thread keeps
-            // overwriting the live slots). DNG needs the full data_length (avg, or avg+diff
-            // for motion); RGB exports debayer the average half.
+            // Copy the slot's raw u16 data for the save thread (the camera thread keeps overwriting the live slots). DNG needs the full data_length (avg, or avg+diff for motion); RGB exports debayer the average half.
             let raw_slot: Vec<u16> =
                 self.image_buffer[data_offset..data_offset + data_length].to_vec();
 
@@ -505,8 +545,8 @@ impl CameraIntegrator {
                         bitdepthold: 0,
                         rgb: false,
                         cfa: bayer_pattern_vec.clone(),
-                        cfaw: 2,
-                        cfah: 2,
+                        cfaw: if raw10 { 4 } else { 2 },
+                        cfah: if raw10 { 4 } else { 2 },
                         black: if current_mode == 0 {
                             image_black_level as f32
                         } else {
@@ -533,6 +573,7 @@ impl CameraIntegrator {
                         ifdoffset: 0,
                         duck: false,
                         save_scan: false,
+                        cfapatternoffset: 0,
                     };
                     let mut dng_bytes = make_base_dng(&mut raw_info);
                     let image_bytes = unsafe {
@@ -564,8 +605,7 @@ impl CameraIntegrator {
                     }
                     (dng_bytes, "dng")
                 } else {
-                    // RGB export: RCD-demosaic the average half + Rec.2020 display matrix +
-                    // sqrt, then encode. Tagged Rec.2020 so it matches the on-screen preview.
+                    // RGB export: RCD-demosaic the average half + Rec.2020 display matrix + sqrt, then encode. Tagged Rec.2020 so it matches the on-screen preview.
                     let avg = &raw_slot[0..(width * height).min(raw_slot.len())];
                     let (ow, oh, rgb) = rcd_to_rgb8(
                         avg,

@@ -247,10 +247,7 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
        instance = this
        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-       // Give SurfaceFlinger a display-native, wide-gamut target so it doesn't clamp our
-       // BT.2020-tagged preview buffer toward sRGB or run a vendor saturation pass. The
-       // Rust side tags the surface dataspace BT.2020 + gamma2.2; this is the Activity-side
-       // half. preferMinimalPostProcessing asks the panel to skip its own colour processing.
+       // Give SurfaceFlinger a display-native, wide-gamut target so it doesn't clamp our BT.2020-tagged preview buffer toward sRGB or run a vendor saturation pass. The Rust side tags the surface dataspace BT.2020 + gamma2.2; this is the Activity-side half. preferMinimalPostProcessing asks the panel to skip its own colour processing.
        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
            window.attributes = window.attributes.apply {
                colorMode = android.content.pm.ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
@@ -262,8 +259,7 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
 
        // Set the config directory for Rust calibration code
        nativeSetConfigDir(filesDir.absolutePath)
-       // Provide ANDROID_ID for calibration-file device binding (machine_uid has no
-       // Android backend; the Rust/chameleon side uses this instead).
+       // Provide ANDROID_ID for calibration-file device binding (machine_uid has no Android backend; the Rust/chameleon side uses this instead).
        val androidId = android.provider.Settings.Secure.getString(
            contentResolver, android.provider.Settings.Secure.ANDROID_ID
        ) ?: ""
@@ -297,13 +293,8 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
        // Initialize auto-nuke handler
        autoNukeHandler = Handler(Looper.getMainLooper())
        
-       // Bind to the camera service. BIND_AUTO_CREATE creates it, which runs its
-       // onCreate() -> startForeground(), so it survives for the life of the binding.
-       // Note: we must NOT call startService() here. On Android 12+ a plain
-       // startService() from an activity that was launched by a finishing
-       // launcher activity counts as a "background service start" and throws
-       // BackgroundServiceStartNotAllowedException, crashing onCreate. Binding is
-       // not subject to that restriction and gives us the same service lifetime.
+       // Bind to the camera service. BIND_AUTO_CREATE creates it, which runs its onCreate() -> startForeground(), so it survives for the life of the binding.
+       // Note: we must NOT call startService() here. On Android 12+ a plain startService() from an activity that was launched by a finishing launcher activity counts as a "background service start" and throws BackgroundServiceStartNotAllowedException, crashing onCreate. Binding is not subject to that restriction and gives us the same service lifetime.
        bindToCameraService()
    }
 
@@ -387,7 +378,7 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
        // Calculate SharedMemory size - SAME calculation as camera integrator
        val pixelCount = cameraWidth * cameraHeight
        val rawBufferSizeBytes = pixelCount * 16  // 2 u16 arrays, 4 bytes per pixel, quad rolling buffer
-       val headerSizeBytes = 32 * 8  // IMAGE_START * 8
+       val headerSizeBytes = 64 * 8  // IMAGE_START (64 u64s) * 8 bytes - must match jni_camera.rs
        val sharedMemorySize = (headerSizeBytes + rawBufferSizeBytes).toLong()
        
        Log.i("UserInterface", "UI dimensions: ${width}x${height} @ ${density}dpi, SharedMemory size: $sharedMemorySize")
@@ -568,8 +559,7 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
                        currentTouchY = event.y
                    }
                    else -> {
-                       // ANY other action (UP, CANCEL, OUTSIDE, POINTER_DOWN, etc.)
-                       // If it's not explicitly DOWN or MOVE, clear the coordinates
+                       // ANY other action (UP, CANCEL, OUTSIDE, POINTER_DOWN, etc.) If it's not explicitly DOWN or MOVE, clear the coordinates
                        currentTouchX = Float.NaN
                        currentTouchY = Float.NaN
                    }
@@ -583,14 +573,11 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
        if (event != null) {
            val deviceName = event.device?.name ?: ""
-           // Diagnostic: which input device sent this key? The save trigger matches on
-           // gpio-keys/qpnp_pon; on some phones the volume keys report a different name.
+           // Diagnostic: which input device sent this key? The save trigger matches on gpio-keys/qpnp_pon; on some phones the volume keys report a different name.
            Log.i("Lumis", "onKeyDown keyCode=$keyCode device='$deviceName' source=${event.source}")
 
            // Handle volume keys from physical buttons for save functions
-           // The on-device volume keypad reports "gpio_keys"/"gpio-keys" (varies by device,
-           // e.g. Pixel uses the underscore) or "qpnp_pon"; anything else (BT remotes like
-           // "AB Shutter3", keyboards) is treated as a shutter.
+           // The on-device volume keypad reports "gpio_keys"/"gpio-keys" (varies by device, e.g. Pixel uses the underscore) or "qpnp_pon"; anything else (BT remotes like "AB Shutter3", keyboards) is treated as a shutter.
            val isPhysicalButton = deviceName.contains("gpio") || deviceName.contains("qpnp_pon")
 
            if ((keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) &&

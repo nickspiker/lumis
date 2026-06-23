@@ -1,17 +1,12 @@
 //! RGB export encoding for the save pipeline (JPEG / TIFF / JPEG XL).
 //!
-//! The camera thread hands us the displayed slot's raw bayer data; we debayer it (the same
-//! 2x2-block approach the live preview uses), apply the XYZ colour matrix + sqrt encode, then
-//! encode to the requested container as bytes for Kotlin to write via MediaStore. DNG is built
-//! separately (chameleon::make_base_dng + raw bayer); this module is RGB-only.
+//! The camera thread hands us the displayed slot's raw bayer data; we debayer it (the same 2x2-block approach the live preview uses), apply the XYZ colour matrix + sqrt encode, then encode to the requested container as bytes for Kotlin to write via MediaStore. DNG is built separately (chameleon::make_base_dng + raw bayer); this module is RGB-only.
 
 use std::io::Cursor;
 
 /// Debayer + colour-correct the average slot into 8-bit RGB, honouring sensor orientation.
 ///
-/// `raw` is the average-mode u16 slot (width*height). `matrix` is the camera->output 3x3
-/// (row-major) applied in linear light before sqrt. `gain` mirrors the display gain. Returns
-/// (out_w, out_h, rgb8) already rotated to upright.
+/// `raw` is the average-mode u16 slot (width*height). `matrix` is the camera->output 3x3 (row-major) applied in linear light before sqrt. `gain` mirrors the display gain. Returns (out_w, out_h, rgb8) already rotated to upright.
 pub fn debayer_to_rgb8(
     raw: &[u16],
     width: usize,
@@ -73,9 +68,7 @@ pub fn debayer_to_rgb8(
     (out_w, out_h, rgb)
 }
 
-/// RCD-demosaic the full frame, colour-correct, and sqrt-encode to 8-bit RGB, honouring sensor
-/// orientation. Same interface as [debayer_to_rgb8] but with the higher-quality RCD demosaic
-/// (used for saved RGB exports — the 2x2 block path stays for the live preview's speed).
+/// RCD-demosaic the full frame, colour-correct, and sqrt-encode to 8-bit RGB, honouring sensor orientation. Same interface as [debayer_to_rgb8] but with the higher-quality RCD demosaic (used for saved RGB exports — the 2x2 block path stays for the live preview's speed).
 pub fn rcd_to_rgb8(
     raw: &[u16],
     width: usize,
@@ -88,8 +81,7 @@ pub fn rcd_to_rgb8(
     use crate::debayer::region::rcd_region;
 
     let scale = 65536. / (65536. - black_level as f32);
-    // Demosaic the whole frame in one shot (crop == full frame). RCD returns black-subtracted +
-    // gained linear-ish RGB per sensor pixel.
+    // Demosaic the whole frame in one shot (crop == full frame). RCD returns black-subtracted + gained linear-ish RGB per sensor pixel.
     let demosaiced = rcd_region(
         raw, width, height, 0, 0, width, height, black_level, scale, bayer_pattern,
     );
@@ -135,8 +127,7 @@ pub fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 
 /// Encode RGB8 to lossless Deflate-compressed TIFF bytes.
 ///
-/// The `image` crate's TIFF encoder is uncompressed-only, so we use the `tiff` crate directly
-/// to get lossless Deflate (≈1.5-2x smaller than raw RGB, still universally readable).
+/// The `image` crate's TIFF encoder is uncompressed-only, so we use the `tiff` crate directly to get lossless Deflate (≈1.5-2x smaller than raw RGB, still universally readable).
 pub fn encode_tiff(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     use crate::image::icc::rec2020_icc;
     use tiff::encoder::{colortype::RGB8, compression::Deflate, TiffEncoder};
@@ -144,8 +135,7 @@ pub fn encode_tiff(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     let mut out = Cursor::new(Vec::new());
     {
         let mut enc = TiffEncoder::new(&mut out).ok()?;
-        // Use the lower-level image encoder so we can write the ICCProfile tag (0x8773 = 34675)
-        // alongside the pixel data, keeping lossless Deflate.
+        // Use the lower-level image encoder so we can write the ICCProfile tag (0x8773 = 34675) alongside the pixel data, keeping lossless Deflate.
         let mut image =
             enc.new_image_with_compression::<RGB8, _>(width, height, Deflate::default()).ok()?;
         image
@@ -165,8 +155,7 @@ pub fn encode_jpegxl(rgb: &[u8], width: usize, height: usize) -> Option<Vec<u8>>
     use zune_jpegxl::JxlSimpleEncoder;
 
     let opts = EncoderOptions::new(width, height, ColorSpace::RGB, BitDepth::Eight);
-    // Lumis fork of zune-jpegxl: signal Rec.2020 in the codestream's ColourEncoding so the
-    // wide-gamut output is interpreted correctly (upstream hardcodes sRGB).
+    // Lumis fork of zune-jpegxl: signal Rec.2020 in the codestream's ColourEncoding so the wide-gamut output is interpreted correctly (upstream hardcodes sRGB).
     let encoder = JxlSimpleEncoder::new(rgb, opts).set_rec2020(true);
     let mut out: Vec<u8> = Vec::new();
     encoder.encode(&mut out).ok()?;

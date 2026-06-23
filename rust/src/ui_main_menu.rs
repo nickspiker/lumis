@@ -70,8 +70,7 @@ impl MainMenu {
                 }
             }
         }
-        // Keep a pristine copy of the splash background to clear button buffers before
-        // re-rendering on screen changes (otherwise old rows bleed through).
+        // Keep a pristine copy of the splash background to clear button buffers before re-rendering on screen changes (otherwise old rows bleed through).
         let normal_buffer_bg = normal_buffer.clone();
         let mut menu = MainMenu {
             width,
@@ -100,9 +99,7 @@ impl MainMenu {
         self.rebuild_buttons();
     }
 
-    // Rebuild the on-screen buttons for the current screen. Exit is always pinned to the
-    // last (bottom) slot; cameras fill upward from just above it, with empty padding on
-    // top so the list sits at the bottom.
+    // Rebuild the on-screen buttons for the current screen. Exit is always pinned to the last (bottom) slot; cameras fill upward from just above it, with empty padding on top so the list sits at the bottom.
     fn rebuild_buttons(&mut self) {
         self.buttons.clear();
         const NUM_SLOTS: usize = 10;
@@ -113,8 +110,7 @@ impl MainMenu {
             Screen::Main => self
                 .all_cameras
                 .iter()
-                // One row per lens: the group head (lowest-index member). Ungrouped
-                // cameras (group_id < 0) are their own head.
+                // One row per lens: the group head (lowest-index member). Ungrouped cameras (group_id < 0) are their own head.
                 .filter(|c| self.is_group_head(c))
                 .map(|c| (c.index, c.clone()))
                 .collect(),
@@ -146,10 +142,7 @@ impl MainMenu {
         self.render_buttons_to_buffers();
     }
 
-    // First (highest-res) mode of a group is its head. We mark the head with mode_count =
-    // group size and the rest with 1, so head == "mode_count >= 1 and it's the first of
-    // its group in all_cameras". Since Kotlin emits the head first, the head is simply the
-    // earliest-index member of the group.
+    // First (highest-res) mode of a group is its head. We mark the head with mode_count = group size and the rest with 1, so head == "mode_count >= 1 and it's the first of its group in all_cameras". Since Kotlin emits the head first, the head is simply the earliest-index member of the group.
     fn is_group_head(&self, cam: &CameraInfo) -> bool {
         if cam.group_id < 0 {
             return true;
@@ -174,8 +167,7 @@ impl MainMenu {
         self.render_buttons_to_buffers();
     }
     fn render_buttons_to_buffers(&mut self) {
-        // Clear to the pristine splash first so rows removed on a screen change (e.g.
-        // when fewer buttons are shown) don't leave stale pixels behind.
+        // Clear to the pristine splash first so rows removed on a screen change (e.g. when fewer buttons are shown) don't leave stale pixels behind.
         self.normal_buffer.copy_from_slice(&self.background);
         self.pressed_buffer.copy_from_slice(&self.background);
         for i in 0..self.buttons.len() {
@@ -294,8 +286,7 @@ impl MainMenu {
         }
     }
     fn draw_camera_button(&mut self, button_index: usize, y: f32, pressed: bool) {
-        // "multiple" is only meaningful on the main screen; inside a lens's mode list
-        // each row shows its own resolution.
+        // "multiple" is only meaningful on the main screen; inside a lens's mode list each row shows its own resolution.
         let on_main = self.screen == Screen::Main;
         let pixels = if pressed {
             &mut self.pressed_buffer
@@ -323,6 +314,10 @@ impl MainMenu {
         let rgb = match &self.buttons[button_index] {
             Button::Camera { info, .. } => {
                 if info.supports_raw {
+                    // The button's identity colour comes from its hardware level (unchanged from before). On top of that we MODULATE red/green to signal the capture mode, leaving blue (and the overall identity) intact:
+                    //   RED   boosted when this is a cropped sub-FOV readout.
+                    //   GREEN boosted when this is the full-res (max-res, non-binned) readout.
+                    // A plain binned full-FOV entry keeps its original colour exactly.
                     let base_colour = match info.hardware_level {
                         0 => [0xFF, 0xA0, 0x60],
                         1 => [0x60, 0xFF, 0x60],
@@ -331,6 +326,11 @@ impl MainMenu {
                         4 => [0x60, 0xFF, 0xFF],
                         _ => [0xFF, 0xFF, 0x60],
                     };
+                    let base_colour = [
+                        if info.is_cropped { 0xFF } else { base_colour[0] },
+                        if info.max_res { 0xFF } else { base_colour[1] },
+                        base_colour[2],
+                    ];
                     if !pressed {
                         [
                             ((base_colour[0] as u16 * 192) >> 8) as u8,
@@ -528,8 +528,7 @@ impl MainMenu {
             let left_gap = button_width * 0.03;
             let right_gap = button_width * 0.03;
             let megapixels = (info.width * info.height) as f32 / 1_000_000.;
-            // A lens with several capture modes shows "multiple" instead of a single
-            // resolution; tapping it (future) opens a per-mode picker.
+            // A lens with several capture modes shows "multiple" instead of a single resolution; tapping it (future) opens a per-mode picker.
             let mp_text = if on_main && info.mode_count > 1 {
                 "multiple ".to_string()
             } else {
@@ -1488,8 +1487,7 @@ impl MainMenu {
         }
     }
 
-    // "Back" button for the mode sub-screen. Same rounded shape as Exit but tinted
-    // teal/blue (channels swapped) with a "< BACK" label.
+    // "Back" button for the mode sub-screen. Same rounded shape as Exit but tinted teal/blue (channels swapped) with a "< BACK" label.
     fn draw_back_button(&mut self, y: f32, pressed: bool) {
         let pixels = if pressed {
             &mut self.pressed_buffer
@@ -1752,8 +1750,7 @@ impl MainMenu {
                                     if !info.supports_raw {
                                         None
                                     } else if self.screen == Screen::Main && info.mode_count > 1 {
-                                        // Multi-mode lens on the main screen: open the mode
-                                        // sub-picker instead of starting the camera.
+                                        // Multi-mode lens on the main screen: open the mode sub-picker instead of starting the camera.
                                         navigate = Some(Screen::Modes(info.group_id));
                                         None
                                     } else {
@@ -1772,10 +1769,7 @@ impl MainMenu {
                             if let Some(target) = navigate {
                                 self.screen = target;
                                 self.rebuild_buttons();
-                                // Invalidate the magic pixel so the next draw is a FULL
-                                // redraw (Kotlin always calls draw with full_draw=false, and
-                                // the whole button set just changed - a partial draw would
-                                // leave the old screen's rows on screen).
+                                // Invalidate the magic pixel so the next draw is a FULL redraw (Kotlin always calls draw with full_draw=false, and the whole button set just changed - a partial draw would leave the old screen's rows on screen).
                                 self.magic_counter[0] = self.magic_counter[0].wrapping_add(1);
                                 return (None, true);
                             }

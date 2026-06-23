@@ -25,6 +25,8 @@ pub struct CameraInfo {
     pub pixel_array_width: u32,
     pub mode_count: u32, // >1 on group head => this lens has multiple capture modes
     pub group_id: i32,   // modes of the same physical lens share this (-1 = ungrouped)
+    pub max_res: bool,   // max-resolution (non-binned) readout, e.g. Pixel 50MP vs 12.5MP
+    pub is_cropped: bool, // images a sub-region of the full active-array FOV (digital crop)
 }
 
 pub fn parse_camera_array(data: &[f32]) -> Vec<CameraInfo> {
@@ -355,6 +357,12 @@ pub fn parse_single_camera(data: &[f32]) -> Option<CameraInfo> {
     } else {
         -1
     };
+    i += 1;
+
+    // max_res and is_cropped follow group_id (default false if absent / at terminator).
+    let max_res = i < data.len() && !is_terminator(data[i]) && data[i] != 0.0;
+    i += 1;
+    let is_cropped = i < data.len() && !is_terminator(data[i]) && data[i] != 0.0;
 
     if crate::DEBUG {
         debug!(
@@ -388,6 +396,8 @@ pub fn parse_single_camera(data: &[f32]) -> Option<CameraInfo> {
         pixel_array_width,
         mode_count,
         group_id,
+        max_res,
+        is_cropped,
     };
 
     if crate::DEBUG {

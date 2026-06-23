@@ -3,7 +3,7 @@ use crate::shared_memory::*;
 extern crate libc;
 use jni::{
     objects::{JByteBuffer, JClass, JObject},
-    sys::{jfloat, jint, jlong, jobject},
+    sys::{jboolean, jfloat, jint, jlong, jobject},
     JNIEnv,
 };
 use log::*;
@@ -152,6 +152,8 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCameraOnFrame<'loc
     captured_iso: jint,
     captured_shutter_ns: jlong,
     captured_focus_distance: jfloat,
+    raw10: jboolean,
+    row_stride: jint,
 ) -> JObject<'local> {
     let integrator = unsafe { &mut *(ptr as *mut CameraIntegrator) };
 
@@ -172,6 +174,8 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCameraOnFrame<'loc
         captured_iso,
         captured_shutter_ns,
         captured_focus_distance,
+        raw10 != 0,
+        row_stride as usize,
     );
 
     // Create CameraSettings object

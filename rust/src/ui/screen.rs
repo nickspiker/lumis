@@ -11,9 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 
-/// Apply the 3x3 camera->Rec.2020 display matrix (magic_9_display) to a linear RGB
-/// triple. Row-major: out_r = m0*r + m1*g + m2*b, etc. Done in linear light, before the
-/// sqrt display encode.
+/// Apply the 3x3 camera->Rec.2020 display matrix (magic_9_display) to a linear RGB triple. Row-major: out_r = m0*r + m1*g + m2*b, etc. Done in linear light, before the sqrt display encode.
 #[inline]
 fn apply_display_matrix(ui: &UserInterface, r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let m = &ui.magic_9_display;
@@ -28,9 +26,7 @@ pub fn draw_screen(ui: &mut UserInterface, window: &NativeWindow, mut full_draw:
     // Check for new image by comparing counters - determines full vs partial draw
     let current_image_counter = ui.header[IMAGE_COUNTER_IDX];
 
-    // While the feed is frozen for calibration (and the overlay held), force full draws: the
-    // image counter is frozen so the normal new-frame trigger won't fire, and we need the
-    // frozen frame + overlay to paint, then a clean repaint on dismiss.
+    // While the feed is frozen for calibration (and the overlay held), force full draws: the image counter is frozen so the normal new-frame trigger won't fire, and we need the frozen frame + overlay to paint, then a clean repaint on dismiss.
     let hold_present = ui.calibration_hold.load().is_some() || ui.frozen_image_counter.is_some();
     if hold_present || ui.previous_hold_present {
         full_draw = true;
@@ -193,8 +189,7 @@ fn spawn_histogram_calculation(ui: &UserInterface, image_counter: u64) {
 }
 
 fn draw_full_screen(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_Buffer) {
-    // Draw the camera image (frozen during calibration). When a calibration hold is active,
-    // the in-place live overlay is composited per-pixel inside the fit-to-screen loop.
+    // Draw the camera image (frozen during calibration). When a calibration hold is active, the in-place live overlay is composited per-pixel inside the fit-to-screen loop.
     draw_camera_or_histogram(ui, pixels, buffer);
 
     if ui.controls_visible {
@@ -231,9 +226,7 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
     } else {
         let pixel_count = ui.sensor_x_size * ui.sensor_y_size;
 
-        // While calibration holds the feed, render from the snapshot taken at freeze time
-        // (avg at 0, diff at pixel_count) so the camera thread can't change it. Otherwise
-        // read the current live slot.
+        // While calibration holds the feed, render from the snapshot taken at freeze time (avg at 0, diff at pixel_count) so the camera thread can't change it. Otherwise read the current live slot.
         let frozen = ui.frozen_image_counter.is_some() && ui.frozen_image.len() >= 2 * pixel_count;
         let (raw_average, raw_difference) = if frozen {
             (
@@ -261,12 +254,7 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
         };
 
         if ui.view_1to1 {
-            // 1:1 pixel view (zoomed in). Each screen pixel maps to one sensor pixel via the pan
-            // offset + rotation. Average mode is colour: cheap per-pixel 2x2-block debayer +
-            // display matrix + sqrt (fast enough for the per-frame UI thread — the high-quality
-            // RCD demosaic is reserved for saving, not the live preview, matching how camera apps
-            // run a light demosaic live and the good one only on capture). Difference/Motion are
-            // monochrome magnitudes, left unmixed.
+            // 1:1 pixel view (zoomed in). Each screen pixel maps to one sensor pixel via the pan offset + rotation. Average mode is colour: cheap per-pixel 2x2-block debayer + display matrix + sqrt (fast enough for the per-frame UI thread — the high-quality RCD demosaic is reserved for saving, not the live preview, matching how camera apps run a light demosaic live and the good one only on capture). Difference/Motion are monochrome magnitudes, left unmixed.
             let scale_avg =
                 ui.display_gain as f32 * (65536. / (65536. - ui.raw_black_level as f32));
             for y in 0..ui.screen_rise {
@@ -328,18 +316,12 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
                     let idx = sensor_y * ui.sensor_x_size + sensor_x;
                     match current_mode {
                         RawMode::Average => {
-                            // 2x2-block colour debayer at (sensor_x, sensor_y), same scheme as the
-                            // fit-to-screen preview and the save fallback.
+                            // 2x2-block colour debayer at (sensor_x, sensor_y), same scheme as the fit-to-screen preview and the save fallback.
                             let bx = sensor_x & !1;
                             let by = sensor_y & !1;
                             let last = ui.sensor_x_size * ui.sensor_y_size - 1;
                             let base = (by * ui.sensor_x_size + bx).min(last);
-                            // Black-level subtract, mirroring the fit-to-screen path EXACTLY so
-                            // both clip indicators match: controls visible -> white-clip zeros
-                            // over-threshold channels (-> dark/false colour) AND black-clip uses a
-                            // WRAPPING sub so a pixel below black_level underflows to a huge u16 ->
-                            // renders WHITE (the crushed-shadow indicator). Controls hidden ->
-                            // saturating sub (no overlay).
+                            // Black-level subtract, mirroring the fit-to-screen path EXACTLY so both clip indicators match: controls visible -> white-clip zeros over-threshold channels (-> dark/false colour) AND black-clip uses a WRAPPING sub so a pixel below black_level underflows to a huge u16 -> renders WHITE (the crushed-shadow indicator). Controls hidden -> saturating sub (no overlay).
                             let bk = ui.raw_black_level;
                             let sub = |v: u16| -> f32 {
                                 if ui.controls_visible {
@@ -403,9 +385,7 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
                 }
             }
         } else {
-            // In-place calibration overlay (live_overlay): held until tap, composited per
-            // sensor pixel below. (min_x, min_y, ov_w, ov_h are full-res sensor coords at 2x
-            // scale; rgba_f32 linear 0..1.)
+            // In-place calibration overlay (live_overlay): held until tap, composited per sensor pixel below. (min_x, min_y, ov_w, ov_h are full-res sensor coords at 2x scale; rgba_f32 linear 0..1.)
             let cal_hold = ui.calibration_hold.load();
             let cal_overlay = cal_hold.as_ref().as_ref();
 
@@ -528,11 +508,7 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
                     // Apply clipping and black level adjustments based on mode
                     let (tl, tr, bl, br) = match current_mode {
                         RawMode::Average => {
-                            // Clipping overlay (controls visible): white-clip zeros over-threshold
-                            // channels (-> dark/false colour), and black-clip uses a WRAPPING
-                            // subtract so a pixel below black_level underflows to a huge value ->
-                            // renders WHITE. That flash-white-on-crushed-shadow IS the black-clip
-                            // indicator. Controls hidden: plain saturating subtract (no overlay).
+                            // Clipping overlay (controls visible): white-clip zeros over-threshold channels (-> dark/false colour), and black-clip uses a WRAPPING subtract so a pixel below black_level underflows to a huge value -> renders WHITE. That flash-white-on-crushed-shadow IS the black-clip indicator. Controls hidden: plain saturating subtract (no overlay).
                             if ui.controls_visible {
                                 (
                                     if tl > ui_constants::CLIPPING_THRESHOLD {
@@ -632,16 +608,11 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
                         RawMode::Difference | RawMode::Motion => ui.display_gain as f32,
                     };
 
-                    // Linear scale, then apply the camera->Rec.2020 display matrix in
-                    // LINEAR space (mixes channels), then sqrt-encode for the BT.2020
-                    // surface. Average mode is colour (debayered) so colour-correct;
-                    // diff/motion are monochrome magnitudes - leave them unmixed.
+                    // Linear scale, then apply the camera->Rec.2020 display matrix in LINEAR space (mixes channels), then sqrt-encode for the BT.2020 surface. Average mode is colour (debayered) so colour-correct; diff/motion are monochrome magnitudes - leave them unmixed.
                     let (mut lr, mut lg, mut lb) =
                         (r as f32 * scale, g as f32 * scale, b as f32 * scale);
 
-                    // Composite the in-place calibration overlay in linear space, before the
-                    // display matrix. Overlay coords are in raw sensor frame (1x); map this
-                    // pixel's sensor coord directly into it.
+                    // Composite the in-place calibration overlay in linear space, before the display matrix. Overlay coords are in raw sensor frame (1x); map this pixel's sensor coord directly into it.
                     if let Some((min_x, min_y, ov_w, ov_h, overlay)) = cal_overlay {
                         let ox = sensor_x;
                         let oy = sensor_y;
@@ -950,9 +921,7 @@ pub fn restore_counter_areas(ui: &UserInterface, pixels: &mut [u8], stride: usiz
                 let dst_idx = (y * stride + x) * 3;
                 pixels[dst_idx] = ui.counter_buffers[i][buf_idx];
                 pixels[dst_idx + 1] = ui.counter_buffers[i][buf_idx + 1];
-                // +32 blue is a debug tint to visualise the counter restore region; in
-                // production restore the original pixel untinted. (Wrapping add, like the
-                // rest of the codebase; the tint values never approach overflow anyway.)
+                // +32 blue is a debug tint to visualise the counter restore region; in production restore the original pixel untinted. (Wrapping add, like the rest of the codebase; the tint values never approach overflow anyway.)
                 pixels[dst_idx + 2] = if crate::DEBUG {
                     ui.counter_buffers[i][buf_idx + 2] + 32
                 } else {

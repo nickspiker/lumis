@@ -48,6 +48,7 @@ pub fn initialize_raw_info() -> RawInfo {
         ifdoffset: 0,
         duck: false,
         save_scan: false,
+        cfapatternoffset: 0,
     }
 }
 pub struct RawInfo {
@@ -81,6 +82,8 @@ pub struct RawInfo {
     pub ifdoffset: u32,
     pub duck: bool,
     pub save_scan: bool,
+    /// Patched with the file offset of the out-of-line 16-byte (4x4 quad-Bayer) CFA pattern. Unused (0) for inline 2x2 patterns.
+    pub cfapatternoffset: u32,
 }
 
 pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
@@ -167,14 +170,25 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
     basedng.extend([40, 1, 3, 0, 1, 0, 0, 0, 1, 0, 0, 0]); //Resolution unit
     numifd += 1;
 
-    basedng.extend([141, 130, 3, 0, 2, 0, 0, 0, 2, 0, 2, 0]); //CFA pattern dimension
+    // CFARepeatPatternDim (0x828D): the CFA tile size. 2x2 for a standard Bayer, 4x4 for a quad-Bayer (Tetracell) sensor where 2x2 clusters share a colour.
+    let (cfa_dim, cfa_w_h): (u16, u8) = match rawinfo.cfa.len() {
+        4 => (2, 2),
+        16 => (4, 4),
+        _ => panic!("Only 2x2 (4-byte) or 4x4 (16-byte) CFA patterns are supported!"),
+    };
+    let _ = cfa_dim;
+    basedng.extend([141, 130, 3, 0, 2, 0, 0, 0, cfa_w_h, 0, cfa_w_h, 0]); //CFA pattern dimension
     numifd += 1;
 
-    basedng.extend([142, 130, 1, 0, 4, 0, 0, 0]); //CFA pattern
+    // CFAPattern (0x828E): the per-cell colour indices. A 4-byte (2x2) pattern fits inline in the IFD value field; a 16-byte (4x4 quad-Bayer) pattern does not, so it is written out-of-line and patched in at the end (offset recorded in rawinfo.cfapatternoffset).
     if rawinfo.cfa.len() == 4 {
+        basedng.extend([142, 130, 1, 0, 4, 0, 0, 0]); //CFA pattern (inline)
         basedng.extend(rawinfo.cfa.clone());
     } else {
-        panic!("Only CFA size of 2x2 is supported!")
+        basedng.extend([142, 130, 1, 0, 16, 0, 0, 0]); //CFA pattern (16 bytes, out-of-line)
+        // The value field (the offset) is the next 4 bytes we append; record its position so it can be patched once the pattern's file offset is known.
+        rawinfo.cfapatternoffset = basedng.len() as u32;
+        basedng.extend([0, 0, 0, 0]); // placeholder offset, patched below
     }
     numifd += 1;
 
@@ -311,6 +325,19 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
     basedng.extend([0, 0, 0, 0]);
     if basedng.len() % word != 0 {
         basedng.extend(vec![0u8; word - basedng.len() % word]);
+    }
+
+    // Append the 16-byte quad-Bayer CFA pattern out-of-line and patch its offset (only when a 4x4 pattern was requested; the 2x2 case is inline and leaves cfapatternoffset == 0).
+    if rawinfo.cfapatternoffset != 0 {
+        let offset = (basedng.len() as u32).to_le_bytes();
+        basedng[rawinfo.cfapatternoffset as usize] = offset[0];
+        basedng[rawinfo.cfapatternoffset as usize + 1] = offset[1];
+        basedng[rawinfo.cfapatternoffset as usize + 2] = offset[2];
+        basedng[rawinfo.cfapatternoffset as usize + 3] = offset[3];
+        basedng.extend(rawinfo.cfa.clone());
+        if basedng.len() % word != 0 {
+            basedng.extend(vec![0u8; word - basedng.len() % word]);
+        }
     }
 
     let offset = (basedng.len() as u32).to_le_bytes(); //Assign raw data offset

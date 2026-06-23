@@ -1,9 +1,6 @@
 //! Rec.2020 ICC profile + per-container embedding (JPEG / TIFF / JPEG XL).
 //!
-//! The RGB exports are encoded in Rec.2020 primaries with a sqrt (gamma 2.0) transfer (the same
-//! pipeline as the on-screen BT.2020 surface). Without an embedded profile, viewers assume sRGB
-//! and render the wide-gamut data wrong. We synthesize a compact ICC v2 matrix/TRC profile
-//! describing BT.2020 primaries + gamma 2.0, and inject it into each container.
+//! The RGB exports are encoded in Rec.2020 primaries with a sqrt (gamma 2.0) transfer (the same pipeline as the on-screen BT.2020 surface). Without an embedded profile, viewers assume sRGB and render the wide-gamut data wrong. We synthesize a compact ICC v2 matrix/TRC profile describing BT.2020 primaries + gamma 2.0, and inject it into each container.
 //!
 //! The profile is built once and cached. Colour values are s15Fixed16 (ICC fixed-point).
 
@@ -44,9 +41,7 @@ fn text_tag(s: &str) -> Vec<u8> {
 
 /// Build a minimal valid ICC v2 RGB matrix/TRC profile for BT.2020 + gamma 2.0.
 ///
-/// rXYZ/gXYZ/bXYZ are the BT.2020 primaries' XYZ contributions adapted to the D50 white point
-/// (the ICC PCS white). These were computed offline (Bradford adaptation of the BT.2020 RGB->XYZ
-/// matrix from D65 to D50) and are baked in as constants.
+/// rXYZ/gXYZ/bXYZ are the BT.2020 primaries' XYZ contributions adapted to the D50 white point (the ICC PCS white). These were computed offline (Bradford adaptation of the BT.2020 RGB->XYZ matrix from D65 to D50) and are baked in as constants.
 fn build_profile() -> Vec<u8> {
     // BT.2020 RGB->XYZ columns, Bradford-adapted to D50 (ICC PCS white).
     let r_xyz = (0.673459, 0.279033, -0.001924);
@@ -124,8 +119,7 @@ pub fn rec2020_icc() -> &'static [u8] {
 
 /// Insert an ICC profile into a baseline JPEG as one APP2 "ICC_PROFILE" segment.
 ///
-/// The profile is split into <=65519-byte chunks (we expect a single chunk for our tiny profile).
-/// The APP2 segment goes right after SOI (the first 2 bytes). Returns the new JPEG bytes.
+/// The profile is split into <=65519-byte chunks (we expect a single chunk for our tiny profile). The APP2 segment goes right after SOI (the first 2 bytes). Returns the new JPEG bytes.
 pub fn jpeg_with_icc(jpeg: &[u8], icc: &[u8]) -> Vec<u8> {
     const MARKER: &[u8] = b"ICC_PROFILE\0";
     const MAX_CHUNK: usize = 65535 - 2 - MARKER.len() - 2; // length field + marker + 2 seq bytes
@@ -153,7 +147,4 @@ pub fn jpeg_with_icc(jpeg: &[u8], icc: &[u8]) -> Vec<u8> {
     out
 }
 
-// Note: JPEG XL colour is signalled *inside* the codestream, not via a container box. Rather
-// than wrap a JP2-style 'colr' box (which JXL decoders ignore), the Lumis fork of zune-jpegxl
-// writes a real Rec.2020 ColourEncoding into the codestream — see `JxlSimpleEncoder::set_rec2020`.
-// So JXL needs no post-hoc ICC injection here.
+// Note: JPEG XL colour is signalled *inside* the codestream, not via a container box. Rather than wrap a JP2-style 'colr' box (which JXL decoders ignore), the Lumis fork of zune-jpegxl writes a real Rec.2020 ColourEncoding into the codestream — see `JxlSimpleEncoder::set_rec2020`. So JXL needs no post-hoc ICC injection here.

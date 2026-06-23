@@ -141,10 +141,12 @@ class CameraInterface : Service() {
        @JvmStatic
        external fun nativeCameraOnFrame(
            contextPtr: Long,
-           buffer: ByteBuffer, 
+           buffer: ByteBuffer,
            capturedIso: Int,
            capturedShutterNs: Long,
-           capturedFocusDistance: Float
+           capturedFocusDistance: Float,
+           raw10: Boolean,
+           rowStride: Int
        ): CameraSettings
        
        @JvmStatic
@@ -336,11 +338,8 @@ class CameraInterface : Service() {
        // Configure audio for STREAM_VOICE_CALL before starting camera
        configureAudioForCamera()
 
-       // The integrator is NOT created here. CameraProcessor first runs a one-shot
-       // auto-exposure to meter the scene, then calls back to initIntegrator() with
-       // the metered ISO/shutter so the manual sliders open at usable values on any
-       // device. After that the camera is fully manual.
-       cameraProcessor.openCamera(cameraInfo.logicalId, cameraInfo.physicalId)
+       // The integrator is NOT created here. CameraProcessor first runs a one-shot auto-exposure to meter the scene, then calls back to initIntegrator() with the metered ISO/shutter so the manual sliders open at usable values on any device. After that the camera is fully manual.
+       cameraProcessor.openCamera(cameraInfo.logicalId, cameraInfo.physicalId, cameraInfo.maxRes)
    }
 
    // Called by CameraProcessor once one-shot AE has settled, with the metered values.
@@ -404,6 +403,8 @@ class CameraInterface : Service() {
                i++ // Skip pixelArrayWidth
                i++ // Skip modeCount
                i++ // Skip groupId
+               val maxRes = cameraArray[i++] != 0f  // max-res (non-binned) readout
+               i++ // Skip isCropped (display-only; carried in CameraData/Rust)
                i++ // Skip hasPhysical flag (+/-Inf)
                // Read logical id string
                val logicalIdLength = cameraArray[i++].toInt()
@@ -420,13 +421,12 @@ class CameraInterface : Service() {
                        sensorOrientation, minIso, maxIso, minExposure, maxExposure, minFocusDistance,
                        hardwareLevel,
                        logicalId = logicalIdSb.toString(),
-                       physicalId = if (physicalIdSb.isEmpty()) null else physicalIdSb.toString()
+                       physicalId = if (physicalIdSb.isEmpty()) null else physicalIdSb.toString(),
+                       maxRes = maxRes
                    )
                }
 
-               // Skip rest of this camera's data until the -0.0f terminator. Detect by
-               // sign bit: -0.0f == 0.0f by IEEE equality, so a plain "!= -0.0f" would
-               // also stop at a legitimate 0.0f field (e.g. groupId 0).
+               // Skip rest of this camera's data until the -0.0f terminator. Detect by sign bit: -0.0f == 0.0f by IEEE equality, so a plain "!= -0.0f" would also stop at a legitimate 0.0f field (e.g. groupId 0).
                while (i < cameraArray.size &&
                       !(cameraArray[i] == 0.0f && (1f / cameraArray[i]) < 0f)) {
                    i++
@@ -525,14 +525,8 @@ class CameraInterface : Service() {
            val rawCameras = mutableListOf<CameraData>()
            val nonRawCameras = mutableListOf<CameraData>()
 
-           // Monotonic index across BOTH top-level and hidden physical cameras, so
-           // every entry the menu shows has a stable, openable index.
-           // We want ONE entry per real physical sensor. A logical multi-camera (Pixel
-           // rear/front) is a virtual wrapper that just fuses/switches among its physical
-           // sub-cameras, so listing both the logical AND its physicals produced dupes
-           // (the logical == its default physical). Rule: if a camera is a logical
-           // multi-camera with RAW physicals, list those physicals instead of itself;
-           // otherwise list the camera directly.
+           // Monotonic index across BOTH top-level and hidden physical cameras, so every entry the menu shows has a stable, openable index.
+           // We want ONE entry per real physical sensor. A logical multi-camera (Pixel rear/front) is a virtual wrapper that just fuses/switches among its physical sub-cameras, so listing both the logical AND its physicals produced dupes (the logical == its default physical). Rule: if a camera is a logical multi-camera with RAW physicals, list those physicals instead of itself; otherwise list the camera directly.
            var index = 0
            for (cameraId in cameraIds) {
                try {
@@ -552,6 +546,14 @@ class CameraInterface : Service() {
                            if (physInfo.supportsRaw) {
                                rawPhysicals.add(physInfo)
                                index++
+                               // Offer a second entry for the non-binned max-res readout.
+                               if (supportsMaxRes(physChars)) {
+                                   rawPhysicals.add(extractCameraData(
+                                       index, physicalId, physChars,
+                                       logicalId = cameraId, physicalId = physicalId, maxRes = true
+                                   ))
+                                   index++
+                               }
                            } else {
                                Log.i("CameraInterface", "Physical camera $physicalId (under $cameraId) has no RAW - skipping")
                            }
@@ -561,13 +563,19 @@ class CameraInterface : Service() {
                    }
 
                    if (rawPhysicals.isNotEmpty()) {
-                       // Logical multi-camera: list its real sensors, NOT the logical wrapper.
+                       // Logical multi-camera: list its real sensors, NOT the logical wrapper. The physical sub-cameras expose their own RAW10 max-res config (added per-physical above), so we do NOT add a separate logical max-res entry - that duplicated the primary lens's 50MP mode.
                        rawCameras.addAll(rawPhysicals)
                    } else {
                        // Plain camera (or logical with no RAW physicals): list it directly.
                        val cameraInfo = extractCameraData(index++, cameraId, characteristics)
                        if (cameraInfo.supportsRaw) {
                            rawCameras.add(cameraInfo)
+                           // Offer a second entry for the non-binned max-res readout.
+                           if (supportsMaxRes(characteristics)) {
+                               rawCameras.add(extractCameraData(
+                                   index++, cameraId, characteristics, maxRes = true
+                               ))
+                           }
                        } else {
                            nonRawCameras.add(cameraInfo)
                        }
@@ -577,28 +585,25 @@ class CameraInterface : Service() {
                }
            }
            
-           // The HAL exposes the SAME physical lens several times as different capture
-           // modes (full-res vs binned, etc) - e.g. the Pixel main wide appears as two
-           // physical ids. Group by real lens, keyed by (facing, focal). We send ALL
-           // modes (not just a representative) so the menu can offer a second screen to
-           // pick a specific mode; the highest-res mode of each lens carries modeCount =
-           // group size (it's the row shown on the main screen and the group's head),
-           // and every mode in a lens shares a groupId so the menu can cluster them.
+           // The HAL exposes the SAME physical lens several times as different capture modes (full-res vs binned, etc) - e.g. the Pixel main wide appears as two physical ids. Group by real lens, keyed by (facing, focal). We send ALL modes (not just a representative) so the menu can offer a second screen to pick a specific mode; the highest-res mode of each lens carries modeCount = group size (it's the row shown on the main screen and the group's head), and every mode in a lens shares a groupId so the menu can cluster them.
+           // Group by real lens (facing + focal). ALL modes of a lens - binned, full-res (max-res), cropped - share one group so screen 1 shows one row per lens and the existing mode sub-screen (screen 2) lists that lens's resolution options.
            val rawByLens = rawCameras.groupBy { Pair(it.facing, lensFocalKey(it)) }
 
-           // Order lenses: back before front (BACK=1 > FRONT=0), then ascending focal
-           // (wide -> tele). Sort by each lens's representative (highest-res) mode.
+           // Order lenses: back before front (BACK=1 > FRONT=0), then ascending focal (wide -> tele). Within a lens, the HEAD (modeIdx 0, shown on screen 1 and opened by default) is the standard binned full-FOV mode - the safe/fast default - NOT the heavy max-res or cropped variants. Order: binned-full first, then the rest by descending resolution as drill-in options on screen 2.
+           val modeRank = compareBy<CameraData>(
+               { if (!it.maxRes && !it.isCropped) 0 else 1 }, // binned full-FOV first
+               { -(it.width.toLong() * it.height.toLong()) }   // then largest first
+           )
            val lensOrder = compareByDescending<List<CameraData>> { it.first().facing }
                .thenBy { it.first().focalLengths.firstOrNull() ?: Float.MAX_VALUE }
            val sortedLenses = rawByLens.values
-               .map { group -> group.sortedByDescending { it.width.toLong() * it.height.toLong() } }
+               .map { group -> group.sortedWith(modeRank) }
                .sortedWith(lensOrder)
 
            val rawWithGroups = mutableListOf<CameraData>()
            for ((groupId, modes) in sortedLenses.withIndex()) {
                modes.forEachIndexed { modeIdx, mode ->
-                   // Head mode (highest res, modeIdx 0) carries the real mode count so the
-                   // menu shows "multiple" and treats it as the group head; others = 1.
+                   // Head mode (highest res, modeIdx 0) carries the real mode count so the menu shows "multiple" and treats it as the group head; others = 1.
                    rawWithGroups.add(mode.copy(
                        groupId = groupId,
                        modeCount = if (modeIdx == 0) modes.size else 1
@@ -611,8 +616,7 @@ class CameraInterface : Service() {
                    .thenBy { it.focalLengths.firstOrNull() ?: Float.MAX_VALUE }
            )
 
-           // Reassign contiguous indices so the menu->open index mapping holds. Each mode
-           // keeps a unique index; StartCamera(index) opens that exact mode.
+           // Reassign contiguous indices so the menu->open index mapping holds. Each mode keeps a unique index; StartCamera(index) opens that exact mode.
            val allCameras = (rawWithGroups + sortedNonRawCameras).mapIndexed { i, cam -> cam.copy(index = i) }
 
            for (camera in allCameras) {
@@ -636,12 +640,9 @@ class CameraInterface : Service() {
        val index: Int,
        val androidCameraId: String,
        val cameraId: String,
-       // The logical camera that must be opened to access this sensor. For a
-       // top-level camera this equals androidCameraId. For a hidden physical
-       // sub-camera (e.g. Pixel ultrawide/telephoto) this is the parent logical id.
+       // The logical camera that must be opened to access this sensor. For a top-level camera this equals androidCameraId. For a hidden physical sub-camera (e.g. Pixel ultrawide/telephoto) this is the parent logical id.
        val logicalId: String,
-       // Non-null only for hidden physical sub-cameras: the physical id to target
-       // via OutputConfiguration.setPhysicalCameraId().
+       // Non-null only for hidden physical sub-cameras: the physical id to target via OutputConfiguration.setPhysicalCameraId().
        val physicalId: String?,
        val facing: Int,
        val width: Int,
@@ -663,16 +664,17 @@ class CameraInterface : Service() {
        val hardwareLevel: Int,
        val sensorOrientation: Int,
        val pixelArrayWidth: Int,
-       // Number of distinct capture modes this lens has, set on the group HEAD mode
-       // (>1 => menu shows "multiple" and opens the mode sub-picker). Non-head modes = 1.
+       // Number of distinct capture modes this lens has, set on the group HEAD mode (>1 => menu shows "multiple" and opens the mode sub-picker). Non-head modes = 1.
        val modeCount: Int = 1,
-       // Modes of the same physical lens share a groupId so the menu can cluster them
-       // and the sub-picker can list just that lens's modes. -1 = ungrouped.
-       val groupId: Int = -1
+       // Modes of the same physical lens share a groupId so the menu can cluster them and the sub-picker can list just that lens's modes. -1 = ungrouped.
+       val groupId: Int = -1,
+       // Maximum-resolution (non-binned) sensor readout. When true the stream uses the MaximumResolution stream config + SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION (e.g. the Pixel main lens's 50MP mode vs the default 12.5MP 2x2-binned mode).
+       val maxRes: Boolean = false,
+       // This RAW size images only a sub-region of the sensor's full active-array FOV (a cropped/digital-zoom readout) rather than the whole area.
+       val isCropped: Boolean = false
    )
 
-   // Group key identifying a real physical lens: facing + focal length (rounded to
-   // 0.1mm). The HAL lists one lens multiple times as different modes that share these.
+   // Group key identifying a real physical lens: facing + focal length (rounded to 0.1mm). The HAL lists one lens multiple times as different modes that share these.
    private fun lensFocalKey(camera: CameraData): Int {
        val f = if (camera.focalLengths.isNotEmpty()) camera.focalLengths[0] else 0f
        return Math.round(f * 10f)
@@ -712,24 +714,48 @@ class CameraInterface : Service() {
        cameraId: String,
        characteristics: CameraCharacteristics,
        logicalId: String = cameraId,
-       physicalId: String? = null
+       physicalId: String? = null,
+       // When true, read sizes/levels from the MAXIMUM_RESOLUTION stream config (the non-binned native readout) instead of the default binned one.
+       maxRes: Boolean = false
    ): CameraData {
        val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
        val supportsRaw = capabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)
-       
+
        val facing = characteristics.get(CameraCharacteristics.LENS_FACING) ?: CameraCharacteristics.LENS_FACING_BACK
        val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
        val hardwareLevel = characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ?: 0
-       
-       val streamConfigMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-       val rawSizes = streamConfigMap?.getOutputSizes(ImageFormat.RAW_SENSOR) ?: arrayOf()
-       val rawSize = if (rawSizes.isNotEmpty()) rawSizes[0] else Size(0, 0)
-       
-       // SENSOR_INFO_PHYSICAL_SIZE covers the FULL sensor, but the lens only images
-       // onto the active (used) array - and FOV must be computed from the area that's
-       // actually imaged. Scale physical size by (activeArray / pixelArray) so the
-       // effective sensor dimensions match the projection. Without this the telephoto
-       // FOVs came out wrong (full-sensor diagonal overstated their angle).
+
+       // For max-res, the RAW sizes come from the MaximumResolution stream config map (API 31+); otherwise the default binned map.
+       val streamConfigMap = if (maxRes && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+           characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+       } else {
+           characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+       }
+       // Max-res RAW comes from the high-resolution (stalling) size list; binned RAW from the regular one.
+       val rawSizes = if (maxRes) {
+           maxResRawSizes(streamConfigMap, characteristics)
+       } else {
+           (streamConfigMap?.getOutputSizes(ImageFormat.RAW_SENSOR) ?: arrayOf()).toList()
+       }
+       // Pick the largest RAW size offered (max-res maps may list several).
+       val rawSize = rawSizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: Size(0, 0)
+
+       // Crop detection: does this RAW size cover the full active-array FOV, or only a sub-region? Compare its aspect ratio to the (max-res-aware) active array's. A mismatch beyond a small tolerance means a cropped/digital-zoom readout.
+       val fullActive = if (maxRes && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+           characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION)
+       } else {
+           null
+       } ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+       val isCropped = if (fullActive != null && rawSize.width > 0 && rawSize.height > 0
+           && fullActive.width() > 0 && fullActive.height() > 0) {
+           val rawAspect = rawSize.width.toFloat() / rawSize.height
+           val activeAspect = fullActive.width().toFloat() / fullActive.height()
+           kotlin.math.abs(rawAspect - activeAspect) > 0.02f
+       } else {
+           false
+       }
+
+       // SENSOR_INFO_PHYSICAL_SIZE covers the FULL sensor, but the lens only images onto the active (used) array - and FOV must be computed from the area that's actually imaged. Scale physical size by (activeArray / pixelArray) so the effective sensor dimensions match the projection. Without this the telephoto FOVs came out wrong (full-sensor diagonal overstated their angle).
        val physicalSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
        val pixelArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
        val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
@@ -789,10 +815,49 @@ class CameraInterface : Service() {
            hasOis = hasOis,
            hardwareLevel = hardwareLevel,
            sensorOrientation = sensorOrientation,
-           pixelArrayWidth = pixelArrayWidth
+           pixelArrayWidth = pixelArrayWidth,
+           maxRes = maxRes,
+           isCropped = isCropped
        )
    }
-   
+
+   // True if this camera advertises the ultra-high-resolution (non-binned) sensor mode, i.e. a distinct MAXIMUM_RESOLUTION RAW readout we can offer as a second entry.
+   private fun supportsMaxRes(characteristics: CameraCharacteristics): Boolean {
+       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
+       val maxMap = characteristics.get(
+           CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION
+       )
+       // The max-res RAW config (RAW10) lives in the high-resolution size list. Gate on an actual returned size: the Pixel doesn't set the ULTRA_HIGH_RESOLUTION cap bit, so the size's presence is the real signal.
+       val maxRawSizes = maxResRawSizes(maxMap, characteristics)
+       return maxRawSizes.isNotEmpty()
+   }
+
+   // RAW sizes for the maximum-resolution mode. The StreamConfigurationMap on the Pixel advertises RAW (format 37) in the max-res map but returns NOTHING from both getHighResolutionOutputSizes() and getOutputSizes() (a known framework quirk). So we also derive the size directly from the max-res pixel-array metadata when the sensor advertises the ULTRA_HIGH_RESOLUTION capability.
+   internal fun maxResRawSizes(
+       map: android.hardware.camera2.params.StreamConfigurationMap?,
+       characteristics: CameraCharacteristics? = null
+   ): List<Size> {
+       // The max-res config exposes RAW as RAW10 (format 37), not RAW_SENSOR.
+       val sizes = mutableListOf<Size>()
+       if (map != null) {
+           try { map.getHighResolutionOutputSizes(ImageFormat.RAW10)?.let { sizes.addAll(it) } } catch (e: Exception) {}
+           map.getOutputSizes(ImageFormat.RAW10)?.let { sizes.addAll(it) }
+       }
+       // Fallback: the Pixel lists RAW10 in the max-res map but may not return a size from the size methods. Synthesize from the max-res pixel array when the map lists RAW10.
+       if (sizes.isEmpty() && characteristics != null
+           && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+           val rawListed = map?.outputFormats?.contains(ImageFormat.RAW10) == true
+           if (rawListed) {
+               val px = characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE_MAXIMUM_RESOLUTION)
+                   ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION)?.let { Size(it.width(), it.height()) }
+               if (px != null && px.width > 0 && px.height > 0) {
+                   sizes.add(Size(px.width, px.height))
+               }
+           }
+       }
+       return sizes
+   }
+
    private fun packCameraData(camera: CameraData, output: MutableList<Float>) {
        output.add(Float.NaN)
        output.add(camera.index.toFloat())
@@ -828,8 +893,9 @@ class CameraInterface : Service() {
        output.add(camera.pixelArrayWidth.toFloat())
        output.add(camera.modeCount.toFloat())  // >1 on group head => lens has multiple modes
        output.add(camera.groupId.toFloat())    // modes of the same lens share this
-       // Physical-camera plumbing (appended after the fields the Rust menu parser
-       // reads; it ignores everything up to the -0.0f terminator).
+       output.add(if (camera.maxRes) 1f else 0f)     // max-res (non-binned) readout
+       output.add(if (camera.isCropped) 1f else 0f)  // cropped sub-FOV readout
+       // Physical-camera plumbing (appended after the fields the Rust menu parser reads; it ignores everything up to the -0.0f terminator).
        output.add(if (camera.physicalId != null) Float.POSITIVE_INFINITY else Float.NEGATIVE_INFINITY)
        output.add(camera.logicalId.length.toFloat())
        for (char in camera.logicalId) {
@@ -867,7 +933,8 @@ data class CameraInfo(
    val minFocusDistance: Float,
    val hardwareLevel: Int,
    val logicalId: String = "",
-   val physicalId: String? = null
+   val physicalId: String? = null,
+   val maxRes: Boolean = false
 )
 
 // Camera processor - handles Camera2 API
@@ -884,13 +951,12 @@ class CameraProcessor(private val service: CameraInterface) {
    private var backgroundThread: HandlerThread? = null
    private var backgroundHandler: Handler? = null
    private var cameraId: String? = null
-   // Set when the selected sensor is a hidden physical sub-camera; targeted via
-   // OutputConfiguration.setPhysicalCameraId() on its parent logical camera.
+   // Set when the selected sensor is a hidden physical sub-camera; targeted via OutputConfiguration.setPhysicalCameraId() on its parent logical camera.
    private var physicalCameraId: String? = null
-   
-   // One-shot auto-exposure warm-up: when a camera opens we let Camera2 meter the
-   // scene for a few frames, then seed the manual ISO/shutter from what it picked and
-   // switch to full manual. Avoids hardcoding an exposure that's wrong on other sensors.
+   // True when the selected mode is the maximum-resolution (non-binned) readout: the ImageReader uses the max-res size and every capture request sets SENSOR_PIXEL_MODE.
+   private var useMaxResolution: Boolean = false
+
+   // One-shot auto-exposure warm-up: when a camera opens we let Camera2 meter the scene for a few frames, then seed the manual ISO/shutter from what it picked and switch to full manual. Avoids hardcoding an exposure that's wrong on other sensors.
    private var aeWarmingUp = true
    private var aeFrameCount = 0
    private val AE_MAX_WARMUP_FRAMES = 20  // ~fallback if the HAL never reports CONVERGED
@@ -945,9 +1011,7 @@ class CameraProcessor(private val service: CameraInterface) {
    private val imageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
        val image = reader.acquireLatestImage() ?: return@OnImageAvailableListener
 
-       // During AE warm-up the integrator doesn't exist yet (nativeContextPtr==0).
-       // We MUST still close these frames or the ImageReader (maxImages=2) fills up
-       // and acquireLatestImage throws, crashing the camera thread.
+       // During AE warm-up the integrator doesn't exist yet (nativeContextPtr==0). We MUST still close these frames or the ImageReader (maxImages=2) fills up and acquireLatestImage throws, crashing the camera thread.
        if (nativeContextPtr == 0L) {
            image.close()
            return@OnImageAvailableListener
@@ -955,6 +1019,9 @@ class CameraProcessor(private val service: CameraInterface) {
 
        try {
            val buffer = image.planes[0].buffer
+           // RAW10 (the max-res format on this device) is MIPI-packed and row-padded; Rust depacks it. RAW_SENSOR is already 16-bit so no depack. rowStride is in bytes.
+           val isRaw10 = image.format == ImageFormat.RAW10
+           val rowStride = image.planes[0].rowStride
 
            // Get capture metadata
            val captureResult = lastCaptureResult
@@ -965,10 +1032,12 @@ class CameraProcessor(private val service: CameraInterface) {
            // Pass frame to Camera processing and get camera settings to apply
            val cameraSettings = CameraInterface.nativeCameraOnFrame(
                nativeContextPtr,
-               buffer, 
+               buffer,
                actualIso,
                actualShutterSpeedNs,
-               actualFocusDistance
+               actualFocusDistance,
+               isRaw10,
+               rowStride
            )
            
            // Check if there's saved image data to process (any format)
@@ -1024,7 +1093,8 @@ class CameraProcessor(private val service: CameraInterface) {
    }
    
    @SuppressLint("MissingPermission")
-   fun openCamera(logicalId: String, physicalId: String?) {
+   fun openCamera(logicalId: String, physicalId: String?, maxRes: Boolean = false) {
+       useMaxResolution = maxRes
        // Start background thread with high priority
        backgroundThread = HandlerThread("CameraThread").apply {
            start()
@@ -1037,25 +1107,35 @@ class CameraProcessor(private val service: CameraInterface) {
            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
        }
 
-       // We always OPEN the logical camera; for a physical sub-camera we route the
-       // RAW stream to it via setPhysicalCameraId() when configuring the session.
+       // We always OPEN the logical camera; for a physical sub-camera we route the RAW stream to it via setPhysicalCameraId() when configuring the session.
        cameraId = logicalId
        physicalCameraId = physicalId
        aeWarmingUp = true
        aeFrameCount = 0
 
-       // RAW sizes must come from whichever sensor actually produces the stream -
-       // the physical camera if targeting one, else the logical camera.
+       // RAW sizes must come from whichever sensor actually produces the stream - the physical camera if targeting one, else the logical camera. For the max-res mode read from the MaximumResolution stream config (the non-binned native readout).
        val sizeChars = cameraManager!!.getCameraCharacteristics(physicalId ?: logicalId)
-       val streamConfigMap = sizeChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-       val rawSizes = streamConfigMap!!.getOutputSizes(ImageFormat.RAW_SENSOR)
-       val rawSize = rawSizes[0]
+       val streamConfigMap = if (maxRes && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+           sizeChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+       } else {
+           sizeChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+       }
+       // The max-res config exposes RAW only as RAW10 (10-bit MIPI-packed), not RAW_SENSOR. Binned uses 16-bit RAW_SENSOR. Choose the format + size accordingly.
+       val rawFormat = if (maxRes) ImageFormat.RAW10 else ImageFormat.RAW_SENSOR
+       val rawSizes: List<Size> = if (maxRes && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+           service.maxResRawSizes(streamConfigMap, sizeChars)
+       } else {
+           (streamConfigMap!!.getOutputSizes(rawFormat) ?: arrayOf()).toList()
+       }
+       // Largest available (max-res maps may list several).
+       val rawSize = rawSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }!!
+       Log.i("CameraInterface", "openCamera rawSize picked=${rawSize.width}x${rawSize.height} format=${if (maxRes) "RAW10" else "RAW_SENSOR"} maxRes=$maxRes")
 
        // Create ImageReader
        imageReader = ImageReader.newInstance(
            rawSize.width,
            rawSize.height,
-           ImageFormat.RAW_SENSOR,
+           rawFormat,
            2
        ).apply {
            setOnImageAvailableListener(imageAvailableListener, backgroundHandler)
@@ -1088,20 +1168,27 @@ class CameraProcessor(private val service: CameraInterface) {
        }
    }
 
-   // Build a manual capture request targeting the RAW ImageReader, applying the
-   // current manual settings. When a physical sub-camera is selected, the same
-   // settings are also set as physical-camera keys so the chosen sensor obeys them.
+   // Build a manual capture request targeting the RAW ImageReader, applying the current manual settings. When a physical sub-camera is selected, the same settings are also set as physical-camera keys so the chosen sensor obeys them.
    private fun buildManualRequest(device: CameraDevice): CaptureRequest.Builder {
        val b = device.createCaptureRequest(CameraDevice.TEMPLATE_MANUAL)
        b.addTarget(imageReader!!.surface)
-       // Manual sensor keys on the logical request propagate to the single physical
-       // RAW stream on this HAL, so per-physical-camera keys aren't needed (and
-       // setPhysicalCameraKey is rejected for a non-streaming-config physical id).
+       // Manual sensor keys on the logical request propagate to the single physical RAW stream on this HAL, so per-physical-camera keys aren't needed (and setPhysicalCameraKey is rejected for a non-streaming-config physical id).
        b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_OFF)
        b.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
        b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentShutterSpeedNs)
        b.set(CaptureRequest.LENS_FOCUS_DISTANCE, currentFocusDistance)
+       applyPixelMode(b)
        return b
+   }
+
+   // Select the maximum-resolution (non-binned) sensor pixel mode on a request when the chosen camera entry is the max-res variant. Must be set on EVERY request feeding the max-res-sized ImageReader, or the HAL rejects the size mismatch.
+   private fun applyPixelMode(b: CaptureRequest.Builder) {
+       if (useMaxResolution && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+           b.set(
+               CaptureRequest.SENSOR_PIXEL_MODE,
+               CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION
+           )
+       }
    }
    
    private fun createCaptureSession() {
@@ -1140,15 +1227,14 @@ class CameraProcessor(private val service: CameraInterface) {
        val device = cameraDevice ?: return
 
        try {
-           // Begin with an auto-exposure warm-up so we can meter the scene and pick
-           // sensible opening ISO/shutter; captureCallback flips us to manual once AE
-           // settles. Focus stays manual (infinity) throughout - we only auto exposure.
+           // Begin with an auto-exposure warm-up so we can meter the scene and pick sensible opening ISO/shutter; captureCallback flips us to manual once AE settles. Focus stays manual (infinity) throughout - we only auto exposure.
            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
            builder.addTarget(imageReader!!.surface)
            builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
            builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
            builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, currentFocusDistance)
+           applyPixelMode(builder)
            session.setRepeatingRequest(builder.build(), captureCallback, backgroundHandler)
            Log.i("CameraInterface", "Started AE warm-up")
        } catch (e: Exception) {
@@ -1156,15 +1242,13 @@ class CameraProcessor(private val service: CameraInterface) {
        }
    }
 
-   // AE has settled: seed the integrator with the metered values, then switch the
-   // repeating request to full manual. Runs on the camera background thread.
+   // AE has settled: seed the integrator with the metered values, then switch the repeating request to full manual. Runs on the camera background thread.
    private fun finishAeWarmup(meteredIso: Int, meteredShutterNs: Long) {
        aeWarmingUp = false
        currentIso = meteredIso
        currentShutterSpeedNs = meteredShutterNs
 
-       // Create the native integrator seeded with the metered values (this also calls
-       // setNativeContext on us), then start pushing frames via the manual request.
+       // Create the native integrator seeded with the metered values (this also calls setNativeContext on us), then start pushing frames via the manual request.
        service.initIntegrator(meteredIso, meteredShutterNs)
 
        val session = captureSession ?: return
