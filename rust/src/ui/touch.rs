@@ -34,6 +34,17 @@ pub fn handle_touch(
                 debug!("Touch start at ({:.1}, {:.1})", x, y);
             }
 
+            // Tapping the top-right counter block cycles the save format. This lives in the
+            // margin (handled before the dead-zone check below). counter_areas is kept up to
+            // date by save_counter_areas during rendering.
+            if point_in_counter_block(ui, x, y) {
+                let next = (ui.header[crate::shared_memory::SAVE_FORMAT_IDX] + 1)
+                    % crate::shared_memory::SAVE_FORMAT_COUNT;
+                ui.header[crate::shared_memory::SAVE_FORMAT_IDX] = next;
+                ui.touch_is_dead = true; // consume; don't also drive controls
+                return true; // request redraw so the indicator updates
+            }
+
             // Start touch
             ui.touch_start_x = x;
             ui.touch_start_y = y;
@@ -803,4 +814,24 @@ pub fn slider_to_horizontal(ui: &UserInterface, slider_pos: f32) -> f32 {
         );
     }
     result
+}
+
+/// True if (x, y) is within the top-right counter block (the S/I/F/format stack). Used to
+/// route a tap there to the save-format cycle instead of the margin dead-zone. Tests the
+/// union of `counter_areas` (kept current by save_counter_areas) with a small touch padding.
+fn point_in_counter_block(ui: &UserInterface, x: f32, y: f32) -> bool {
+    let pad = 8.0;
+    for &(x0, y0, x1, y1) in ui.counter_areas.iter() {
+        if x1 <= x0 || y1 <= y0 {
+            continue; // empty/uninitialised area
+        }
+        if x >= x0 as f32 - pad
+            && x <= x1 as f32 + pad
+            && y >= y0 as f32 - pad
+            && y <= y1 as f32 + pad
+        {
+            return true;
+        }
+    }
+    false
 }

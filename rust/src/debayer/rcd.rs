@@ -287,8 +287,14 @@ impl RcdData {
             }
         }
 
-        // Border interpolation - DISABLED for cropped preview use
-        // self.border_interpolate(raw_image, 4);
+        // Fill the 4px border RCD's interior loops (4..n-4) leave unprocessed by replicating the
+        // nearest interior pixel. Without this the border carries only the raw CFA channel (other
+        // two channels zero) -> coloured/black fringes. The region helper adds margin so this
+        // border lands outside the requested crop, but at sensor edges the margin is clamped, so
+        // a correct border fill matters there.
+        if raw_image.width > 8 && raw_image.height > 8 {
+            self.border_interpolate(raw_image, 4);
+        }
     }
 
     /// Calculate V statistic for vertical/horizontal discrimination

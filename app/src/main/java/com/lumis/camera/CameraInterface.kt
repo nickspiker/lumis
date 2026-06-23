@@ -177,7 +177,15 @@ class CameraInterface : Service() {
    // Native methods
    external fun nativeGetSavedDngData(): SaveDng?
    external fun nativeClearSaveInProgress(ptr: Long)
-   
+
+   // Map the Rust-assigned file extension to a MediaStore mime type.
+   fun mimeForFilename(filename: String): String = when (filename.substringAfterLast('.').lowercase()) {
+       "dng" -> "image/x-adobe-dng"
+       "tiff", "tif" -> "image/tiff"
+       "jxl" -> "image/jxl"
+       else -> "image/jpeg"
+   }
+
    // Called from JNI to save image data using MediaStore
    fun saveImageToMediaStoreImpl(imageData: ByteArray, filename: String, mimeType: String): Boolean {
        Log.i("CameraInterface", "Attempting to save: $filename")
@@ -963,11 +971,12 @@ class CameraProcessor(private val service: CameraInterface) {
                actualFocusDistance
            )
            
-           // Check if there's saved DNG data to process
+           // Check if there's saved image data to process (any format)
            service.nativeGetSavedDngData()?.let { savedData: SaveDng ->
-               Log.i("CameraInterface", "Processing saved DNG data: ${savedData.dngData.size} bytes, filename: ${savedData.filename}")
-               if (service.saveImageToMediaStoreImpl(savedData.dngData, savedData.filename, "image/x-adobe-dng")) {
-                   Log.i("CameraInterface", "Successfully saved DNG: ${savedData.filename}")
+               val mimeType = service.mimeForFilename(savedData.filename)
+               Log.i("CameraInterface", "Processing saved image: ${savedData.dngData.size} bytes, filename: ${savedData.filename}, mime: $mimeType")
+               if (service.saveImageToMediaStoreImpl(savedData.dngData, savedData.filename, mimeType)) {
+                   Log.i("CameraInterface", "Successfully saved: ${savedData.filename}")
                    // Clear save in progress flag so next save can proceed
                    service.nativeClearSaveInProgress(service.nativeCameraContextPtr)
                } else {

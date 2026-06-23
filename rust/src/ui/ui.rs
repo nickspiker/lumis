@@ -185,7 +185,7 @@ pub struct UserInterface {
     pub previous_histogram_counter: u64,
 
     // Counter text save/restore for partial redraws
-    pub counter_buffers: Vec<Vec<u8>>, // 3 buffers for saved/frame/fps
+    pub counter_buffers: Vec<Vec<u8>>, // 4 buffers for saved/frame/fps/format
     pub counter_areas: Vec<(usize, usize, usize, usize)>, // (x, y, end_x, end_y) for each
 }
 
@@ -536,8 +536,8 @@ impl UserInterface {
             previous_image_counter: 0,
             previous_exposure_start: 0,
             previous_histogram_counter: 0,
-            counter_buffers: vec![Vec::new(), Vec::new(), Vec::new()],
-            counter_areas: vec![(0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)],
+            counter_buffers: vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            counter_areas: vec![(0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)],
         };
 
         if crate::DEBUG {
@@ -673,6 +673,12 @@ impl UserInterface {
                 // Pointers to shared memory for writing calibration results back (as usize for Send)
                 let magic_9_display_addr = self.magic_9_display.as_mut_ptr() as usize;
                 let magic_9_display_gamma_addr = (self.magic_9_display_gamma as *mut f32) as usize;
+                // XYZ matrix (for RGB exports) and the DNG magic9inv bytes live in shared
+                // memory too; capture their addresses so the worker can write the results.
+                let magic_9_dng_xyz_addr = self.magic_9_dng_xyz.as_mut_ptr() as usize;
+                let magic_9_dng_xyz_gamma_addr = (self.magic_9_dng_xyz_gamma as *mut f32) as usize;
+                let magic_9_inv_addr =
+                    unsafe { self.header.as_mut_ptr().add(MAGIC_9_INV_IDX) as *mut u8 } as usize;
 
                 // Spawn calibration work on background thread to avoid ANR
                 // (sync_profiles makes blocking HTTP requests)
@@ -753,13 +759,29 @@ impl UserInterface {
                                 _warning,
                                 live_overlay,
                             )) => {
-                                // Write computed cam2terminal9 matrix to shared memory for live display
+                                // Write the calibration results to shared memory:
+                                // - cam2terminal9 (Rec.2020) -> magic_9_display for live preview.
+                                // - magic9inv (camera->XYZ ColorMatrix1) -> for the DNG.
+                                // - XYZ export matrix -> magic_9_dng_xyz. We don't yet have a
+                                //   separate XYZ terminal profile, so seed it from cam2terminal9
+                                //   for now (TODO: real XYZ profile). RGB exports use this.
                                 unsafe {
                                     let magic9_ptr = magic_9_display_addr as *mut f32;
                                     let magic9_slice = std::slice::from_raw_parts_mut(magic9_ptr, 9);
                                     magic9_slice.copy_from_slice(&raw_info.cam2terminal9);
-                                    let gamma_ptr = magic_9_display_gamma_addr as *mut f32;
-                                    *gamma_ptr = settings.terminal9[9];
+                                    *(magic_9_display_gamma_addr as *mut f32) = settings.terminal9[9];
+
+                                    let xyz_ptr = magic_9_dng_xyz_addr as *mut f32;
+                                    let xyz_slice = std::slice::from_raw_parts_mut(xyz_ptr, 9);
+                                    xyz_slice.copy_from_slice(&raw_info.cam2terminal9);
+                                    *(magic_9_dng_xyz_gamma_addr as *mut f32) = settings.terminal9[9];
+
+                                    let inv_ptr = magic_9_inv_addr as *mut u8;
+                                    std::ptr::copy_nonoverlapping(
+                                        raw_info.magic9inv.as_ptr(),
+                                        inv_ptr,
+                                        raw_info.magic9inv.len(),
+                                    );
                                 }
 
                                 // Hold the in-place live overlay over the frozen frame until tap.

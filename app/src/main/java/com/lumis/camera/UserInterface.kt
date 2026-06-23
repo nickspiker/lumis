@@ -583,10 +583,18 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
        if (event != null) {
            val deviceName = event.device?.name ?: ""
-           
+           // Diagnostic: which input device sent this key? The save trigger matches on
+           // gpio-keys/qpnp_pon; on some phones the volume keys report a different name.
+           Log.i("Lumis", "onKeyDown keyCode=$keyCode device='$deviceName' source=${event.source}")
+
            // Handle volume keys from physical buttons for save functions
+           // The on-device volume keypad reports "gpio_keys"/"gpio-keys" (varies by device,
+           // e.g. Pixel uses the underscore) or "qpnp_pon"; anything else (BT remotes like
+           // "AB Shutter3", keyboards) is treated as a shutter.
+           val isPhysicalButton = deviceName.contains("gpio") || deviceName.contains("qpnp_pon")
+
            if ((keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) &&
-               (deviceName.contains("gpio-keys") || deviceName.contains("qpnp_pon"))) {
+               isPhysicalButton) {
                // Physical volume buttons - handle save functions
                if (uiContextPtr != 0L) {
                    when (keyCode) {
@@ -606,7 +614,7 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
            }
            
            // Handle Bluetooth shutter buttons (various keycodes from non-physical devices)
-           if (!(deviceName.contains("gpio-keys") || deviceName.contains("qpnp_pon"))) {
+           if (!isPhysicalButton) {
                when (keyCode) {
                    KeyEvent.KEYCODE_VOLUME_UP,
                    KeyEvent.KEYCODE_VOLUME_DOWN,

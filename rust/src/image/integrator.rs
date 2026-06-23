@@ -354,6 +354,56 @@ impl CameraIntegrator {
             let bayer_pattern = self.header[SENSOR_BAYER_PATTERN_IDX] as u32;
             let device_orientation = self.header[SENSOR_ORIENTATION_IDX] as u16;
             let pixel_count = self.width * self.height;
+            let save_format = self.header[SAVE_FORMAT_IDX];
+            // XYZ matrix for RGB exports, and the magic9inv bytes for the DNG ColorMatrix1.
+            // magic_9_dng_xyz lives in zero-initialized shared memory and is only populated by
+            // a calibration scan. Pre-calibration it is all zeros, which would multiply every
+            // exported pixel to black; fall back to identity so uncalibrated RGB exports show
+            // the raw debayered scene (accuracy doesn't matter until calibrated anyway).
+            let xyz_matrix = {
+                let m = *self.magic_9_dng_xyz;
+                if m.iter().all(|&v| v == 0.) {
+                    [1., 0., 0., 0., 1., 0., 0., 0., 1.]
+                } else {
+                    m
+                }
+            };
+            // RGB exports (JPEG/TIFF/JXL) are tagged Rec.2020 to match the on-screen preview,
+            // so they use the camera->Rec.2020 display matrix, NOT the DNG's XYZ matrix. Same
+            // zero-fallback to identity for the uncalibrated case.
+            let display_matrix = {
+                let m = unsafe {
+                    *(self.header.as_ptr().add(MAGIC_9_DISPLAY_IDX) as *const [f32; 9])
+                };
+                if m.iter().all(|&v| v == 0.) {
+                    [1., 0., 0., 0., 1., 0., 0., 0., 1.]
+                } else {
+                    m
+                }
+            };
+            let mut magic9inv: [u8; 8 * 9] = unsafe {
+                let p = self.header.as_ptr().add(MAGIC_9_INV_IDX) as *const u8;
+                let mut a = [0u8; 8 * 9];
+                std::ptr::copy_nonoverlapping(p, a.as_mut_ptr(), 8 * 9);
+                a
+            };
+            // magic9inv is the DNG ColorMatrix1 (9 SRATIONALs, num/den i32 pairs). It is only
+            // written by a calibration scan; pre-calibration shared memory is all zeros, which
+            // is a degenerate (0/0) matrix that raw converters reject. Fall back to the identity
+            // SRATIONAL pattern so uncalibrated DNGs remain valid.
+            if magic9inv.iter().all(|&b| b == 0) {
+                magic9inv = [
+                    1, 0, 0, 0, 1, 0, 0, 0, //
+                    0, 0, 0, 0, 1, 0, 0, 0, //
+                    0, 0, 0, 0, 1, 0, 0, 0, //
+                    0, 0, 0, 0, 1, 0, 0, 0, //
+                    1, 0, 0, 0, 1, 0, 0, 0, //
+                    0, 0, 0, 0, 1, 0, 0, 0, //
+                    0, 0, 0, 0, 1, 0, 0, 0, //
+                    0, 0, 0, 0, 1, 0, 0, 0, //
+                    1, 0, 0, 0, 1, 0, 0, 0, //
+                ];
+            }
 
             // Calculate black level based on mode
             let image_black_level = match current_mode {
@@ -411,117 +461,139 @@ impl CameraIntegrator {
                 .as_millis();
             let millis = timestamp_ms % 1000;
 
-            let filename = format!(
-                "{} {} {:03}.dng",
+            // Base filename without extension; each encoder appends its own.
+            let filename_base = format!(
+                "{} {} {:03}",
                 mode_str,
                 datetime.format("%Y-%m-%d %H:%M:%S"),
                 millis
             );
 
-            // Build DNG header
-            let mut raw_info = RawInfo {
-                make: "Android".to_owned(),
-                makeoffset: 0,
-                makelen: 0,
-                model: "Lumis".to_owned(),
-                modeloffset: 0,
-                modellen: 0,
-                width: self.width,
-                height: self.height,
-                bitdepth: 16,
-                bitdepthold: 0,
-                rgb: false,
-                cfa: bayer_pattern_vec.clone(),
-                cfaw: 2,
-                cfah: 2,
-                black: if current_mode == 0 {
-                    image_black_level as f32
-                } else {
-                    0.
-                },
-                blackoffset: 0,
-                blackcount: 0,
-                blacktype: 0,
-                white: 65535.,
-                orientation: match device_orientation {
-                    0 => 1,
-                    1 => 8,
-                    2 => 3,
-                    3 => 6,
-                    _ => 1,
-                },
-                compression: false,
-                cam2terminal9: *self.magic_9_display,
-                magic9inv: [
-                    1, 0, 0, 0, 1, 0, 0, 0, //
-                    0, 0, 0, 0, 1, 0, 0, 0, //
-                    0, 0, 0, 0, 1, 0, 0, 0, //
-                    //
-                    0, 0, 0, 0, 1, 0, 0, 0, //
-                    1, 0, 0, 0, 1, 0, 0, 0, //
-                    0, 0, 0, 0, 1, 0, 0, 0, //
-                    //
-                    0, 0, 0, 0, 1, 0, 0, 0, //
-                    0, 0, 0, 0, 1, 0, 0, 0, //
-                    1, 0, 0, 0, 1, 0, 0, 0, //
-                ],
-                magicoffset: 0,
-                profileoffset: 0,
-                curveoffset: 0,
-                imagedataoffset: 0,
-                ifdoffset: 0,
-                duck: false,
-                save_scan: false,
-            };
+            // Copy the slot's raw u16 data for the save thread (the camera thread keeps
+            // overwriting the live slots). DNG needs the full data_length (avg, or avg+diff
+            // for motion); RGB exports debayer the average half.
+            let raw_slot: Vec<u16> =
+                self.image_buffer[data_offset..data_offset + data_length].to_vec();
 
-            // Create base DNG with header
-            let mut dng_bytes = make_base_dng(&mut raw_info);
+            let width = self.width;
+            let height = self.height;
+            let display_orientation = device_orientation; // 0/1/2/3 -> 0/90/180/270 below
 
-            // Append image data directly
-            let image_slice = &self.image_buffer[data_offset..data_offset + data_length];
-            let image_bytes = unsafe {
-                std::slice::from_raw_parts(image_slice.as_ptr() as *const u8, data_length * 2)
-            };
-            dng_bytes.extend_from_slice(image_bytes);
-
-            // Spawn save thread
-            let pixel_count = self.width * self.height;
             thread::spawn(move || {
-                log::info!("Save thread started for {}", filename);
+                use crate::image::save_encode::*;
+                use crate::shared_memory::*;
 
-                // Handle motion calculation if needed
-                let mut final_dng = dng_bytes;
-                if current_mode == 2 {
-                    // Motion mode: compute motion values in-place
-                    let data_start = final_dng.len() - (pixel_count * 4); // Start of our appended data
+                let orient_deg = match display_orientation {
+                    1 => 90u16,
+                    2 => 180,
+                    3 => 270,
+                    _ => 0,
+                };
 
-                    // Work with u16 view of the data
-                    let motion_data = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            final_dng[data_start..].as_mut_ptr() as *mut u16,
-                            pixel_count * 2,
+                let (bytes, ext): (Vec<u8>, &str) = if save_format == SAVE_FORMAT_DNG {
+                    // DNG: raw bayer + the real chameleon ColorMatrix1 (magic9inv) + D50.
+                    let mut raw_info = RawInfo {
+                        make: "Android".to_owned(),
+                        makeoffset: 0,
+                        makelen: 0,
+                        model: "Lumis".to_owned(),
+                        modeloffset: 0,
+                        modellen: 0,
+                        width,
+                        height,
+                        bitdepth: 16,
+                        bitdepthold: 0,
+                        rgb: false,
+                        cfa: bayer_pattern_vec.clone(),
+                        cfaw: 2,
+                        cfah: 2,
+                        black: if current_mode == 0 {
+                            image_black_level as f32
+                        } else {
+                            0.
+                        },
+                        blackoffset: 0,
+                        blackcount: 0,
+                        blacktype: 0,
+                        white: 65535.,
+                        orientation: match display_orientation {
+                            0 => 1,
+                            1 => 8,
+                            2 => 3,
+                            3 => 6,
+                            _ => 1,
+                        },
+                        compression: false,
+                        cam2terminal9: xyz_matrix,
+                        magic9inv,
+                        magicoffset: 0,
+                        profileoffset: 0,
+                        curveoffset: 0,
+                        imagedataoffset: 0,
+                        ifdoffset: 0,
+                        duck: false,
+                        save_scan: false,
+                    };
+                    let mut dng_bytes = make_base_dng(&mut raw_info);
+                    let image_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            raw_slot.as_ptr() as *const u8,
+                            raw_slot.len() * 2,
                         )
                     };
+                    dng_bytes.extend_from_slice(image_bytes);
 
-                    // Compute motion values in first half, overwriting average values
-                    for i in 0..pixel_count {
-                        let avg_value = motion_data[i] as u32;
-                        let diff_value = motion_data[pixel_count + i] as u32;
-                        motion_data[i] = ((diff_value << 16)
-                            / (avg_value.max(image_black_level as u32 + 1)
-                                - image_black_level as u32))
-                            .min(65535) as u16;
+                    // Motion mode: compute motion in-place over the appended data, then trim.
+                    if current_mode == 2 {
+                        let pc = width * height;
+                        let data_start = dng_bytes.len() - (pc * 4);
+                        let motion = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                dng_bytes[data_start..].as_mut_ptr() as *mut u16,
+                                pc * 2,
+                            )
+                        };
+                        for i in 0..pc {
+                            let avg = motion[i] as u32;
+                            let diff = motion[pc + i] as u32;
+                            motion[i] = ((diff << 16)
+                                / (avg.max(image_black_level as u32 + 1) - image_black_level as u32))
+                                .min(65535) as u16;
+                        }
+                        dng_bytes.truncate(dng_bytes.len() - (pc * 2));
                     }
+                    (dng_bytes, "dng")
+                } else {
+                    // RGB export: RCD-demosaic the average half + Rec.2020 display matrix +
+                    // sqrt, then encode. Tagged Rec.2020 so it matches the on-screen preview.
+                    let avg = &raw_slot[0..(width * height).min(raw_slot.len())];
+                    let (ow, oh, rgb) = rcd_to_rgb8(
+                        avg,
+                        width,
+                        height,
+                        image_black_level,
+                        bayer_pattern,
+                        &display_matrix,
+                        orient_deg,
+                    );
+                    let encoded = match save_format {
+                        SAVE_FORMAT_TIFF => encode_tiff(&rgb, ow as u32, oh as u32).map(|b| (b, "tiff")),
+                        SAVE_FORMAT_JPEGXL => encode_jpegxl(&rgb, ow, oh).map(|b| (b, "jxl")),
+                        _ => encode_jpeg(&rgb, ow as u32, oh as u32).map(|b| (b, "jpg")),
+                    };
+                    match encoded {
+                        Some((b, e)) => (b, e),
+                        None => {
+                            log::error!("RGB encode failed for format {}", save_format);
+                            return;
+                        }
+                    }
+                };
 
-                    // Truncate to remove the diff data
-                    final_dng.truncate(final_dng.len() - (pixel_count * 2));
-                }
-
-                // Store DNG bytes for Kotlin to retrieve
-                set_pending_save_data(final_dng, filename.clone());
-                log::info!("DNG stored, waiting for Kotlin to retrieve");
-
-                // NOTE: CURRENTLY_SAVING flag will be cleared by Kotlin after successful file save
+                let filename = format!("{}.{}", filename_base, ext);
+                set_pending_save_data(bytes, filename.clone());
+                log::info!("Save data stored ({}), waiting for Kotlin", filename);
+                // CURRENTLY_SAVING is cleared by Kotlin after the file is written.
             });
         }
         // Send Kotlin user settings from header

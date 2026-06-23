@@ -261,7 +261,14 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
         };
 
         if ui.view_1to1 {
-            // 1:1 pixel view mode - direct sensor pixels, no debayering
+            // 1:1 pixel view (zoomed in). Each screen pixel maps to one sensor pixel via the pan
+            // offset + rotation. Average mode is colour: cheap per-pixel 2x2-block debayer +
+            // display matrix + sqrt (fast enough for the per-frame UI thread — the high-quality
+            // RCD demosaic is reserved for saving, not the live preview, matching how camera apps
+            // run a light demosaic live and the good one only on capture). Difference/Motion are
+            // monochrome magnitudes, left unmixed.
+            let scale_avg =
+                ui.display_gain as f32 * (65536. / (65536. - ui.raw_black_level as f32));
             for y in 0..ui.screen_rise {
                 for x in 0..ui.screen_run {
                     let dst_idx = (y * buffer.stride as usize + x) * 3;
@@ -318,50 +325,75 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
                         continue;
                     }
 
-                    // Get the raw pixel value from selected data source
                     let idx = sensor_y * ui.sensor_x_size + sensor_x;
-                    let pixel_value = match current_mode {
-                        RawMode::Average => raw_average[idx],
-                        RawMode::Difference => raw_difference[idx],
-                        RawMode::Motion => {
-                            // Motion mode: calculate diff/average with black level correction
-                            let diff_value = raw_difference[idx] as u32;
-                            let avg_value = raw_average[idx] as u32;
-                            let corrected_avg = avg_value.max(ui.raw_black_level as u32 + 1)
-                                - ui.raw_black_level as u32;
-                            ((diff_value << 16) / corrected_avg).min(65535) as u16
-                        }
-                    };
-
-                    // Apply scaling and clipping based on mode
                     match current_mode {
                         RawMode::Average => {
-                            // Check clipping first, then subtract black level
-                            if ui.controls_visible && pixel_value > ui_constants::CLIPPING_THRESHOLD
-                            {
-                                pixels[dst_idx] = 0;
-                                pixels[dst_idx + 1] = 0;
-                                pixels[dst_idx + 2] = 0;
-                            } else {
-                                let adjusted = pixel_value.saturating_sub(ui.raw_black_level);
-                                let scale = ui.display_gain as f32
-                                    * (65536. / (65536. - ui.raw_black_level as f32));
-                                let value = ((adjusted as f32 * scale).sqrt()) as u8;
-                                pixels[dst_idx] = value;
-                                pixels[dst_idx + 1] = value;
-                                pixels[dst_idx + 2] = value;
-                            }
+                            // 2x2-block colour debayer at (sensor_x, sensor_y), same scheme as the
+                            // fit-to-screen preview and the save fallback.
+                            let bx = sensor_x & !1;
+                            let by = sensor_y & !1;
+                            let last = ui.sensor_x_size * ui.sensor_y_size - 1;
+                            let base = (by * ui.sensor_x_size + bx).min(last);
+                            // Black-level subtract, mirroring the fit-to-screen path EXACTLY so
+                            // both clip indicators match: controls visible -> white-clip zeros
+                            // over-threshold channels (-> dark/false colour) AND black-clip uses a
+                            // WRAPPING sub so a pixel below black_level underflows to a huge u16 ->
+                            // renders WHITE (the crushed-shadow indicator). Controls hidden ->
+                            // saturating sub (no overlay).
+                            let bk = ui.raw_black_level;
+                            let sub = |v: u16| -> f32 {
+                                if ui.controls_visible {
+                                    if v > ui_constants::CLIPPING_THRESHOLD {
+                                        0.
+                                    } else {
+                                        v.wrapping_sub(bk) as f32
+                                    }
+                                } else {
+                                    v.saturating_sub(bk) as f32
+                                }
+                            };
+                            let tl = sub(raw_average[base]);
+                            let tr = sub(raw_average[(base + 1).min(last)]);
+                            let bl = sub(raw_average[(base + ui.sensor_x_size).min(last)]);
+                            let br = sub(raw_average[(base + ui.sensor_x_size + 1).min(last)]);
+                            let local = (sensor_x - bx) + (sensor_y - by);
+                            let (r, g, b) = match ui.bayer_pattern {
+                                0 => (tl, if local < 2 { tr } else { bl }, br), // RGGB
+                                1 => (tr, if local < 2 { tl } else { br }, bl), // GRBG
+                                2 => (bl, if local < 2 { tl } else { br }, tr), // GBRG
+                                3 => (br, if local < 2 { tr } else { bl }, tl), // BGGR
+                                _ => (tl, if local < 2 { tr } else { bl }, br),
+                            };
+                            // Black already subtracted above; just apply gain + matrix.
+                            let r = r * scale_avg;
+                            let g = g * scale_avg;
+                            let b = b * scale_avg;
+                            let (lr, lg, lb) = apply_display_matrix(ui, r, g, b);
+                            pixels[dst_idx] = (lr.max(0.).sqrt()).min(255.) as u8;
+                            pixels[dst_idx + 1] = (lg.max(0.).sqrt()).min(255.) as u8;
+                            pixels[dst_idx + 2] = (lb.max(0.).sqrt()).min(255.) as u8;
                         }
                         RawMode::Difference | RawMode::Motion => {
-                            // Check clipping, no black level subtraction
-                            if ui.controls_visible && pixel_value > ui_constants::CLIPPING_THRESHOLD
+                            let pixel_value = match current_mode {
+                                RawMode::Difference => raw_difference[idx],
+                                _ => {
+                                    let diff_value = raw_difference[idx] as u32;
+                                    let avg_value = raw_average[idx] as u32;
+                                    let corrected_avg = avg_value
+                                        .max(ui.raw_black_level as u32 + 1)
+                                        - ui.raw_black_level as u32;
+                                    ((diff_value << 16) / corrected_avg).min(65535) as u16
+                                }
+                            };
+                            if ui.controls_visible
+                                && pixel_value > ui_constants::CLIPPING_THRESHOLD
                             {
                                 pixels[dst_idx] = 0;
                                 pixels[dst_idx + 1] = 0;
                                 pixels[dst_idx + 2] = 0;
                             } else {
-                                let scale = ui.display_gain as f32;
-                                let value = ((pixel_value as f32 * scale).sqrt()) as u8;
+                                let value =
+                                    ((pixel_value as f32 * ui.display_gain as f32).sqrt()) as u8;
                                 pixels[dst_idx] = value;
                                 pixels[dst_idx + 1] = value;
                                 pixels[dst_idx + 2] = value;
@@ -496,28 +528,32 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
                     // Apply clipping and black level adjustments based on mode
                     let (tl, tr, bl, br) = match current_mode {
                         RawMode::Average => {
-                            // Subtract black level, with optional clipping overlay
+                            // Clipping overlay (controls visible): white-clip zeros over-threshold
+                            // channels (-> dark/false colour), and black-clip uses a WRAPPING
+                            // subtract so a pixel below black_level underflows to a huge value ->
+                            // renders WHITE. That flash-white-on-crushed-shadow IS the black-clip
+                            // indicator. Controls hidden: plain saturating subtract (no overlay).
                             if ui.controls_visible {
                                 (
                                     if tl > ui_constants::CLIPPING_THRESHOLD {
                                         0
                                     } else {
-                                        tl.saturating_sub(ui.raw_black_level)
+                                        tl.wrapping_sub(ui.raw_black_level)
                                     },
                                     if tr > ui_constants::CLIPPING_THRESHOLD {
                                         0
                                     } else {
-                                        tr.saturating_sub(ui.raw_black_level)
+                                        tr.wrapping_sub(ui.raw_black_level)
                                     },
                                     if bl > ui_constants::CLIPPING_THRESHOLD {
                                         0
                                     } else {
-                                        bl.saturating_sub(ui.raw_black_level)
+                                        bl.wrapping_sub(ui.raw_black_level)
                                     },
                                     if br > ui_constants::CLIPPING_THRESHOLD {
                                         0
                                     } else {
-                                        br.saturating_sub(ui.raw_black_level)
+                                        br.wrapping_sub(ui.raw_black_level)
                                     },
                                 )
                             } else {
@@ -778,6 +814,15 @@ fn draw_counters(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWind
     let saved_text = format!("{}:S", ui.header[SAVED_COUNTER_IDX]);
     let frame_text = format!("{}:I", ui.header[FRAME_COUNTER_IDX].max(1));
     let fps_text = format!("{:.1}:F", fps);
+    // 4th line: the selected save format (tap the counter block to cycle).
+    let format_text = match ui.header[SAVE_FORMAT_IDX] {
+        SAVE_FORMAT_JPEG => "JPEG",
+        SAVE_FORMAT_TIFF => "TIFF",
+        SAVE_FORMAT_DNG => "DNG",
+        SAVE_FORMAT_JPEGXL => "JXL",
+        _ => "JPEG",
+    }
+    .to_owned();
 
     // Calculate text positions (right-aligned, vertically stacked)
     let text_height = ui.screen_rise.min(ui.screen_run) as f32 * 0.032;
@@ -793,6 +838,7 @@ fn draw_counters(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWind
         user_to_screen(ui, 1., space * 0.5), // Saved
         user_to_screen(ui, 1., space * 1.5), // Frame
         user_to_screen(ui, 1., space * 2.5), // FPS
+        user_to_screen(ui, 1., space * 3.5), // Save format
     ];
 
     let saved_colour = if (flags & MANUAL_SAVE_BIT) != 0 {
@@ -813,9 +859,12 @@ fn draw_counters(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWind
     let fps_ratio = fps / theoretical_max_fps;
     let fps_colour = (((1. - fps_ratio) * 256.) as u8, (fps_ratio * 256.) as u8, 0);
 
+    // Save-format line: cyan-ish, brighter while a save is pending.
+    let format_colour = (128, 200, 255);
+
     // Draw the counters
-    let texts = [&saved_text, &frame_text, &fps_text];
-    let colours = [saved_colour, frame_count_colour, fps_colour];
+    let texts = [&saved_text, &frame_text, &fps_text, &format_text];
+    let colours = [saved_colour, frame_count_colour, fps_colour, format_colour];
 
     for (i, (text, colour)) in texts.iter().zip(colours.iter()).enumerate() {
         ui.text_renderer.draw_text_right(
@@ -852,6 +901,7 @@ pub fn save_counter_areas(ui: &mut UserInterface, pixels: &[u8], stride: usize) 
         ((1., fudge), (1. - width, space - fudge)), // Saved
         ((1., space + fudge), (1. - width, space * 2. - fudge)), // Frame
         ((1., space * 2. + fudge), (1. - width, space * 3. - fudge)), // FPS
+        ((1., space * 3. + fudge), (1. - width, space * 4. - fudge)), // Save format
     ];
 
     for (i, &((tl_x_user, tl_y_user), (br_x_user, br_y_user))) in user_positions.iter().enumerate()
@@ -900,7 +950,14 @@ pub fn restore_counter_areas(ui: &UserInterface, pixels: &mut [u8], stride: usiz
                 let dst_idx = (y * stride + x) * 3;
                 pixels[dst_idx] = ui.counter_buffers[i][buf_idx];
                 pixels[dst_idx + 1] = ui.counter_buffers[i][buf_idx + 1];
-                pixels[dst_idx + 2] = ui.counter_buffers[i][buf_idx + 2] + 32;
+                // +32 blue is a debug tint to visualise the counter restore region; in
+                // production restore the original pixel untinted. (Wrapping add, like the
+                // rest of the codebase; the tint values never approach overflow anyway.)
+                pixels[dst_idx + 2] = if crate::DEBUG {
+                    ui.counter_buffers[i][buf_idx + 2] + 32
+                } else {
+                    ui.counter_buffers[i][buf_idx + 2]
+                };
                 buf_idx += 3;
             }
         }

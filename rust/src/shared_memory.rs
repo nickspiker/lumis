@@ -27,7 +27,16 @@ pub const HEARTBEAT_NANOS_IDX: usize = 25; // Nanoseconds within current second 
 pub const HISTOGRAM_COUNTER_IDX: usize = 26; // Histogram version counter for UI full draw triggering
 pub const MAGIC_9_DISPLAY_IDX: usize = 27; // Display/Terminal magic 9 (9 f32s) + gamma (1 f32) = 5 u64s (27-31)
 pub const MAGIC_9_DNG_XYZ_IDX: usize = 32; // Adobe XYZ magic 9 (9 f32s) + gamma (1 f32) = 5 u64s (32-36)
+pub const SAVE_FORMAT_IDX: usize = 37; // Save format: 0=JPEG, 1=TIFF, 2=DNG, 3=JPEG XL
+pub const MAGIC_9_INV_IDX: usize = 38; // DNG magic9inv (72 bytes = 9 u64s, 38-46) from chameleon
 pub const IMAGE_START: usize = 64;
+
+// Save format values (SAVE_FORMAT_IDX)
+pub const SAVE_FORMAT_JPEG: u64 = 0;
+pub const SAVE_FORMAT_TIFF: u64 = 1;
+pub const SAVE_FORMAT_DNG: u64 = 2;
+pub const SAVE_FORMAT_JPEGXL: u64 = 3;
+pub const SAVE_FORMAT_COUNT: u64 = 4;
 
 // Boolean flag bit positions
 pub const COMPLETE_EXPOSURE_BIT: u64 = 1 << 0;
