@@ -605,17 +605,29 @@ impl CameraIntegrator {
                     }
                     (dng_bytes, "dng")
                 } else {
-                    // RGB export: RCD-demosaic the average half + Rec.2020 display matrix + sqrt, then encode. Tagged Rec.2020 so it matches the on-screen preview.
+                    // RGB export: demosaic the average half + Rec.2020 display matrix + sqrt, then encode. Tagged Rec.2020 so it matches the on-screen preview. Quad-Bayer (max-res RAW10) uses the quad demosaic; standard Bayer uses RCD.
                     let avg = &raw_slot[0..(width * height).min(raw_slot.len())];
-                    let (ow, oh, rgb) = rcd_to_rgb8(
-                        avg,
-                        width,
-                        height,
-                        image_black_level,
-                        bayer_pattern,
-                        &display_matrix,
-                        orient_deg,
-                    );
+                    let (ow, oh, rgb) = if raw10 {
+                        quad_to_rgb8(
+                            avg,
+                            width,
+                            height,
+                            image_black_level,
+                            bayer_pattern,
+                            &display_matrix,
+                            orient_deg,
+                        )
+                    } else {
+                        rcd_to_rgb8(
+                            avg,
+                            width,
+                            height,
+                            image_black_level,
+                            bayer_pattern,
+                            &display_matrix,
+                            orient_deg,
+                        )
+                    };
                     let encoded = match save_format {
                         SAVE_FORMAT_TIFF => encode_tiff(&rgb, ow as u32, oh as u32).map(|b| (b, "tiff")),
                         SAVE_FORMAT_JPEGXL => encode_jpegxl(&rgb, ow, oh).map(|b| (b, "jxl")),

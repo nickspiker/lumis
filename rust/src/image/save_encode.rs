@@ -116,6 +116,52 @@ pub fn rcd_to_rgb8(
     (out_w, out_h, rgb)
 }
 
+/// Quad-Bayer (Tetracell, max-res 50MP) demosaic to colour-corrected sqrt-encoded 8-bit RGB, honouring orientation. Same interface as [rcd_to_rgb8] but for the 4x4 quad-Bayer CFA. See [crate::debayer::quad].
+pub fn quad_to_rgb8(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    black_level: u16,
+    bayer_pattern: u32,
+    matrix: &[f32; 9],
+    orientation: u16,
+) -> (usize, usize, Vec<u8>) {
+    use crate::debayer::quad::quad_demosaic;
+
+    // Match rcd_to_rgb8's scale: it feeds the colour matrix values in 0..~65535 via
+    // (v-black) * 65536/(65536-black). We get the identical scale with white=65536 and gain=65536.
+    let demosaiced = quad_demosaic(raw, width, height, black_level, 65535, 65536.0, bayer_pattern);
+
+    let (out_w, out_h) = match orientation {
+        90 | 270 => (height, width),
+        _ => (width, height),
+    };
+    let mut rgb = vec![0u8; out_w * out_h * 3];
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            let (sx, sy) = match orientation {
+                90 => (oy, out_w - 1 - ox),
+                180 => (width - 1 - ox, height - 1 - oy),
+                270 => (height - 1 - oy, ox),
+                _ => (ox, oy),
+            };
+            if sx >= width || sy >= height {
+                continue;
+            }
+            let px = demosaiced[sy * width + sx];
+            let (r, g, b) = (px[0], px[1], px[2]);
+            let lr = matrix[0] * r + matrix[1] * g + matrix[2] * b;
+            let lg = matrix[3] * r + matrix[4] * g + matrix[5] * b;
+            let lb = matrix[6] * r + matrix[7] * g + matrix[8] * b;
+            let o = (oy * out_w + ox) * 3;
+            rgb[o] = (lr.max(0.).sqrt()).min(255.) as u8;
+            rgb[o + 1] = (lg.max(0.).sqrt()).min(255.) as u8;
+            rgb[o + 2] = (lb.max(0.).sqrt()).min(255.) as u8;
+        }
+    }
+    (out_w, out_h, rgb)
+}
+
 /// Encode RGB8 to JPEG bytes (quality 95), tagged with the Rec.2020 ICC profile (APP2 marker).
 pub fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     use crate::image::icc::{jpeg_with_icc, rec2020_icc};

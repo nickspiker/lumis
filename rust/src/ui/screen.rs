@@ -787,11 +787,11 @@ fn draw_counters(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWind
     let fps_text = format!("{:.1}:F", fps);
     // 4th line: the selected save format (tap the counter block to cycle).
     let format_text = match ui.header[SAVE_FORMAT_IDX] {
-        SAVE_FORMAT_JPEG => "JPEG",
-        SAVE_FORMAT_TIFF => "TIFF",
-        SAVE_FORMAT_DNG => "DNG",
         SAVE_FORMAT_JPEGXL => "JXL",
-        _ => "JPEG",
+        SAVE_FORMAT_JPEG => "JPEG",
+        SAVE_FORMAT_DNG => "DNG",
+        SAVE_FORMAT_TIFF => "TIFF",
+        _ => "JXL",
     }
     .to_owned();
 
