@@ -256,6 +256,8 @@ impl CameraIntegrator {
         raw10: bool,
         row_stride: usize,
     ) -> (i32, i64, f32) {
+        // Tell the UI process whether this frame is quad-Bayer (max-res RAW10 = a Tetracell 4x4 CFA). The UI's calibration path needs this to pre-bin before handing the frame to chameleon (whose debayer only understands standard 2x2 Bayer).
+        self.header[QUAD_BAYER_IDX] = if raw10 { 1 } else { 0 };
         // Depack RAW10 -> the same 2-bytes-per-pixel little-endian layout the integrator's accumulation loops expect (value 0..=1023, since white_level is 10-bit). Done once per frame on the camera thread; pixels are read many times downstream.
         let unpacked: Vec<u8>;
         let frame_data: &[u8] = if raw10 {
@@ -403,9 +405,8 @@ impl CameraIntegrator {
             };
             // RGB exports (JPEG/TIFF/JXL) are tagged Rec.2020 to match the on-screen preview, so they use the camera->Rec.2020 display matrix, NOT the DNG's XYZ matrix. Same zero-fallback to identity for the uncalibrated case.
             let display_matrix = {
-                let m = unsafe {
-                    *(self.header.as_ptr().add(MAGIC_9_DISPLAY_IDX) as *const [f32; 9])
-                };
+                let m =
+                    unsafe { *(self.header.as_ptr().add(MAGIC_9_DISPLAY_IDX) as *const [f32; 9]) };
                 if m.iter().all(|&v| v == 0.) {
                     [1., 0., 0., 0., 1., 0., 0., 0., 1.]
                 } else {
@@ -452,8 +453,7 @@ impl CameraIntegrator {
             // RAW10 max-res on this device is a quad-Bayer (Tetracell) sensor: each base colour covers a 2x2 cluster, so the CFA is a 4x4 tile (each base cell expanded to 2x2). Tag the DNG with the real 4x4 pattern so a quad-Bayer-aware raw converter can demosaic it. Binned mode stays the standard 2x2 pattern.
             let bayer_pattern_vec: Vec<u8> = if raw10 {
                 // base is [c00,c01,c10,c11] over a 2x2; expand to 4x4 row-major.
-                let (c00, c01, c10, c11) =
-                    (base_cfa[0], base_cfa[1], base_cfa[2], base_cfa[3]);
+                let (c00, c01, c10, c11) = (base_cfa[0], base_cfa[1], base_cfa[2], base_cfa[3]);
                 vec![
                     c00, c00, c01, c01, //
                     c00, c00, c01, c01, //
@@ -598,7 +598,8 @@ impl CameraIntegrator {
                             let avg = motion[i] as u32;
                             let diff = motion[pc + i] as u32;
                             motion[i] = ((diff << 16)
-                                / (avg.max(image_black_level as u32 + 1) - image_black_level as u32))
+                                / (avg.max(image_black_level as u32 + 1)
+                                    - image_black_level as u32))
                                 .min(65535) as u16;
                         }
                         dng_bytes.truncate(dng_bytes.len() - (pc * 2));
@@ -629,7 +630,9 @@ impl CameraIntegrator {
                         )
                     };
                     let encoded = match save_format {
-                        SAVE_FORMAT_TIFF => encode_tiff(&rgb, ow as u32, oh as u32).map(|b| (b, "tiff")),
+                        SAVE_FORMAT_TIFF => {
+                            encode_tiff(&rgb, ow as u32, oh as u32).map(|b| (b, "tiff"))
+                        }
                         SAVE_FORMAT_JPEGXL => encode_jpegxl(&rgb, ow, oh).map(|b| (b, "jxl")),
                         _ => encode_jpeg(&rgb, ow as u32, oh as u32).map(|b| (b, "jpg")),
                     };

@@ -1,6 +1,3 @@
-use chameleon::{
-    encode_settings, get_settings, scan_target, verichrome_dir, write_settings, ImageData, RawInfo,
-};
 use crate::image::integrator::TimeBase;
 use crate::shared_memory::*;
 use crate::ui::arrows::ArrowBuffers;
@@ -10,6 +7,9 @@ use crate::ui::text::TextRenderer;
 use crate::ui::touch::*;
 use crate::ui::ui::ui_constants::CALIBRATION_BUTTON_SIZE;
 use arc_swap::ArcSwap;
+use chameleon::{
+    encode_settings, get_settings, scan_target, verichrome_dir, write_settings, ImageData, RawInfo,
+};
 use log::*;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -20,9 +20,15 @@ use RawMode;
 /// with the input [r,g,b]. The display surface is tagged BT.2020 so Android performs the
 /// final Rec.2020 -> panel-gamut conversion.
 pub const REC2020_DISPLAY_MATRIX: [f32; 9] = [
-    3.168_241,    -2.156_882_8,  0.096_456_88,
-    -0.266_362_52, 1.404_945_7, -0.175_554_8,
-    0.003_891_53, -0.020_567_68, 0.945_832_6,
+    3.168_241,
+    -2.156_882_8,
+    0.096_456_88,
+    -0.266_362_52,
+    1.404_945_7,
+    -0.175_554_8,
+    0.003_891_53,
+    -0.020_567_68,
+    0.945_832_6,
 ];
 
 pub mod ui_constants {
@@ -219,7 +225,10 @@ impl UserInterface {
         // profile: the camera/LMS working RGB -> linear Rec.2020 matrix, decoded
         // (BLAKE3-validated) from rec2020-1.mag. The display surface is tagged BT.2020 so
         // Android does the final 2020 -> panel conversion. Row-major, R/G/B output rows.
-        if ui.magic_9_display[0] == 0.0 && ui.magic_9_display[4] == 0.0 && ui.magic_9_display[8] == 0.0 {
+        if ui.magic_9_display[0] == 0.0
+            && ui.magic_9_display[4] == 0.0
+            && ui.magic_9_display[8] == 0.0
+        {
             ui.magic_9_display.copy_from_slice(&REC2020_DISPLAY_MATRIX);
             *ui.magic_9_display_gamma = 2.2;
             log::info!("Initialized magic_9_display to rec2020-1 terminal matrix");
@@ -299,7 +308,7 @@ impl UserInterface {
             );
         }
 
-        let dynamic_range = sensor_white_level - sensor_black_level;
+        let dynamic_range = sensor_white_level.wrapping_sub(sensor_black_level);
         if crate::DEBUG {
             debug!("Sensor dynamic range: {} levels", dynamic_range);
         }
@@ -640,7 +649,8 @@ impl UserInterface {
                 log::info!("Starting Chameleon colour calibration");
 
                 // Set calibrating flag for blinking button
-                self.calibrating.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.calibrating
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
 
                 // Get current image slot from SharedMemory header
                 let image_counter = self.header[IMAGE_COUNTER_IDX];
@@ -658,11 +668,21 @@ impl UserInterface {
                 let avg_offset = (current_slot * 2) * pixel_count;
 
                 let raw_average = &self.image_buffer[avg_offset..avg_offset + pixel_count];
-                let img = raw_average.to_vec();
+
+                // Quad-Bayer (max-res RAW10) frames are a 4x4 Tetracell CFA; chameleon's debayer only understands standard 2x2 Bayer. Pre-bin each 2x2 same-colour cluster into one pixel, yielding a half-size standard 2x2 Bayer frame with the same base pattern, before handing it to scan_target. Calibration only needs accurate colour, not 50MP resolution.
+                let is_quad = self.header[crate::shared_memory::QUAD_BAYER_IDX] != 0;
+                let (img, width, height) = if is_quad {
+                    let (ow, oh, binned) = crate::debayer::quad::quad_to_standard_bayer(
+                        raw_average,
+                        self.sensor_x_size,
+                        self.sensor_y_size,
+                    );
+                    (binned, ow, oh)
+                } else {
+                    (raw_average.to_vec(), self.sensor_x_size, self.sensor_y_size)
+                };
 
                 // Capture values needed for the background thread
-                let width = self.sensor_x_size;
-                let height = self.sensor_y_size;
                 let bayer_pattern = self.bayer_pattern;
                 let black_level = self.raw_black_level;
                 let magic_9 = *self.magic_9_display;
@@ -767,14 +787,17 @@ impl UserInterface {
                                 //   for now (TODO: real XYZ profile). RGB exports use this.
                                 unsafe {
                                     let magic9_ptr = magic_9_display_addr as *mut f32;
-                                    let magic9_slice = std::slice::from_raw_parts_mut(magic9_ptr, 9);
+                                    let magic9_slice =
+                                        std::slice::from_raw_parts_mut(magic9_ptr, 9);
                                     magic9_slice.copy_from_slice(&raw_info.cam2terminal9);
-                                    *(magic_9_display_gamma_addr as *mut f32) = settings.terminal9[9];
+                                    *(magic_9_display_gamma_addr as *mut f32) =
+                                        settings.terminal9[9];
 
                                     let xyz_ptr = magic_9_dng_xyz_addr as *mut f32;
                                     let xyz_slice = std::slice::from_raw_parts_mut(xyz_ptr, 9);
                                     xyz_slice.copy_from_slice(&raw_info.cam2terminal9);
-                                    *(magic_9_dng_xyz_gamma_addr as *mut f32) = settings.terminal9[9];
+                                    *(magic_9_dng_xyz_gamma_addr as *mut f32) =
+                                        settings.terminal9[9];
 
                                     let inv_ptr = magic_9_inv_addr as *mut u8;
                                     std::ptr::copy_nonoverlapping(
@@ -930,8 +953,7 @@ impl UserInterface {
         // A fresh touch while the full-screen calibration scan is held dismisses it (and
         // unfreezes the feed). Per design the same touch still passes through to normal
         // handling below, so e.g. tapping a control both dismisses and acts.
-        if current_touch_valid && !self.last_touch_valid && self.calibration_hold.load().is_some()
-        {
+        if current_touch_valid && !self.last_touch_valid && self.calibration_hold.load().is_some() {
             self.calibration_hold.store(std::sync::Arc::new(None));
             self.frozen_image_counter = None;
             self.frozen_image = Vec::new();

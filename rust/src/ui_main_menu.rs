@@ -18,8 +18,8 @@ enum Button {
 
 #[derive(Clone, PartialEq)]
 enum Screen {
-    Main,            // one row per lens (group heads)
-    Modes(i32),      // the capture modes of one lens (group_id)
+    Main,       // one row per lens (group heads)
+    Modes(i32), // the capture modes of one lens (group_id)
 }
 pub struct MainMenu {
     width: u32,
@@ -327,7 +327,11 @@ impl MainMenu {
                         _ => [0xFF, 0xFF, 0x60],
                     };
                     let base_colour = [
-                        if info.is_cropped { 0xFF } else { base_colour[0] },
+                        if info.is_cropped {
+                            0xFF
+                        } else {
+                            base_colour[0]
+                        },
                         if info.max_res { 0xFF } else { base_colour[1] },
                         base_colour[2],
                     ];
@@ -1224,8 +1228,8 @@ impl MainMenu {
                     if channel < colour.len() {
                         let src = colour[channel] * 255.0;
                         let dst = image[idx * channels + channel] as f32;
-                        image[idx * channels + channel] =
-                            (src * alpha + dst * (1.0 - alpha)).clamp(0.0, 255.0) as u8;
+                        // No clamp: `as u8` saturates (>255 -> 255, negative/NaN -> 0).
+                        image[idx * channels + channel] = (src * alpha + dst * (1.0 - alpha)) as u8;
                     }
                 }
             }
@@ -1565,7 +1569,11 @@ impl MainMenu {
                 shade(px, py, xw, yw);
             }
         }
-        let (a, r, g, b) = if pressed { (300u16, 64u8, 255u8, 255u8) } else { (200u16, 0u8, 200u8, 255u8) };
+        let (a, r, g, b) = if pressed {
+            (300u16, 64u8, 255u8, 255u8)
+        } else {
+            (200u16, 0u8, 200u8, 255u8)
+        };
         self.text_renderer.draw_text_center(
             pixels,
             self.width,

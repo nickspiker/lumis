@@ -37,9 +37,13 @@ pub fn rcd_region(
     pattern: u32,
 ) -> Vec<[u16; 3]> {
     // Pad outwards by the margin, snap the origin DOWN to an even coord (Bayer phase), and clamp to the frame. Snapping to even keeps the padded tile's (0,0) on the same colour as the sensor origin so `fc_for_pattern` stays correct.
+    // Rule 0: saturating_sub prevents usize underflow when crop_x < RCD_MARGIN (near-edge crop); it floors at 0 instead of wrapping to a huge usize that would later index out of bounds as a row/col origin.
     let pad_x0 = crop_x.saturating_sub(RCD_MARGIN) & !1;
+    // Rule 0: saturating_sub prevents usize underflow when crop_y < RCD_MARGIN (near-edge crop); it floors at 0 instead of wrapping to a huge usize that would later index out of bounds as a row/col origin.
     let pad_y0 = crop_y.saturating_sub(RCD_MARGIN) & !1;
+    // Rule 0 MEMORY SAFETY: .min(full_w) clamps the padded region's right edge to the frame width so later reads of this tile stay in bounds.
     let pad_x1 = (crop_x + crop_w + RCD_MARGIN).min(full_w);
+    // Rule 0 MEMORY SAFETY: .min(full_h) clamps the padded region's bottom edge to the frame height so later reads of this tile stay in bounds.
     let pad_y1 = (crop_y + crop_h + RCD_MARGIN).min(full_h);
     let pad_w = pad_x1 - pad_x0;
     let pad_h = pad_y1 - pad_y0;
@@ -53,7 +57,8 @@ pub fn rcd_region(
         for tx in 0..pad_w {
             let sx = pad_x0 + tx;
             let v = raw[sy * full_w + sx];
-            let lin = ((v as f32 - black as f32).max(0.) * scale).min(65535.) as u16;
+            // RcdData stores u16, so the `as u16` here necessarily floors sub-black negatives to 0 (and saturates >65535). That loses noise-floor signal, but it's a constraint of RCD's u16 grid, not a removable clamp - preserving it would require RCD to work in f32. No explicit clamp added; the cast is the floor.
+            let lin = ((v as f32 - black as f32) * scale) as u16;
             let ch = fc(ty, tx);
             rcd.data[ty][tx][ch] = lin;
         }
@@ -99,10 +104,14 @@ fn block_debayer_pixel(
     let bx = sx & !1;
     let by = sy & !1;
     let last = full_w * full_h - 1;
+    // Rule 0 MEMORY SAFETY: .min(last) clamps the 2x2-block origin to the final valid index so reading the block at the image's right/bottom edge can't index out of bounds / panic.
     let idx = (by * full_w + bx).min(last);
     let tl = raw[idx] as f32;
+    // Rule 0 MEMORY SAFETY: .min(last) clamps the right neighbour index to the final valid index so the edge block read can't index out of bounds / panic.
     let tr = raw[(idx + 1).min(last)] as f32;
+    // Rule 0 MEMORY SAFETY: .min(last) clamps the below neighbour index to the final valid index so the edge block read can't index out of bounds / panic.
     let bl = raw[(idx + full_w).min(last)] as f32;
+    // Rule 0 MEMORY SAFETY: .min(last) clamps the below-right neighbour index to the final valid index so the edge block read can't index out of bounds / panic.
     let br = raw[(idx + full_w + 1).min(last)] as f32;
     let local = (sx - bx) + (sy - by);
     let (r, g, b) = match pattern {
@@ -112,6 +121,7 @@ fn block_debayer_pixel(
         3 => (br, if local < 2 { tr } else { bl }, tl), // BGGR
         _ => (tl, if local < 2 { tr } else { bl }, br),
     };
-    let cv = |v: f32| ((v - black as f32).max(0.) * gain).min(65535.) as u16;
+    // No clamps: each channel casts straight to u16 (no matrix between), so `as u16` saturates sub-black (negative) -> 0 and >65535 -> 65535.
+    let cv = |v: f32| ((v - black as f32) * gain) as u16;
     [cv(r), cv(g), cv(b)]
 }

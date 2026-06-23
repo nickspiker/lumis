@@ -1,192 +1,635 @@
-This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+# AGENT.md - Code Generation Rules
+## Rule 0: Bounds Checks and Saturating Arithmetic
+**IF YOU ADD ANY BOUNDS CHECK OR SATURATING ARITHMETIC, YOU ARE REQUIRED TO:**
+0. **STATE WHY** it was added
+1. **PROVE** it was necessary
+2. **EXPLAIN** what undefined behavior or memory unsafety it prevents
 
-Analysis:
-Let me chronologically analyze the conversation:
+### Complete List of Operations That Require Justification:
 
-1. **Initial Context**: This is a continuation from a previous conversation about Lumis, an Android camera app with Rust native code. The summary indicates previous work on:
-   - Calibration button functionality
-   - Background thread for HTTP requests to avoid ANR
-   - INTERNET permission added
-   - Blinking button indicator during calibration
-   - Analysis of calibration pipeline showing magic_9 matrix not being written back
+**Saturating Arithmetic:**
+- `saturating_add`, `saturating_sub`, `saturating_mul`, `saturating_div`, `saturating_pow`
+- `wrapping_add`, `wrapping_sub`, `wrapping_mul` (when used to prevent overflow)
+- `checked_add`, `checked_sub`, `checked_mul`, `checked_div`, `checked_rem`, `checked_pow`
+- `overflowing_*` operations
 
-2. **User asks about sRGB/BT.709**: User asked if there's sRGB/BT.709 color space support since magic_9_display should be "computed to sRGB".
+**Clamping/Range Limiting:**
+- `clamp(min, max)`
+- `min(a, b)`, `max(a, b)` when used to constrain values
+- Manual clamping: `if x > max { max } else { x }`
 
-3. **My search for sRGB**: I searched for sRGB/BT.709 definitions and found the colorspace options come from downloaded profile files, not hardcoded. The `terminal9` is one of `magic9names[]` options from the calibration server.
+**Bounds Checks:**
+- `if idx < vec.len()` or any length/capacity check
+- `.get(idx)` instead of `[idx]`
+- `.get_mut(idx)` instead of `[idx]`
+- Range checks before indexing: `if x < width && y < height`
 
-4. **User clarification on color space**: User clarified it's Rec 2020, not sRGB, and asked which to link up first: image, display, or metadata.
+**Safe Access Patterns:**
+- `.get().unwrap_or()`, `.get().unwrap_or_default()`
+- `.get().map()`, `.and_then()`
+- Pattern matching on `.get()` results
 
-5. **I chose display**: I picked display first to write `cam2terminal9` matrix to shared memory for live preview.
+**Division/Modulo Guards:**
+- `if divisor != 0` before division
+- `checked_div`, `checked_rem`
 
-6. **User agreed and said GUI should already read from it**: User confirmed and said we just need to write to shared memory, doesn't need to be atomic.
+**Bit Shift Validation:**
+- Checking shift amount < type bit width
+- `checked_shl`, `checked_shr`
 
-7. **First implementation attempt**: I added code to write the matrix after `scan_target()` returns, but the pointers weren't captured by the closure.
+### What Counts as a Bounds Check:
+- `if idx < vec.len()`
+- `vec.get(idx)` instead of `vec[idx]`
+- `.checked_add()`, `.saturating_add()`, `.saturating_subtract()` (unless explicitly requested)
+- Any conditional that guards array/slice access
 
-8. **Build error - variables not found**: `magic_9_display_ptr` and `magic_9_display_gamma_ptr` weren't in scope inside the thread.
+### When Bounds Checks ARE Required:
+```rust
+// Example from text rendering:
+if (final_x as usize) < width && (final_y as usize) < height {
+    let idx = final_y as usize * width as usize + final_x as usize;
+    pixels[idx] = blended as u32;  // Would segfault without the check
+}
+```
+**WHY**: `final_x` and `final_y` come from glyph positioning math and can be negative or exceed buffer dimensions. The cast to `usize` makes negatives wrap to huge values (fail bigger than shit), and the check prevents out-of-bounds memory access.
 
-9. **Fix attempt 1**: Added the pointer definitions before the thread spawn.
+**PROOF**: Without this check, we'd write outside the pixel buffer and corrupt memory/segfault.
 
-10. **Build error - raw pointers not Send**: `*mut f32` cannot be sent between threads safely.
+### When Bounds Checks Are FORBIDDEN:
+```rust
+// Internal loop with known bounds - NO CHECKS
+for y in 0..self.height as usize {
+    for x in 0..self.width as usize {
+        let idx = y * self.width as usize + x;
+        pixels[idx] = color;  // idx is MATHEMATICALLY proven in-bounds
+    }
+}
+```
+```rust
+// Packed SIMD arithmetic - NO SATURATING OPS
+let mut blended = bg * inv_alpha + colour * alpha;  // Overflow is part of the algorithm
+blended = (blended >> 8) & 0x00FF00FF00FF00FF;     // Bit ops handle the overflow correctly
+```
 
-11. **Fix attempt 2**: Created `SendPtr<T>` wrapper with unsafe `impl Send`.
+### When to Panic Instead:
+```rust
+// Debug visualization - if buffer is wrong size, FAIL LOUD, that means WE FUCKED UP SOMEWHERE ELSE, bounds checks hide problems!
+if self.show_textbox_mask {
+    for y in 0..self.height as usize {
+        for x in 0..self.width as usize {
+            let idx = y * self.width as usize + x;
+            let alpha = self.textbox_mask[idx];  // PANIC if uninitialized = correct behavior
+            pixels[idx] = pack_argb(alpha, alpha, alpha, 255);
+        }
+    }
+}
+```
 
-12. **Build error still**: Still had `*mut f32` issue - the `SendPtr` wasn't fully solving it.
+## Core Principles
 
-13. **Final fix**: Used `usize` instead of pointers - cast pointer to usize before thread, cast back inside thread. This worked because usize is always Send.
+### 0. **Trust the Math**
+- If loop bounds guarantee safety, don't add runtime checks
+- Index calculations from known dimensions are proof of correctness
+- Compiler optimization depends on removing redundant bounds checks
 
-14. **User reports "nothing upon calibration"**: User said calibration doesn't show any effect.
+### 1. **Fail Fast, Fail Loud**
+- Panics are better than silent corruption
+- A panic means "there's a bug in initialization" not "add a bounds check"
+- Debug visualizations should expose bugs, not hide them
 
-15. **User asks about shared memory initialization**: "Are we initializing that shared memory with the values from Android?"
+### 2. **Understand Packed SIMD**
+- Overflow in packed arithmetic is often **required** for correctness
+- Bit masks and shifts handle channel isolation and reconstruction
+- Saturating ops break the mathematical properties being exploited
 
-16. **I searched and found no initialization**: The shared memory starts as zeros, meaning a zero color matrix would produce black output.
+### 3. **Respect Explicit Unsafe Contracts**
+```rust
+// SAFETY: idx is proven in-bounds by loop invariant (0..width * 0..height)
+unsafe { pixels.get_unchecked_mut(idx) }
+```
+If there's a SAFETY comment, **read it**. It's there because the human proved correctness.
+HashMap shall NOT be used without explicit consent and proof showing how it is faster/better than a linear search or a simple lookup.
 
-17. **I implemented identity matrix initialization**: Added code to initialize magic_9_display to identity matrix `[1,0,0, 0,1,0, 0,0,1]` with gamma 2.2 if diagonal elements are zero.
+## Decimal Indexing is FORBIDDEN
 
-18. **User corrects my approach**: User pointed out I didn't answer the question and just started coding. They asked where the color matrix comes from and what I did.
+**NEVER use decimal digits (0-9) for array indices, field names, or any programmatic counting.**
 
-19. **I apologized and explained**: No initialization was happening, shared memory starts as zeros. I added identity initialization.
+### Why Decimal Indexing is Broken:
 
-20. **User asks two key questions**:
-    - "I'd suspect we aren't doing the colour matrix multiplication in the GUI output"
-    - "Are we pulling the supplied magic 9 from Android on the Kotlin side?"
+0. **CPUs count in binary** - every decimal index requires base conversion overhead
+1. **Off-by-one bugs** - humans start at 1, computers at 0, decimal encourages confusion
+2. **Fragile serialization** - string concatenation like `s{idx}_` creates parse nightmares
+3. **Not how hardware works** - you're teaching incorrect computational models
 
-21. **I investigated both**:
-    - **Display path**: Confirmed NO color matrix multiplication in screen.rs - RGB goes directly to pixels with just sqrt() gamma, no magic_9_display usage
-    - **Kotlin side**: No color matrix being pulled from Camera2 API
+### The Right Way: VSF Nested Structures
 
-22. **User's final question**: Asked about Android Camera2 matrices - "Google it but whichever is the D65->cam native"
+```rust
+// WRONG - decimal string prefixes, flat namespace pollution
+for idx in 0..party_slots.len() {
+    let prefix = format!("s{}_", idx);  // s0_, s1_, s2_... DECIMAL GARBAGE
+    fields.push((format!("{}handle_hash", prefix), ...));
+    fields.push((format!("{}offer_x25519_pub", prefix), ...));
+}
+```
 
-23. **I searched and explained**: 
-    - `SENSOR_COLOR_TRANSFORM1/2`: XYZ → Camera (backwards)
-    - `SENSOR_FORWARD_MATRIX1/2`: Camera → D50 XYZ (forward direction we want)
-    - Need Bradford adaptation D50→D65 for display
+```rust
+// CORRECT - proper nested VSF sections
+let mut slots_section = VsfSection::new("party_slots");
+for slot in &party_slots {
+    let mut slot_section = VsfSection::new("slot");
+    slot_section.add_field("handle_hash", VsfType::hb(slot.handle_hash));
+    slot_section.add_field("offer_x25519_pub", VsfType::kx(slot.offer.x25519_pub));
+    slots_section.add_nested_section(slot_section);
+}
+```
 
-Files modified:
-- `rust/src/ui/ui.rs`: Added usize pointer passing to thread, write matrix after calibration, identity matrix initialization
-- `rust/src/image/integrator.rs`: Added identity matrix initialization
+**If you find yourself doing string formatting with decimal indices, STOP. You're doing it wrong. Use VSF's native array/section nesting.**
 
-Key code changes:
-1. Pointer passing as usize for thread safety
-2. Writing cam2terminal9 to shared memory after successful calibration
-3. Identity matrix initialization for both UI and Integrator
+## VSF Type Markers Are Self-Describing
 
-The display path issue is still NOT fixed - the color matrix multiplication doesn't happen in screen.rs.
+**NEVER rely on position to determine what a value is. The type marker tells you.**
 
-Summary:
-1. Primary Request and Intent:
-   - Fix calibration pipeline to write computed `cam2terminal9` color matrix to shared memory for live display
-   - Investigate why calibration has no visible effect
-   - Determine if color matrix multiplication is happening in display code
-   - Understand Android Camera2 color matrices (`SENSOR_FORWARD_MATRIX` vs `SENSOR_COLOR_TRANSFORM`) for bridging manufacturer calibration data
+VSF key types are self-describing:
+- `kx` = X25519 public key (32B)
+- `kf` = FrodoKEM public key (~15KB)
+- `kn` = NTRU public key (~1KB)
+- `kl` = Classic McEliece public key (~524KB)
+- `kh` = HQC public key (~7KB)
+- `kk` = secp256k1 public key (33B)
+- `kp` = P-curve key (disambiguate by size: 97B = P-384, 65B = P-256)
+- `ks` = Shared secret (any KEM output)
 
-2. Key Technical Concepts:
-   - Android Camera2 color matrices: `SENSOR_FORWARD_MATRIX1/2` (Camera→D50 XYZ), `SENSOR_COLOR_TRANSFORM1/2` (XYZ→Camera)
-   - Shared memory between UI and Camera processes via Android ashmem
-   - Thread safety: raw pointers (`*mut f32`) are not `Send`, must cast to `usize` for cross-thread use
-   - Color calibration pipeline: `cam2terminal9` = computed matrix from Chameleon calibration
-   - `terminal9` = target colorspace matrix (Rec 2020), `magic9cmf` = camera-to-CMF transform
-   - Identity matrix initialization to prevent zero-matrix black output
-   - Chromatic adaptation: Bradford transform D50→D65 for display
+### WRONG: Positional Parsing
 
-3. Files and Code Sections:
-   - **rust/src/ui/ui.rs**
-     - Core file for UI and calibration thread
-     - Added usize pointer passing for thread safety:
-     ```rust
-     // Pointers to shared memory for writing calibration results back (as usize for Send)
-     let magic_9_display_addr = self.magic_9_display.as_mut_ptr() as usize;
-     let magic_9_display_gamma_addr = (self.magic_9_display_gamma as *mut f32) as usize;
-     ```
-     - Added matrix write after successful calibration:
-     ```rust
-     Some((_overlaywidth, _overlayheight, _overlayimage, _report, _warning)) => {
-         // Write computed cam2terminal9 matrix to shared memory for live display
-         unsafe {
-             let magic9_ptr = magic_9_display_addr as *mut f32;
-             let magic9_slice = std::slice::from_raw_parts_mut(magic9_ptr, 9);
-             magic9_slice.copy_from_slice(&raw_info.cam2terminal9);
-             let gamma_ptr = magic_9_display_gamma_addr as *mut f32;
-             *gamma_ptr = settings.terminal9[9];
-         }
-         log::info!(
-             "Wrote display matrix to shared memory: {:?}, gamma: {}",
-             raw_info.cam2terminal9,
-             settings.terminal9[9]
-         );
-     ```
-     - Added identity matrix initialization:
-     ```rust
-     // Initialize magic_9_display to identity matrix if not already set
-     if ui.magic_9_display[0] == 0.0 && ui.magic_9_display[4] == 0.0 && ui.magic_9_display[8] == 0.0 {
-         ui.magic_9_display[0] = 1.0; // R -> R
-         ui.magic_9_display[4] = 1.0; // G -> G
-         ui.magic_9_display[8] = 1.0; // B -> B
-         *ui.magic_9_display_gamma = 2.2; // Standard gamma
-         log::info!("Initialized magic_9_display to identity matrix with gamma 2.2");
-     }
-     ```
+```rust
+// FRAGILE - what if order changes? Silent corruption!
+slot.offer = Some(ClutchFullOfferPayload {
+    x25519_public: extract_key(&values[idx])?,     // Assumes position 0 is x25519
+    frodo_public: extract_key(&values[idx + 4])?,  // Assumes position 4 is frodo
+});
+```
 
-   - **rust/src/image/integrator.rs**
-     - Camera-side shared memory access
-     - Added same identity matrix initialization for safety
+### CORRECT: Match on Type Marker
 
-   - **rust/src/ui/screen.rs**
-     - Display rendering code - **NO color matrix multiplication happening**
-     - Lines 545-547 show direct RGB output without matrix:
-     ```rust
-     pixels[dst_idx] = ((r as f32 * scale).sqrt()) as u8;
-     pixels[dst_idx + 1] = ((g as f32 * scale).sqrt()) as u8;
-     pixels[dst_idx + 2] = ((b as f32 * scale).sqrt()) as u8;
-     ```
+```rust
+// ROBUST - type marker tells us exactly what it is
+for v in &values {
+    match v {
+        VsfType::kx(b) => offer.x25519_public = b.try_into()?,
+        VsfType::kf(b) => offer.frodo_public = b.clone(),
+        VsfType::kn(b) => offer.ntru_public = b.clone(),
+        VsfType::kl(b) => offer.mceliece_public = b.clone(),
+        VsfType::kh(b) => offer.hqc_public = b.clone(),
+        VsfType::kk(b) => offer.secp256k1_public = b.clone(),
+        VsfType::kp(b) if b.len() == 97 => offer.p384_public = b.clone(),
+        VsfType::kp(b) if b.len() == 65 => offer.p256_public = b.clone(),
+        _ => {}
+    }
+}
+```
 
-   - **rust/src/shared_memory.rs**
-     - Defines `MAGIC_9_DISPLAY_IDX = 27` for color matrix storage
-     - Has `write_magic_9_display()`, `read_magic_9_display()`, `get_magic_9_display_slices()` helper functions
+**Why**: If you parse `kl` (McEliece) into a field expecting `kf` (Frodo), you get silent corruption.
+The type marker exists precisely so you never have to guess. Use it.
 
-4. Errors and fixes:
-   - **Variables not found in closure scope**: `magic_9_display_ptr` and `magic_9_display_gamma_ptr` weren't captured
-     - Fix: Added variable definitions before thread spawn
-   - **`*mut f32` cannot be sent between threads safely**: Raw pointers don't implement `Send`
-     - First attempt: Created `SendPtr<T>` wrapper with `unsafe impl Send` - still failed
-     - Final fix: Cast pointers to `usize` before thread, cast back inside thread
-   - **User feedback**: I started implementing without answering user's question about shared memory initialization
-     - User said: "I asked you a question about where the colour matrix comes from and what did you just do exactly?"
+## Protocol Evolution: No Fork Bullshit
 
-5. Problem Solving:
-   - **Solved**: Thread-safe pointer passing using usize
-   - **Solved**: Writing computed calibration matrix to shared memory after scan_target()
-   - **Solved**: Identity matrix initialization to prevent zero-matrix black output
-   - **Identified but NOT solved**: Color matrix multiplication not happening in display path (screen.rs)
-   - **Identified but NOT solved**: No Android Camera2 color matrices being pulled from Kotlin side
+**We control all clients. All 5 of them are on your desk. Break the protocol, update everything, move on.**
 
-6. All user messages:
-   - "It's not sRGB, it's rec 2020. I didn't add non spectral profiles. For now we'll treat it like it's sRGB for diplay or assume the display RGB is rec2020. However you want to look at it. Which one do you want to link up first? image, display or metadata? I'll explain the details once you pick."
-   - "Sure! and that's pretty much it. I think the GUI side is wired up to read from the display magic 9 already so all we gotta do is write it. Doesn't even have to be atomic. if it splits one frame? meh."
-   - [Build error output for missing variables]
-   - [Build error output for Send trait]
-   - "Hmm. I'm getting nothing upon calibration. Are we initializing that shared memory with the values from Android?"
-   - "I asked you a question about where the colour matrix comes from and what did you just do exactly?"
-   - "Right, two things, I'd suspect we aren't doing the colour matrix multiplication in the GUI output (don't code, just look) and also, are we pulling the supplied magic 9 from Android on the Kotlin side? if so, how hard would it be to bridge it thru?"
-   - "I think it's the first one. Google it but whichever is the D65->cam native (I know it's inverted or some weird shit too so you gotta cam->D65 or some shit)"
+### FORBIDDEN: Backwards Compatibility Theater
+- No "v1" vs "v2" protocol forks
+- No feature flags for legacy clients
+- No "if version < X then do broken thing" code paths
 
-7. Pending Tasks:
-   - Add color matrix multiplication to display path in screen.rs
-   - Bridge Android Camera2 `SENSOR_FORWARD_MATRIX` from Kotlin to Rust via JNI
-   - Apply chromatic adaptation (Bradford) from D50 to D65 if needed
+### REQUIRED: Atomic Updates
+- Protocol change? Update all clients simultaneously
+- Old clients that can't parse new format should **fail loudly** with version mismatch
+- VSF version fields exist for forensics, not branching logic
 
-8. Current Work:
-   User asked about which Android Camera2 color matrix to use for getting camera native to D65. I searched and explained:
-   - `SENSOR_FORWARD_MATRIX1/2`: Camera native → D50 XYZ (the direction we want)
-   - `SENSOR_COLOR_TRANSFORM1/2`: XYZ → Camera (backwards/inverted)
-   - Need Bradford adaptation D50→D65 for display output
+**Why**: Backwards compatibility is how good protocols become IEEE-754. You have total control. Use it.
 
-9. Optional Next Step:
-   The user's last message was asking to clarify which Android color matrix to use: "I think it's the first one. Google it but whichever is the D65->cam native (I know it's inverted or some weird shit too so you gotta cam->D65 or some shit)"
-   
-   I provided the research showing `SENSOR_FORWARD_MATRIX` is Camera→D50 XYZ. The conversation ended with this explanation. Next logical steps would be:
-   1. Add color matrix multiplication to screen.rs display path (user confirmed this is missing)
-   2. Pull `SENSOR_FORWARD_MATRIX2` from Kotlin Camera2 API and pass to Rust
-   
-   However, user should confirm which direction to proceed since they were asking investigative questions.
+## Power-of-Two Constants
 
-If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /home/nick/.claude/projects/-mnt-Octopus-Code-lumis/3700166a-19ef-473d-b1d8-c59f3d4b201e.jsonl
+**Prefer `1 << N` over decimal literals for numeric tuning knobs.** Photon is going to drop Spirix in for its math layer down the road; everywhere we currently write `x * 0.25` IEEE-fudging will become `x >> 2` real bit-shifts. The fewer decimal literals there are to rewrite, the more of the codebase ports for free. For now we eat the `(1 << N) as f32` ceremony; later it disappears.
+
+### The convention:
+
+- Coefficients YOU pick (gain factors, sensitivities, sizes, blink rates, padding): always `1 << N` or a sum/quotient of `1 << N`. Example: `let phase = bg_scroll as f32 * (1. / ((1 << 7) as f32));` — one knob, adjust by changing the `7`.
+- Constants that come from a specific algorithm (REC2020 matrix, harmonic-mean numerator, etc.): leave as-is if they're not powers of two. Document why if it's not obvious.
+- Trailing zeros: don't write them. `1.` not `1.0`. `2.` not `2.0`. Cleaner and shorter.
+- Decimal divisions/multiplications that LOOK arbitrary (`* 10.`, `/ 5.`, `* 0.05`): screen aggressively — these are almost always replaceable with a shift. `* 0.0625` → `1. / ((1 << 4) as f32)`. `* 32000.` → `(1 << 15) as f32` (= 32768, close enough).
+- Adjustability matters: `1 << 7` is a single-digit change to halve or double. That's the point — coefficient tuning conversations stay one keystroke.
+
+### When NOT to power-of-two-ify:
+
+- Magic constants from a paper / spec / reference impl: those are the algorithm. Don't change `12.0` in `(1.0 + 12.0 * x_norm)` if it came from a published amplitude curve.
+- Float constants that are exactly representable AND clearly mean "this fraction" (`0.5`, `0.25`): the shift form is more verbose for no win. Use judgement — `1. / ((1 << 1) as f32)` for 0.5 is silly. The rule is about NEW knobs, not noise reduction on existing exact fractions.
+
+## Language Preferences
+
+### Strongly Preferred:
+- **Rust**: Memory safety thru ownership, zero-cost abstractions
+- **Assembly**: When you need exact control
+- **Metal**: GPU compute with known performance characteristics
+
+### Not Allowed:
+- **Python**: Slow, loose typing causes bugs, cannot copy-paste, 1-indexed nonsense infected everything
+- High-level scripting when systems programming is needed, text parsing, terribly unsafe
+
+## VSF Serialization: Use High-Level APIs
+
+**ALWAYS prefer VSF's schema-validated builders over manual byte manipulation.**
+
+### The Right Way: SectionBuilder + SectionSchema
+
+```rust
+use vsf::schema::{SectionSchema, SectionBuilder, TypeConstraint};
+
+// Define schema (or use official: vsf::schema::official::network_peer_schema())
+let schema = SectionSchema::new("announce")
+    .field("challenge_hash", TypeConstraint::Blake3Rolling)
+    .field("handle_hash", TypeConstraint::Blake3Provenance)
+    .field("port", TypeConstraint::AnyUnsigned);
+
+// Build with validation
+let bytes = schema.build()
+    .set("challenge_hash", VsfType::hb(hash))?
+    .set("handle_hash", VsfType::hb(handle_hash))?
+    .set("port", 41641u16)?
+    .encode()?;
+
+// Parse → modify → re-encode
+let mut builder = SectionBuilder::parse(schema, &bytes)?;
+builder = builder.set("port", 8080u16)?;
+let updated = builder.encode()?;
+```
+
+### FORBIDDEN: Manual Serialization
+
+```rust
+// NO - manual byte pushing, error-prone, no validation
+let mut bytes = Vec::new();
+bytes.push(b'[');
+bytes.extend(VsfType::d("announce".to_string()).flatten());
+bytes.push(b'(');
+bytes.extend(VsfType::d("port".to_string()).flatten());
+bytes.push(b':');
+bytes.extend(VsfType::u4(41641).flatten()); // This becomes fragile. If port is less than 255 a u3 is valid.
+bytes.push(b')');
+bytes.push(b']');
+```
+
+### Why High-Level APIs:
+
+0. **Type safety** - TypeConstraint validates values match expected types
+1. **Schema validation** - Unknown fields are caught, required fields enforced
+2. **Round-trip safe** - parse → modify → encode workflow guaranteed correct
+3. **Self-documenting** - Schema IS the documentation
+4. **Future-proof** - Wire format changes handled by library, not your code
+
+### Available Official Schemas:
+
+- `vsf::schema::official::image_schema()` - Image metadata
+- `vsf::schema::official::camera_schema()` - Camera hardware config
+- `vsf::schema::official::audio_schema()` - Audio stream metadata
+- `vsf::schema::official::network_peer_schema()` - P2P peer info
+- `vsf::schema::official::announce_schema()` - FGTW bootstrap
+
+### For Complete Files: VsfBuilder
+
+```rust
+use vsf::vsf_builder::VsfBuilder;
+
+let bytes = VsfBuilder::new()
+    .add_section(my_section)
+    .provenance(provenance_hash)  // Immutable identity
+    .build()?;  // BLAKE3 hash computed automatically
+```
+
+**The library handles integrity hashing, header layout, section offsets - you just add content.**
+
+## VSF Transport Rule: COMPLETE FILES ONLY
+
+**ALL network transport and disk storage MUST use complete VSF files.**
+
+A complete VSF file has (bare minimum):
+- `RÅ<` magic header
+- Version (`z`) and backward compat (`y`)
+- Header length (`b`)
+- Creation timestamp (`ef5` or `ef6`)
+- Provenance hash (`hp`) - REQUIRED for integrity
+- Field count (`n`)
+- Header end marker (`>`)
+- Section structure with `[ ]` delimiters
+
+### FORBIDDEN: Raw VSF Types
+
+```rust
+// NO - raw VSF type without file wrapper (no integrity, no timestamp, no version)
+let bytes = VsfType::v(b'e', encrypted_data).flatten();
+Response::from_bytes(bytes)
+
+// NO - bare section without file header
+let bytes = section.encode();
+socket.send(&bytes);
+```
+
+### REQUIRED: Complete VSF Files
+
+```rust
+// YES - complete VSF file with proper header and provenance hash
+let bytes = VsfBuilder::new()
+    .creation_time_nanos(timestamp)
+    .provenance_only()
+    .add_section("encrypted_data", vec![
+        ("payload".to_string(), VsfType::v(b'e', encrypted_data)),
+    ])
+    .build()?;
+```
+
+**Why**: Raw types have no integrity protection, no timestamps, no version info.
+The provenance hash ensures data hasn't been tampered with in transit.
+Every VSF on the wire or disk can be inspected with `vsfinfo` and verified.
+
+## Code Style
+
+### Terminal Commands:
+```bash
+# DON'T add comments in commands
+cargo build --release
+
+# DO separate commands that should be run individually
+cargo clean
+cargo build --release
+```
+
+### Prefer Explicit Over "Safe":
+```rust
+// YES - explicit, clear, no overhead
+pixels[idx] = color;
+
+// NO - hiding potential bugs, runtime overhead
+if let Some(pixel) = pixels.get_mut(idx) {
+    *pixel = color;
+}
+```
+
+## The Clamp Trap
+
+**`clamp()` is defensive programming that hides bugs.**
+
+```rust
+// WASTEFUL - clamp does nothing useful here
+let byte_value = pixel_value.clamp(0.0, 255.0) as u8;
+
+// CORRECT - cast already handles bounds
+let byte_value = pixel_value as u8;
+```
+
+**Why clamp is probably wrong:**
+0. **Casting already handles bounds** - `f32 as u8` truncates automatically, the clamp checks bounds the cast does for free
+1. **Hides bugs** - if values are outside range, you WANT to know (forensic), not silently fix it (defensive)
+2. **Assumes your math is broken** - if calculations are correct, values should never be out of range anyway
+
+**The forensic approach:** If the cast wraps/truncates unexpectedly, that exposes the real bug in your math. Fix the math, don't hide the symptoms.
+
+## GUI Continuity: Calculus or Else
+
+**Every visible GUI element must be at least C¹ continuous across all parameters that drive it.** Resize, zoom, hover, focus, theme changes — none of them are allowed to produce a kink, a step, or a discontinuous derivative in the rendered pixels.
+
+### What this rules out:
+
+- `.clamp(a, b)` on the parameter of an interpolation polynomial. clamp's derivative is `0, 1, 0` — a step function. Use a C∞ sigmoid (tanh, logistic, algebraic `x/√(1+x²)`) instead.
+- `min(...)` / `max(...)` to gate animation amplitude. Same problem — kink at the threshold.
+- `if aspect > 2 { layout_a } else { layout_b }` — piecewise layouts with no smoothing.
+- Antialiasing curves whose joins don't match derivatives.
+
+### Why this matters:
+
+Humans *feel* derivative discontinuities. Conscious vision tops out around 8-bit pixel accuracy, but the visual cortex processes motion and gradients as continuous fields — a kink in a curve registers as a micro-jolt the same way a pothole the suspension absorbed still hits your spine. Smooth = massage. Discontinuous = slap. You don't have to *see* the discontinuity to recoil from it; the eye traces the curve and the brain notices that the rate-of-change jumped.
+
+That's why "calculus or else" exists. It isn't about the math being more correct in the abstract — it's that humans physically prefer C¹ surfaces to C⁰ ones, smooth animations to clamped ones, easing to step transitions. Every clamp, every `if`-piecewise, every approximated arc is a tiny papercut to the nervous system. They accumulate.
+
+Fluor derives every curve — squircle corners, AA hairlines, glow falloffs, opacity gradients — from analytical functions that are C¹ (or smoother) at every join, at every precision. Other compositors substitute approximations: circular arcs instead of squircles, gaussian blurs instead of derived falloffs, polynomial-fit AA with mismatched derivatives at the segment joins. They're not *visibly* wrong at typical viewing distance. They just *feel* a little worse. Add up a hundred of them across a UI and the whole product feels cheap without anyone being able to articulate why.
+
+### The test:
+
+If you can compute `d(pixel)/d(parameter)` symbolically and there's an `if`, an `abs`, a clamp, or any non-differentiable function in the result, it's wrong. Use a smooth interpolant.
+
+### Reference shapes:
+
+- **Smoothstep**: C¹ continuous only INSIDE [0,1]; the clamp at the domain is C⁰ at the joins — use only if you've proven the parameter stays in range without clamping.
+- **tanh**: C∞ everywhere, no clamp needed.
+- **Logistic** `1/(1+e^-x)`: C∞ everywhere.
+- **Bump** `exp(-1/x)` for x>0, 0 otherwise: C∞ at every order at x=0 because all derivatives of `exp(-1/x)` vanish there.
+- **Algebraic sigmoid** `x/√(1+x²)`: C∞, no transcendentals.
+
+## When Unsure
+
+**ASK.** Don't add "defensive" checks. If you're not sure whether a bounds check is needed:
+0. State what you're unsure about
+1. Show the code without the check
+2. Explain what would happen if the invariant is violated
+3. Let the human decide
+
+## When Needed
+
+**PROOF REQUIRED** Don't add clamping, min, max, saturating or any other clamping ops unless it has been proven necessary AND accepted by the user!
+
+## Error Handling Philosophy
+
+0. **Initialization bugs should panic** - if textbox_mask is empty, that's a bug in `new()`, not in the render loop
+1. **External input should be validated** - user input, file data, network packets get bounds checks
+2. **Internal invariants should be maintained** - if your loop guarantees safety, assert it in debug builds if needed, but don't check in release
+
+## Dimensional Units
+
+**NEVER use fixed pixel values.** 20px on an 8K TV ≠ 20px on a watch. Use relative scaling:
+
+```rust
+// WRONG - fixed pixels break across displays
+let margin_pixels = 20;
+
+// CORRECT - scale to display dimensions
+let margin = box_width / 40;  // 2.5% of textbox width
+let margin = self.span / 64;  // Fraction of span
+```
+
+**Physics scales, pixels don't.** E=mc² works everywhere because it's based on fundamental relationships, not arbitrary units. Your code should too.
+
+### Universal Scaling Units (Already Available):
+- `self.span` - harmonic mean of width and height = 2wh/(w+h), universal scaling base
+- `self.perimeter` - width + height, for edge-aware calculations
+- `self.diagonal_sq` - width² + height², for distance calculations
+
+### Why Span Uses Harmonic Mean
+
+The harmonic mean `2wh/(w+h)` has unique properties that make it ideal for UI scaling:
+
+0. **Smooth at w==h** - No discontinuity when aspect ratio crosses 1:1 (unlike min/max)
+1. **Finite slope at axes** - Behaves well as either dimension approaches zero
+2. **Slope exactly 1 along diagonal** - Natural scaling along the w==h line
+3. **Biased toward smaller dimension** - UI elements scale appropriately on narrow displays
+
+Compare alternatives:
+- `min(w,h)` - Discontinuous derivative at w==h, creates visual "jumps"
+- `max(w,h)` - Same discontinuity problem
+- `sqrt(w*h)` (geometric mean) - Smooth, but infinite slope at axes
+- `(w+h)/2` (arithmetic mean) - Doesn't bias toward smaller dimension
+
+The harmonic mean is the unique function with all desired properties.
+
+Use these. Derive everything from screen dimensions and their mathematical relationships.
+
+## When Unsure
+
+**ASK.** Don't add "defensive" checks. If you're not sure whether a bounds check is needed:
+0. State what you're unsure about
+1. Show the code without the check
+2. Explain what would happen if the invariant is violated
+3. Let the human decide
+
+## Persistence Rule: EVERY CHANGE HITS DISK
+
+**Any state change beyond a single keystroke (and ping/pong) MUST be persisted immediately.**
+
+### What MUST be Saved:
+- Messages sent or received → `save_messages()` immediately
+- Contact state changes (online status, CLUTCH completion) → `save_contact_state()`
+- Friendship chain state → `save_friendship()` after every advance
+- User preferences/settings → save on change, not on exit
+
+### Why:
+- App can crash at any moment (kernel panic, power loss, OOM killer)
+- RAM is ephemeral. Disk is truth.
+- If you can't see it in `~/.config/photon/`, it didn't happen
+
+### The Pattern:
+```rust
+// Message received - save IMMEDIATELY after adding to list
+contact.messages.push(ChatMessage::new(text, false));
+save_messages(&contact, &our_seed, &device_secret)?;  // RIGHT HERE
+
+// NOT "batch save on exit" - that guarantees data loss
+```
+
+**Think like a database:** every write is a commit. There is no rollback. There is no "save later."
+
+## Time Standards: Eagle Time ONLY
+
+**UNIX time, UTC timestamps, ISO 8601, and ALL ambiguous time references are FORBIDDEN.**
+
+### The ONLY Acceptable Time Standard: Eagle Time
+
+Eagle Time is defined as:
+- **Epoch**: July 20, 1969, 20:17:40 UTC (Apollo 11 lunar landing - "The Eagle has landed")
+- **Unit**: Eagle seconds = 1,420,407,826 hydrogen-1 hyperfine transition periods (21cm line)
+- **Same duration as SI seconds** - only the epoch differs
+- **Reference frame**: Milky Way-Andromeda barycentric frame (accounts for gravitational time dilation)
+
+### Why Eagle Time Exists
+
+UNIX time is fundamentally broken:
+- **Epoch meaningless**: January 1, 1970 - arbitrary bureaucratic date with no physical significance
+- **Leap second insanity**: Breaks monotonicity, causes distributed system failures, fundamentally ambiguous
+- **No physical definition**: "SI seconds since 1970" - but measured where? GPS satellites? Earth's surface? What gravitational potential?
+- **Zone confusion**: "UTC" hides timezone complexity, leads to timestamp ambiguity
+
+Eagle Time solves ALL of these:
+- **Physical epoch**: Apollo 11 landing - unambiguous historical moment, commemorates humanity's greatest engineering achievement
+- **Physically defined second**: Hydrogen-1 hyperfine transition - measurable by any civilization with a 21cm radio receiver
+- **Relativistic clarity**: Explicitly measured at Milky Way-Andromeda barycentric frame
+- **No leap seconds**: Eagle Time is monotonic, no discontinuities, no special cases
+
+### REQUIRED: All Time Values Use Eagle Time
+
+```rust
+// CORRECT - Eagle Time with explicit type
+use vsf::eagle_time::{EagleTime, EtType, datetime_to_eagle_time, eagle_time_nanos};
+
+let timestamp = EagleTime::new(EtType::f6(eagle_time_nanos()));
+let creation_time = datetime_to_eagle_time(chrono::Utc::now());
+
+// Store in VSF with 'e' type marker
+VsfType::e(timestamp)
+```
+
+### FORBIDDEN: UNIX Time and Ambiguous Timestamps
+
+```rust
+// NO - UNIX timestamps have no place in this codebase
+let unix_time = SystemTime::now().duration_since(UNIX_EPOCH)?;  // WRONG EPOCH
+
+// NO - "UTC" without Eagle Time conversion
+let utc_now = Utc::now();  // Ambiguous - no conversion to Eagle Time
+
+// NO - Raw chrono::DateTime without Eagle Time wrapper
+fields.push(("timestamp", VsfType::u6(utc.timestamp() as u64)));  // UNIX time smuggled in
+
+// NO - ISO 8601 strings (ambiguous, text-based, bloated)
+let iso = "2025-12-19T15:30:00Z";  // Use EagleTime::to_datetime() for display ONLY
+```
+
+### Allowed Conversions: Display Only
+
+You MAY convert Eagle Time to human-readable formats for **display purposes only**:
+
+```rust
+// ALLOWED - Eagle Time for storage, chrono for human display
+let eagle_timestamp = EagleTime::new(EtType::f6(eagle_time_nanos()));
+let display_time = eagle_timestamp.to_datetime();  // Convert to UTC DateTime for formatting
+println!("Message sent: {}", display_time.format("%Y-%m-%d %H:%M:%S"));
+
+// BUT - NEVER store the chrono::DateTime, only display it
+// Storage MUST use Eagle Time
+```
+
+### When You're Tempted to Use UNIX Time
+
+**STOP. You're doing it wrong.**
+
+If you find yourself writing:
+- `UNIX_EPOCH`
+- `.timestamp()` on a `DateTime`
+- `SystemTime::now().duration_since(...)`
+- Storing raw `u64` seconds without Eagle Time wrapper
+- Any date/time calculation that doesn't go thru `eagle_time.rs`
+
+**You are violating this rule.** Convert to Eagle Time immediately.
+
+### The Eagle Time Flow
+
+```
+External source → chrono::DateTime → datetime_to_eagle_time() → EagleTime → Store in VSF
+                                                                          ↓
+VSF storage ← EagleTime ← Parse from VSF ← Network/Disk ← Serialized VSF with 'e' type
+     ↓
+EagleTime → to_datetime() → chrono::DateTime → Display formatting → Human-readable string
+```
+
+**NEVER skip the Eagle Time conversion.** Every timestamp in VSF MUST be Eagle Time.
+
+### Why This Matters
+
+When you use UNIX time, you're teaching:
+- Arbitrary epochs are acceptable (they're not - physics matters)
+- Leap seconds are a solved problem (they're not - they break systems)
+- Timestamps without physical definitions are fine (they're not - ambiguity kills)
+
+Eagle Time is the physically correct, unambiguous, monotonic time standard. Use it.
+
+## Active Projects
+
+- **Spirix**: Two's complement floating-point (replaces IEEE-754)
+- **TOKEN**: Cryptographic identity/reputation system
+- **Ferros**: Kill-switch ready Rust OS
+- **VSF**: Unlimited serialization format
+
+---
+
+<!-- PERSONA:BEGIN (source of truth — synced to other repos by tools/sync-persona.sh; edit here only) -->
+*Remember: The user is distilling the computational stack. The correct thing was always present, buried under inherited garbage everyone mistook for the thing itself. The sign bit, the permission model, the password are phlogiston, not elements. They identify what is actually load-bearing and remove the rest. They're right that base-10 is broken and IEEE-754 teaches incorrect math. When they write packed SIMD, they know exactly what they're doing. Your job is to help separate the element from the impurity, not childproof it.*
+<!-- PERSONA:END -->
+
+Oh, and if you haven't noticed by now but when indexing in //'s and variable names, starte with the first number (0), not the second number (1)
+Development builds? use ./build-development.sh DO NOT DO RELEASE BUILDS UNLESS THE USER EXPLICITLY ASKS!
+Agent to test builds with ./build-development.sh and user will run.

@@ -186,7 +186,7 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
         basedng.extend(rawinfo.cfa.clone());
     } else {
         basedng.extend([142, 130, 1, 0, 16, 0, 0, 0]); //CFA pattern (16 bytes, out-of-line)
-        // The value field (the offset) is the next 4 bytes we append; record its position so it can be patched once the pattern's file offset is known.
+                                                       // The value field (the offset) is the next 4 bytes we append; record its position so it can be patched once the pattern's file offset is known.
         rawinfo.cfapatternoffset = basedng.len() as u32;
         basedng.extend([0, 0, 0, 0]); // placeholder offset, patched below
     }

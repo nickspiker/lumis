@@ -28,7 +28,35 @@ pub fn quad_cfa_color(bayer_pattern: u32, row: usize, col: usize) -> usize {
 
 #[inline]
 fn clampi(v: isize, hi: usize) -> usize {
+    // Rule 0: MEMORY SAFETY - this index clamp keeps an array index in [0, hi-1] so raw[...] / green[...] can't panic / index out of bounds when a neighbour offset (x-2, x+2, etc.) runs off the image edge.
     v.clamp(0, hi as isize - 1) as usize
+}
+
+/// Collapse a 4x4 quad-Bayer frame into a half-size standard 2x2 Bayer frame by averaging each 2x2 same-colour cluster into one pixel. The output keeps the same base bayer_pattern (each quad cluster maps to the corresponding standard-Bayer cell), so a standard 2x2 debayer (e.g. chameleon's, used for calibration) reads it correctly. Returns ((width+1)/2 * (height+1)/2) u16 at the same value scale as the input (cluster mean preserves 0..white).
+pub fn quad_to_standard_bayer(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+) -> (usize, usize, Vec<u16>) {
+    let ow = width / 2;
+    let oh = height / 2;
+    let mut out = vec![0u16; ow * oh];
+    for oy in 0..oh {
+        for ox in 0..ow {
+            // The output cell (ox,oy) corresponds to the 2x2 cluster at input origin (2*ox, 2*oy).
+            let sx = ox * 2;
+            let sy = oy * 2;
+            let a = raw[sy * width + sx] as u32;
+            // Rule 0: MEMORY SAFETY - clamp the +1 neighbour column index to the last valid column (width-1) so the 2x2 cluster read at the right edge stays in bounds and raw[...] can't index out of bounds.
+            let b = raw[sy * width + (sx + 1).min(width - 1)] as u32;
+            // Rule 0: MEMORY SAFETY - clamp the +1 neighbour row index to the last valid row (height-1) so the 2x2 cluster read at the bottom edge stays in bounds and raw[...] can't index out of bounds.
+            let c = raw[(sy + 1).min(height - 1) * width + sx] as u32;
+            // Rule 0: MEMORY SAFETY - clamp both the +1 row and +1 column neighbour indices to the last valid row/column so the bottom-right corner of the 2x2 cluster read stays in bounds and raw[...] can't index out of bounds.
+            let d = raw[(sy + 1).min(height - 1) * width + (sx + 1).min(width - 1)] as u32;
+            out[oy * ow + ox] = ((a + b + c + d) / 4) as u16;
+        }
+    }
+    (ow, oh, out)
 }
 
 /// Demosaic a quad-Bayer frame to full-resolution linear RGB (f32, black-subtracted and gained so the channel range matches a standard 0..white debayer). `raw` is the u16 slot (width*height). `black`/`white` are the per-pixel sensor levels (the 2x2 cluster sum scaling is handled internally: a cluster mean averages 4 same-colour pixels, so levels stay per-pixel). Returns width*height*3 linear RGB with each channel already multiplied by `gain`.
@@ -44,11 +72,14 @@ pub fn quad_demosaic(
     let w = width;
     let h = height;
     // Normalise to 0..1 linear, black-subtracted. (Cluster means below average 4 normalised samples - the extra dynamic range from summing is realised on-device by the integrator's accumulation; here we keep a single normalised scale so the colour matrix downstream is unchanged.)
+    // Rule 0: prevents divide-by-zero/negative in scale = 1.0 / (...) when white <= black (degenerate/swapped sensor levels); .max(1.0) keeps the divisor >= 1 so scale stays finite and positive (a 0 or negative divisor would yield +/-inf or a sign-flipped scale, producing inf/NaN or inverted output downstream).
     let scale = 1.0 / (white as f32 - black as f32).max(1.0);
-    let norm = |v: u16| -> f32 { ((v as f32 - black as f32).max(0.0)) * scale };
+    // No floor: a sub-black sample is real signal (it pulls the cluster mean down, which is correct), and it stays f32 through the matrix downstream. Clamping per-sample would discard noise-floor information; the final sqrt + saturating cast handle any genuinely-negative output.
+    let norm = |v: u16| -> f32 { (v as f32 - black as f32) * scale };
 
     let g = |x: isize, y: isize| -> f32 { norm(raw[clampi(y, h) * w + clampi(x, w)]) };
-    let cfa = |x: isize, y: isize| -> usize { quad_cfa_color(bayer_pattern, y as usize, x as usize) };
+    let cfa =
+        |x: isize, y: isize| -> usize { quad_cfa_color(bayer_pattern, y as usize, x as usize) };
 
     // 2x2 cluster mean of whatever colour sits at the cluster origin (even,even) containing (x,y).
     let cmean = |x: isize, y: isize| -> f32 {
@@ -86,7 +117,12 @@ pub fn quad_demosaic(
 
             let mut diag_sum = 0.0;
             let mut diag_n = 0.0;
-            for (nx, ny) in [(x - 2, y - 2), (x + 2, y - 2), (x - 2, y + 2), (x + 2, y + 2)] {
+            for (nx, ny) in [
+                (x - 2, y - 2),
+                (x + 2, y - 2),
+                (x - 2, y + 2),
+                (x + 2, y + 2),
+            ] {
                 if is_g(nx, ny) {
                     diag_sum += cmean(nx, ny);
                     diag_n += 1.0;
@@ -105,6 +141,7 @@ pub fn quad_demosaic(
             };
 
             let est = g(x, y) + (g_lpf - own);
+            // Rule 0: ALGORITHMIC floor - reconstructed green can't represent negative light, so floor to 0. Not a safety clamp; it prevents a physically impossible negative green value (from the green_lpf - own correction overshooting) leaking into the chroma-difference reconstruction in Step 2.
             green[y as usize * w + x as usize] = est.max(0.0);
         }
     }
@@ -134,7 +171,8 @@ pub fn quad_demosaic(
                     continue;
                 }
                 // chroma difference cd = colour_cluster_mean - green_cluster_lpf, interpolated along edges.
-                let cd_at = |cx: isize, cy: isize| -> f32 { cmean(cx, cy) - green_cluster_lpf(cx, cy) };
+                let cd_at =
+                    |cx: isize, cy: isize| -> f32 { cmean(cx, cy) - green_cluster_lpf(cx, cy) };
 
                 let mut h_cd = None;
                 {
@@ -168,8 +206,18 @@ pub fn quad_demosaic(
                 {
                     let mut acc = 0.0;
                     let mut n = 0.0;
-                    for (nx, ny) in [(x - 2, y - 2), (x + 2, y - 2), (x - 2, y + 2), (x + 2, y + 2)] {
-                        if nx >= 0 && ny >= 0 && nx < w as isize && ny < h as isize && cfa(nx, ny) == color {
+                    for (nx, ny) in [
+                        (x - 2, y - 2),
+                        (x + 2, y - 2),
+                        (x - 2, y + 2),
+                        (x + 2, y + 2),
+                    ] {
+                        if nx >= 0
+                            && ny >= 0
+                            && nx < w as isize
+                            && ny < h as isize
+                            && cfa(nx, ny) == color
+                        {
                             acc += cd_at(nx, ny);
                             n += 1.0;
                         }
@@ -184,7 +232,7 @@ pub fn quad_demosaic(
                 .abs();
                 let gv = (green[clampi(y - 1, h) * w + x as usize]
                     - green[clampi(y + 1, h) * w + x as usize])
-                .abs();
+                    .abs();
 
                 let cd = match (h_cd, v_cd) {
                     (Some(hc), Some(vc)) => {
@@ -200,12 +248,8 @@ pub fn quad_demosaic(
                 };
                 rgb[color] = gx + cd;
             }
-            // Apply gain; clamp negatives. (Downstream applies the colour matrix + sqrt.)
-            out[y as usize * w + x as usize] = [
-                (rgb[0].max(0.0)) * gain,
-                (rgb[1].max(0.0)) * gain,
-                (rgb[2].max(0.0)) * gain,
-            ];
+            // No floor: a reconstructed channel can dip slightly negative (difference-domain estimate), and that is real signal. The downstream colour matrix + sqrt + saturating cast handle the true value; clamping here would discard information and could even brighten another channel through the matrix's negative coeffs.
+            out[y as usize * w + x as usize] = [rgb[0] * gain, rgb[1] * gain, rgb[2] * gain];
         }
     }
     out

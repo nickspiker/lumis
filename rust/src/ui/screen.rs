@@ -205,7 +205,11 @@ fn draw_full_screen(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeW
 }
 
 // The original image-drawing body: histogram if visible, else the camera image.
-fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_Buffer) {
+fn draw_camera_or_histogram(
+    ui: &mut UserInterface,
+    pixels: &mut [u8],
+    buffer: &ANativeWindow_Buffer,
+) {
     // Draw histogram if visible and available, otherwise draw image
     let draw_histogram = ui.histogram_visible && ui.histogram_buffer.load().is_some();
 
@@ -351,9 +355,10 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
                             let g = g * scale_avg;
                             let b = b * scale_avg;
                             let (lr, lg, lb) = apply_display_matrix(ui, r, g, b);
-                            pixels[dst_idx] = (lr.max(0.).sqrt()).min(255.) as u8;
-                            pixels[dst_idx + 1] = (lg.max(0.).sqrt()).min(255.) as u8;
-                            pixels[dst_idx + 2] = (lb.max(0.).sqrt()).min(255.) as u8;
+                            // No clamps: `as u8` saturates >255 -> 255 and negative -> sqrt = NaN -> 0 (black), the desired output.
+                            pixels[dst_idx] = lr.sqrt() as u8;
+                            pixels[dst_idx + 1] = lg.sqrt() as u8;
+                            pixels[dst_idx + 2] = lb.sqrt() as u8;
                         }
                         RawMode::Difference | RawMode::Motion => {
                             let pixel_value = match current_mode {
@@ -367,8 +372,7 @@ fn draw_camera_or_histogram(ui: &mut UserInterface, pixels: &mut [u8], buffer: &
                                     ((diff_value << 16) / corrected_avg).min(65535) as u16
                                 }
                             };
-                            if ui.controls_visible
-                                && pixel_value > ui_constants::CLIPPING_THRESHOLD
+                            if ui.controls_visible && pixel_value > ui_constants::CLIPPING_THRESHOLD
                             {
                                 pixels[dst_idx] = 0;
                                 pixels[dst_idx + 1] = 0;

@@ -93,7 +93,7 @@ fn build_profile() -> Vec<u8> {
     p[12..16].copy_from_slice(b"mntr"); // device class: display
     p[16..20].copy_from_slice(b"RGB "); // data colour space
     p[20..24].copy_from_slice(b"XYZ "); // PCS
-    // date/time (zeros ok), 'acsp' signature
+                                        // date/time (zeros ok), 'acsp' signature
     p[36..40].copy_from_slice(b"acsp");
     // PCS illuminant = D50 (required in header).
     p[68..72].copy_from_slice(&s15f16(0.964203));

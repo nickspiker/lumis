@@ -2,7 +2,8 @@ use crate::{
     ui::{
         buttons::{composite_calibration_scan, composite_chameleon_button},
         sliders::get_slider_labels,
-        touch::slider_to_horizontal, ui::ui_constants,
+        touch::slider_to_horizontal,
+        ui::ui_constants,
     },
     UserInterface,
 };

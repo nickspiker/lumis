@@ -282,7 +282,8 @@ impl RcdData {
             for col in 0..raw_image.width {
                 let indx = row * raw_image.width + col;
                 for c in 0..3 {
-                    self.data[row][col][c] = (65535.0 * rgb[indx][c]).clamp(0.0, 65535.0) as u16;
+                    // No clamp: `as u16` saturates (>65535 -> 65535, negative/NaN -> 0). Verified equivalent to clamp(0,65535) over all f32.
+                    self.data[row][col][c] = (65535.0 * rgb[indx][c]) as u16;
                 }
             }
         }
