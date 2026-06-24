@@ -33,6 +33,12 @@ pub fn draw_screen(ui: &mut UserInterface, window: &NativeWindow, mut full_draw:
     }
     ui.previous_hold_present = hold_present;
 
+    // Dark-frame calibration screen: frames arrive ~16s apart but the stats update on a ~1.5s throttle,
+    // so force a full draw every render-loop tick to keep the live stats refreshing smoothly.
+    if (ui.header[FLAGS_IDX] & CALIBRATING_BIT) != 0 {
+        full_draw = true;
+    }
+
     if ui.histogram_visible && ui.histogram_buffer.load().is_some() {
         // Histogram mode with histogram ready - use histogram counter for full draw decisions
         let current_histogram_counter = ui.header[HISTOGRAM_COUNTER_IDX];
@@ -189,6 +195,13 @@ fn spawn_histogram_calculation(ui: &UserInterface, image_counter: u64) {
 }
 
 fn draw_full_screen(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_Buffer) {
+    // Dark-frame calibration capture has its own minimal screen: just progress stats and an
+    // End/Finalize button - no live image, no camera controls. Render it and return.
+    if (ui.header[crate::shared_memory::FLAGS_IDX] & crate::shared_memory::CALIBRATING_BIT) != 0 {
+        draw_calibration_screen(ui, pixels, buffer);
+        return;
+    }
+
     // Draw the camera image (frozen during calibration). When a calibration hold is active, the in-place live overlay is composited per-pixel inside the fit-to-screen loop.
     draw_camera_or_histogram(ui, pixels, buffer);
 
@@ -202,6 +215,99 @@ fn draw_full_screen(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeW
     if crate::DEBUG {
         debug_draw_margins(ui, pixels, buffer);
     }
+}
+
+// Minimal dark-frame calibration screen: black background, live progress stats, and a FINALIZE button.
+// No image, no camera controls - the user just watches the convergence and taps FINALIZE when satisfied
+// (which sets CAL_FINALIZE_BIT; the integrator then averages, writes the cal to disk, and stops).
+fn draw_calibration_screen(
+    ui: &mut UserInterface,
+    pixels: &mut [u8],
+    buffer: &ANativeWindow_Buffer,
+) {
+    use crate::shared_memory::*;
+    let w = buffer.stride as u32;
+    let h = buffer.height as u32;
+    // Clear to black.
+    for p in pixels.iter_mut() {
+        *p = 0;
+    }
+
+    // Read the published progress stats.
+    let is_dark = (ui.header[FLAGS_IDX] & CAL_IS_DARK_BIT) != 0;
+    let frames = ui.header[CAL_FRAME_COUNT_IDX];
+    let elapsed_ms = ui.header[CAL_ELAPSED_MS_IDX];
+    let correlation = f64::from_bits(ui.header[CAL_CORRELATION_IDX]);
+    let mean = f64::from_bits(ui.header[CAL_MEAN_IDX]);
+    let noise = f64::from_bits(ui.header[CAL_NOISE_IDX]);
+
+    let cx = w as f32 / 2.;
+    let line_h = h as f32 * 0.055;
+    let size = line_h * 0.6;
+    let y0 = h as f32 * 0.16;
+
+    // Convergence colour cue: red->green as it approaches 1.0 (clean fixed pattern).
+    let cg = (correlation.clamp(0., 1.) * 255.) as u8;
+    let cr = 255 - cg;
+    let secs = elapsed_ms / 1000;
+
+    // (text, r, g, b) per line; the title gets a half-line gap after it (index 0).
+    let lines: [(String, u8, u8, u8); 6] = [
+        (
+            if is_dark { "DARK CALIBRATION".into() } else { "BIAS CALIBRATION".into() },
+            0xFF,
+            0xC0,
+            0x40,
+        ),
+        (format!("frames: {}", frames), 0xE0, 0xE0, 0xE0),
+        (format!("elapsed: {}m {}s", secs / 60, secs % 60), 0xE0, 0xE0, 0xE0),
+        (format!("convergence: {:.3}", correlation), cr, cg, 0x40),
+        (format!("mean: {:.0}", mean), 0xE0, 0xE0, 0xE0),
+        (format!("noise: {:.0}", noise), 0xE0, 0xE0, 0xE0),
+    ];
+    for (i, (text, r, g, b)) in lines.iter().enumerate() {
+        // Extra half-line gap below the title.
+        let y = y0 + i as f32 * line_h + if i > 0 { line_h * 0.5 } else { 0. };
+        ui.text_renderer
+            .draw_text_center(pixels, w, h, text, cx, y, size, 0, *r, *g, *b, 0);
+    }
+
+    // FINALIZE button - a teal bar near the bottom. Rect kept in sync with the touch hit-test.
+    let (bx0, by0, bx1, by1) = calibration_finalize_rect(w, h);
+    for py in by0..by1 {
+        for px in bx0..bx1 {
+            let off = (py as usize * w as usize + px as usize) * 3;
+            if off + 2 < pixels.len() {
+                pixels[off] = 0x10;
+                pixels[off + 1] = 0x50;
+                pixels[off + 2] = 0x50;
+            }
+        }
+    }
+    ui.text_renderer.draw_text_center(
+        pixels,
+        w,
+        h,
+        "FINALIZE",
+        cx,
+        (by0 + by1) as f32 / 2. - size * 0.5,
+        size,
+        0,
+        0x60,
+        0xFF,
+        0xFF,
+        0,
+    );
+}
+
+// The on-screen rectangle (x0,y0,x1,y1) of the calibration FINALIZE button, in buffer pixels. Shared
+// by the renderer and the touch hit-test so they can't drift apart.
+pub fn calibration_finalize_rect(w: u32, h: u32) -> (u32, u32, u32, u32) {
+    let bw = (w as f32 * 0.6) as u32;
+    let bh = (h as f32 * 0.08) as u32;
+    let x0 = (w - bw) / 2;
+    let y0 = (h as f32 * 0.78) as u32;
+    (x0, y0, x0 + bw, y0 + bh)
 }
 
 // The original image-drawing body: histogram if visible, else the camera image.

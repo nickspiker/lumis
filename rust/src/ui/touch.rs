@@ -28,6 +28,23 @@ pub fn handle_touch(
         trace!("Touch event: action={:?}, pos=({:.1}, {:.1})", action, x, y);
     }
 
+    // Dark-frame calibration screen: the only interactive element is FINALIZE. A tap inside that
+    // button requests finalize+stop (the integrator writes the cal to disk and clears CALIBRATING_BIT);
+    // everything else on this screen is inert. Handled before all normal camera-touch logic.
+    if (ui.header[crate::shared_memory::FLAGS_IDX] & crate::shared_memory::CALIBRATING_BIT) != 0 {
+        if let TouchAction::Down = action {
+            let (bx0, by0, bx1, by1) = crate::ui::screen::calibration_finalize_rect(
+                ui.screen_run as u32,
+                ui.screen_rise as u32,
+            );
+            if x >= bx0 as f32 && x < bx1 as f32 && y >= by0 as f32 && y < by1 as f32 {
+                ui.header[crate::shared_memory::FLAGS_IDX] |=
+                    crate::shared_memory::CAL_FINALIZE_BIT;
+            }
+        }
+        return true; // keep the stats screen repainting; consume all touches
+    }
+
     match action {
         TouchAction::Down => {
             if crate::DEBUG {
