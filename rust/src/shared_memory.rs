@@ -30,6 +30,17 @@ pub const MAGIC_9_DNG_XYZ_IDX: usize = 32; // Adobe XYZ magic 9 (9 f32s) + gamma
 pub const SAVE_FORMAT_IDX: usize = 37; // Save format: 0=JPEG XL, 1=JPEG, 2=DNG, 3=TIFF
 pub const MAGIC_9_INV_IDX: usize = 38; // DNG magic9inv (72 bytes = 9 u64s, 38-46) from chameleon
 pub const QUAD_BAYER_IDX: usize = 47; // 1 if the frame is 4x4 quad-Bayer (max-res RAW10), else 0
+
+// --- Dark-frame calibration capture (indices 48-55, free header space below IMAGE_START=64) ---
+// The integrator, while CALIBRATING_BIT is set, accumulates frames without the normal per-exposure
+// reset and writes these progress stats each frame so the calibration display screen can show how the
+// capture is converging and let the user choose when to finalize.
+pub const CAL_FRAME_COUNT_IDX: usize = 48; // u64: number of frames accumulated so far this calibration
+pub const CAL_ELAPSED_MS_IDX: usize = 49; // u64: milliseconds since this calibration capture started
+pub const CAL_CORRELATION_IDX: usize = 50; // f64 bits: split-half correlation (even vs odd frame averages); ~1.0 = clean fixed pattern
+pub const CAL_MEAN_IDX: usize = 51; // f64 bits: mean dark level across the frame (raw counts)
+pub const CAL_NOISE_IDX: usize = 52; // f64 bits: residual per-pixel noise std (falls ~1/sqrt(N) as it converges)
+
 pub const IMAGE_START: usize = 64;
 
 // Save format values (SAVE_FORMAT_IDX). Numbered to match the tap-cycle order JXL -> JPEG -> DNG -> TIFF, and JXL is 0 so it's the zero-initialized default.
@@ -44,6 +55,13 @@ pub const COMPLETE_EXPOSURE_BIT: u64 = 1 << 0;
 pub const MANUAL_SAVE_BIT: u64 = 1 << 1;
 pub const CONTINUOUS_SAVE_BIT: u64 = 1 << 2;
 pub const CURRENTLY_SAVING: u64 = 1 << 3;
+// Set while a dark-frame calibration capture is running: the integrator accumulates without the normal
+// per-exposure reset (mean + per-pixel variance + even/odd half-sums for the convergence metric).
+pub const CALIBRATING_BIT: u64 = 1 << 4;
+// 1 = dark-current calibration (max ISO + longest shutter), 0 = bias (max ISO + shortest shutter).
+pub const CAL_IS_DARK_BIT: u64 = 1 << 5;
+// Set by the UI to request the running calibration be finalized (averaged + written to disk) and stopped.
+pub const CAL_FINALIZE_BIT: u64 = 1 << 6;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum RawMode {
