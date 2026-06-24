@@ -63,6 +63,103 @@ fn mosaic_quad(w: usize, h: usize, rgb: &[[u16; 3]], bayer_pattern: u32) -> Vec<
     raw
 }
 
+// ---- standard 2x2 Bayer mosaic + a matched directional demosaic ----
+// This exists ONLY to A/B the CFA LAYOUT against quad-Bayer with the algorithm held constant: same
+// gradient-chosen-directional green, same chroma-difference R/B, just a standard RGGB 2x2 CFA instead
+// of the 4x4 Tetracell. It is NOT the shipping demosaic (that's chameleon's RCD); it's a like-for-like
+// control so any PSNR gap is attributable to the mosaic arrangement, not to a fancier algorithm.
+fn std_cfa_color(row: usize, col: usize) -> usize {
+    // RGGB: R G / G B
+    match ((row & 1) << 1) | (col & 1) {
+        0 => 0, // (0,0) R
+        3 => 2, // (1,1) B
+        _ => 1, // G
+    }
+}
+
+fn mosaic_standard(w: usize, h: usize, rgb: &[[u16; 3]]) -> Vec<u16> {
+    let mut raw = vec![0u16; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            raw[y * w + x] = rgb[y * w + x][std_cfa_color(y, x)];
+        }
+    }
+    raw
+}
+
+// Directional green + chroma-difference R/B on a standard RGGB Bayer frame. Mirrors quad_demosaic's
+// structure (H/V/P/Q green by smallest gradient, then colour = green + interpolated colour-minus-green).
+fn standard_demosaic(raw: &[u16], w: usize, h: usize) -> Vec<[f32; 3]> {
+    let at = |x: isize, y: isize| -> f32 {
+        let xi = x.clamp(0, w as isize - 1) as usize;
+        let yi = y.clamp(0, h as isize - 1) as usize;
+        raw[yi * w + xi] as f32 / 65535.0
+    };
+    let cfa = |x: isize, y: isize| std_cfa_color(y as usize, x as usize);
+
+    // Step 1: green at every pixel.
+    let mut green = vec![0.0f32; w * h];
+    for y in 0..h as isize {
+        for x in 0..w as isize {
+            if cfa(x, y) == 1 {
+                green[y as usize * w + x as usize] = at(x, y);
+                continue;
+            }
+            // Neighbouring greens are the 4-connected N/S/E/W pixels (standard Bayer).
+            let (gw, ge, gn, gs) = (at(x - 1, y), at(x + 1, y), at(x, y - 1), at(x, y + 1));
+            let h_grad = (gw - ge).abs();
+            let v_grad = (gn - gs).abs();
+            // P (\): NW=mean(W,N) corner vs SE=mean(E,S); Q (/): NE=mean(E,N) vs SW=mean(W,S).
+            let p_grad = (0.5 * (gw + gn) - 0.5 * (ge + gs)).abs();
+            let q_grad = (0.5 * (ge + gn) - 0.5 * (gw + gs)).abs();
+            let (mut best, mut est) = (h_grad, 0.5 * (gw + ge));
+            if v_grad < best { best = v_grad; est = 0.5 * (gn + gs); }
+            if p_grad < best { best = p_grad; est = 0.25 * (gw + gn + ge + gs); }
+            if q_grad < best { est = 0.25 * (gw + gn + ge + gs); }
+            let _ = best;
+            green[y as usize * w + x as usize] = est.max(0.0);
+        }
+    }
+    // Step 2: R and B from green-difference domain (bilinear on the colour-minus-green residual).
+    let mut out = vec![[0.0f32; 3]; w * h];
+    let gg = |x: isize, y: isize| -> f32 {
+        green[y.clamp(0, h as isize - 1) as usize * w + x.clamp(0, w as isize - 1) as usize]
+    };
+    // chroma residual sampler for a given colour, averaging same-colour neighbours present at offset set.
+    for y in 0..h as isize {
+        for x in 0..w as isize {
+            let gx = green[y as usize * w + x as usize];
+            let fc = cfa(x, y);
+            let mut rgb = [0.0f32; 3];
+            rgb[1] = gx;
+            // For each of R(0) and B(2): if measured here use it; else interpolate residual from the
+            // 4 diagonal (for G-site cross) / orthogonal same-colour neighbours.
+            for &col in &[0usize, 2usize] {
+                if fc == col {
+                    rgb[col] = at(x, y);
+                } else if fc == 1 {
+                    // Green site: the wanted colour is on either the horizontal or vertical pair.
+                    // Average whichever orthogonal pair carries `col` (residual = colour - green).
+                    let horiz = std_cfa_color((y) as usize, (x + 1).max(0) as usize) == col
+                        || std_cfa_color((y) as usize, (x - 1).max(0) as usize) == col;
+                    let (a, b) = if horiz { ((x - 1, y), (x + 1, y)) } else { ((x, y - 1), (x, y + 1)) };
+                    let res = 0.5 * ((at(a.0, a.1) - gg(a.0, a.1)) + (at(b.0, b.1) - gg(b.0, b.1)));
+                    rgb[col] = (gx + res).max(0.0);
+                } else {
+                    // Opposite colour site (R wanting B or vice versa): 4 diagonal same-colour neighbours.
+                    let res = 0.25 * ((at(x - 1, y - 1) - gg(x - 1, y - 1))
+                        + (at(x + 1, y - 1) - gg(x + 1, y - 1))
+                        + (at(x - 1, y + 1) - gg(x - 1, y + 1))
+                        + (at(x + 1, y + 1) - gg(x + 1, y + 1)));
+                    rgb[col] = (gx + res).max(0.0);
+                }
+            }
+            out[y as usize * w + x as usize] = rgb;
+        }
+    }
+    out
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -79,23 +176,41 @@ fn main() {
     for path in &args[1..] {
         let p = Path::new(path);
         let (w, h, truth) = load_tiff_rgb16(p);
-        let raw = mosaic_quad(w, h, &truth, bayer_pattern);
-        // black=0, white=65535, gain=1 -> demosaic returns 0..1 linear matching truth/65535.
-        let recon = quad::quad_demosaic(&raw, w, h, 0, 65535, 1.0, bayer_pattern);
+        // QH_STD=1: mosaic+demosaic as a standard 2x2 RGGB Bayer (same algorithm) to A/B the CFA layout.
+        let use_std = std::env::var("QH_STD").map(|s| s == "1").unwrap_or(false);
+        let recon = if use_std {
+            let raw = mosaic_standard(w, h, &truth);
+            standard_demosaic(&raw, w, h)
+        } else {
+            let raw = mosaic_quad(w, h, &truth, bayer_pattern);
+            // black=0, white=65535, gain=1 -> demosaic returns 0..1 linear matching truth/65535.
+            quad::quad_demosaic(&raw, w, h, 0, 65535, 1.0, bayer_pattern)
+        };
 
         let (rel_pct, psnr, diff) = score_relative(w, h, &truth, &recon);
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
-        let diff_path = p.with_file_name(format!("{stem}_diff.png"));
-        write_png_rgb8(&diff_path, w, h, &diff);
+        // In standard-Bayer A/B mode (QH_STD=1) we only want the numbers - don't clobber the quad PNGs.
+        if !use_std {
+            let diff_path = p.with_file_name(format!("{stem}_diff.png"));
+            write_png_rgb8(&diff_path, w, h, &diff);
+
+            // Viewable debayered output: recon is linear 0..1, so sqrt-encode it (the same transfer the
+            // on-device display uses) before writing to 8-bit PNG - otherwise linear light looks far too
+            // dark. Also write the reference at the same tone so you can A/B them side by side.
+            let recon_rgb8 = encode_linear_rgb8(&recon, w, h);
+            write_png_rgb8(&p.with_file_name(format!("{stem}_recon.png")), w, h, &recon_rgb8);
+            let truth_rgb8 = encode_truth_rgb8(&truth, w, h);
+            write_png_rgb8(&p.with_file_name(format!("{stem}_truth.png")), w, h, &truth_rgb8);
+        }
 
         println!(
-            "{:<28}  {}x{}  rel-err {:>6.3}%   rel-PSNR {:>6.2} dB   -> {}",
+            "{:<28}  {}x{}  rel-err {:>6.3}%   rel-PSNR {:>6.2} dB   {}",
             stem,
             w,
             h,
             rel_pct,
             psnr,
-            diff_path.file_name().unwrap().to_string_lossy()
+            if use_std { "[standard-bayer A/B]" } else { "-> *_recon/_truth/_diff.png" }
         );
         total_rel += rel_pct as f64;
         total_psnr += psnr as f64;
@@ -220,6 +335,35 @@ fn score_relative(w: usize, h: usize, truth: &[[u16; 3]], recon: &[[f32; 3]]) ->
         pc(0), 100.0 * band_n[0] / (count), pc(1), pc(2)
     );
     (mean_rel * 100.0, psnr, diff)
+}
+
+// sqrt transfer for display: linear 0..1 -> 8-bit. Matches the on-device encode (the final step of
+// the screen pipeline is .sqrt() as u8 in linear space), so these PNGs look like the live preview
+// would, not like raw linear light (which is far too dark to inspect by eye).
+fn to_srgb8(linear: f32) -> u8 {
+    (linear.max(0.0).min(1.0).sqrt() * 255.0).round() as u8
+}
+
+// Debayered recon (Vec<[f32;3]> linear 0..1) -> sqrt-encoded 8-bit RGB for viewing.
+fn encode_linear_rgb8(recon: &[[f32; 3]], w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * 3];
+    for i in 0..w * h {
+        out[i * 3] = to_srgb8(recon[i][0]);
+        out[i * 3 + 1] = to_srgb8(recon[i][1]);
+        out[i * 3 + 2] = to_srgb8(recon[i][2]);
+    }
+    out
+}
+
+// Reference truth (16-bit linear) -> the SAME sqrt encode so recon and truth are tone-matched for A/B.
+fn encode_truth_rgb8(truth: &[[u16; 3]], w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * 3];
+    for i in 0..w * h {
+        out[i * 3] = to_srgb8(truth[i][0] as f32 / 65535.0);
+        out[i * 3 + 1] = to_srgb8(truth[i][1] as f32 / 65535.0);
+        out[i * 3 + 2] = to_srgb8(truth[i][2] as f32 / 65535.0);
+    }
+    out
 }
 
 fn write_png_rgb8(path: &Path, w: usize, h: usize, rgb: &[u8]) {
