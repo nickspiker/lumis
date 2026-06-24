@@ -67,9 +67,12 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
    private var cameraWidth: Int = 0
    private var cameraHeight: Int = 0
    
-   // Input state - sent to Rust every frame
+   // Input state - sent to Rust every frame.
+   // currentTouchX/Y hold the latest touch position (NaN = no touch). onTouchEvent runs on the UI thread and writes these; the render loop reads them once per frame. At high resolution a frame's draw can take longer than a quick tap's DOWN..UP, so the UP would overwrite the DOWN with NaN before any frame sampled it - the tap is lost. To prevent that we latch: a DOWN that has not yet been read by a draw must survive at least one frame as a valid touch before UP clears it. touchDownSampled tracks whether the current down has been delivered to a draw; pendingTouchUp defers the NaN clear by one frame when it hasn't.
    private var currentTouchX: Float = Float.NaN
-   private var currentTouchY: Float = Float.NaN  
+   private var currentTouchY: Float = Float.NaN
+   @Volatile private var touchDownSampled: Boolean = false
+   @Volatile private var pendingTouchUp: Boolean = false
    private var gravityX: Float = 0.0f
    private var gravityY: Float = 0.0f  
    private var gravityZ: Float = 0.0f
@@ -400,18 +403,31 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
    private fun drawUIFrame() {
        if (uiContextPtr != 0L) {
            surfaceView.holder.surface?.let { surface ->
+               // Snapshot the touch once so onTouchEvent (UI thread) can't mutate it mid-call. If this frame carries a valid touch, mark the current down as delivered to a draw - a later UP can now clear immediately rather than deferring.
+               val touchX = currentTouchX
+               val touchY = currentTouchY
+               if (!touchX.isNaN()) {
+                   touchDownSampled = true
+               }
                nativeUIDraw(
                    uiContextPtr,
                    surface,
                    bluetoothShutterPressed,  // completeExposure - Bluetooth shutter
-                   savePressed,              // save - volume up  
+                   savePressed,              // save - volume up
                    continuousSavePressed,    // continuousSave - volume down
                    gravityX,                 // Raw gravity for Rust rotation handling
                    gravityY,
                    gravityZ,
-                   currentTouchX,            // NaN if no touch
-                   currentTouchY
+                   touchX,                   // NaN if no touch
+                   touchY
                )
+               // A tap whose UP arrived before its DOWN was sampled deferred the NaN clear (pendingTouchUp). We've now delivered that DOWN to a draw, so release the touch: next frame sends NaN, giving Rust the DOWN -> UP transition it needs to register the tap.
+               if (pendingTouchUp) {
+                   currentTouchX = Float.NaN
+                   currentTouchY = Float.NaN
+                   pendingTouchUp = false
+                   touchDownSampled = false
+               }
                // Reset flags after sending
                if (bluetoothShutterPressed) {
                    bluetoothShutterPressed = false
@@ -557,11 +573,22 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
                        currentTouchX = event.x
                        currentTouchY = event.y
+                       if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                           // Fresh press: it has not been handed to a draw yet, and any deferred release from a prior tap is moot.
+                           touchDownSampled = false
+                           pendingTouchUp = false
+                       }
                    }
                    else -> {
-                       // ANY other action (UP, CANCEL, OUTSIDE, POINTER_DOWN, etc.) If it's not explicitly DOWN or MOVE, clear the coordinates
-                       currentTouchX = Float.NaN
-                       currentTouchY = Float.NaN
+                       // ANY other action (UP, CANCEL, OUTSIDE, POINTER_DOWN, etc.). Clear the coordinates - but if the matching DOWN was never sampled by a draw (a tap shorter than one slow frame), defer the clear one frame so the draw loop still sees the DOWN before the UP. Otherwise clear immediately.
+                       if (touchDownSampled) {
+                           currentTouchX = Float.NaN
+                           currentTouchY = Float.NaN
+                           pendingTouchUp = false
+                       } else {
+                           // Keep currentTouchX/Y at the down position for one more frame; the render loop will sample the DOWN, then honour this pending UP.
+                           pendingTouchUp = true
+                       }
                    }
                }
            }

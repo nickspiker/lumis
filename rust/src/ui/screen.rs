@@ -231,7 +231,7 @@ fn draw_camera_or_histogram(
         let pixel_count = ui.sensor_x_size * ui.sensor_y_size;
         // Quad-Bayer (Tetracell) mode: the CFA is a 4x4 tile of four 2x2 same-colour clusters, so a 2x2 block is a single colour and naive debayer renders grey. When set, both preview paths resolve colour from the 4x4 quad tile instead. Matches ui.rs's `is_quad` usage.
         let is_quad = ui.header[crate::shared_memory::QUAD_BAYER_IDX] != 0;
-        // Quad tile -> (R cluster, G cluster, B cluster) top-left offsets within the 4x4 tile. base_2x2 gives the per-cluster colour (0=R,1=G,2=B) in (cluster_row, cluster_col) order; cluster k sits at offset ((k&1)*2, (k>>1)*2) = (col,row). We pick one representative cluster per channel (R, the first G, B); a single representative pixel per cluster is sampled below for speed (full averaging is unnecessary for the live preview).
+        // Per-2x2-cell colour (0=R,1=G,2=B) of the base Bayer pattern, indexed row-major (idx = row*2 + col). The fit-to-screen Average bin uses this to classify each source pixel: for standard Bayer it is the colour of each pixel of the 2x2 cell; for quad-Bayer it is the colour of each 2x2 CLUSTER of the 4x4 tile.
         let base_2x2 = |bayer_pattern: u32| -> [usize; 4] {
             match bayer_pattern {
                 0 => [0, 1, 1, 2], // RGGB
@@ -240,26 +240,6 @@ fn draw_camera_or_histogram(
                 3 => [2, 1, 1, 0], // BGGR
                 _ => [0, 1, 1, 2],
             }
-        };
-        // For the active pattern, return the (dx,dy) cluster offsets within the 4x4 tile for the R, G and B channels. cluster index k -> offset (col=(k&1)*2, row=(k>>1)*2). First matching G cluster wins.
-        let quad_offsets = |bayer_pattern: u32| -> [(usize, usize); 3] {
-            let base = base_2x2(bayer_pattern);
-            let mut offs = [(0usize, 0usize); 3]; // [R, G, B]
-            let mut have_g = false;
-            for k in 0..4 {
-                let off = ((k & 1) * 2, (k >> 1) * 2);
-                match base[k] {
-                    0 => offs[0] = off,
-                    2 => offs[2] = off,
-                    _ => {
-                        if !have_g {
-                            offs[1] = off;
-                            have_g = true;
-                        }
-                    }
-                }
-            }
-            offs
         };
 
         // While calibration holds the feed, render from the snapshot taken at freeze time (avg at 0, diff at pixel_count) so the camera thread can't change it. Otherwise read the current live slot.
@@ -366,48 +346,13 @@ fn draw_camera_or_histogram(
                                     v.saturating_sub(bk) as f32
                                 }
                             };
-                            let (r, g, b) = if is_quad {
-                                // Quad-Bayer: a 2x2 block is one colour, so resolve from the 4x4 tile. Sample one representative pixel (the cluster top-left) of the R, G and B clusters; full per-cluster averaging is not needed for the live preview.
-                                let tx = sensor_x & !3;
-                                let ty = sensor_y & !3;
-                                let [(rdx, rdy), (gdx, gdy), (bdx, bdy)] =
-                                    quad_offsets(ui.bayer_pattern);
-                                // .min(last): every computed index feeds raw_average[..]; clamping to the last valid element prevents an out-of-bounds index (panic / UB) when the tile origin lands at the sensor's right/bottom edge.
-                                let ridx = ((ty + rdy) * ui.sensor_x_size + tx + rdx).min(last);
-                                let gidx = ((ty + gdy) * ui.sensor_x_size + tx + gdx).min(last);
-                                let bidx = ((ty + bdy) * ui.sensor_x_size + tx + bdx).min(last);
-                                (
-                                    sub(raw_average[ridx]),
-                                    sub(raw_average[gidx]),
-                                    sub(raw_average[bidx]),
-                                )
-                            } else {
-                                // 2x2-block colour debayer at (sensor_x, sensor_y), same scheme as the fit-to-screen preview and the save fallback.
-                                let bx = sensor_x & !1;
-                                let by = sensor_y & !1;
-                                let base = (by * ui.sensor_x_size + bx).min(last);
-                                let tl = sub(raw_average[base]);
-                                let tr = sub(raw_average[(base + 1).min(last)]);
-                                let bl = sub(raw_average[(base + ui.sensor_x_size).min(last)]);
-                                let br = sub(raw_average[(base + ui.sensor_x_size + 1).min(last)]);
-                                let local = (sensor_x - bx) + (sensor_y - by);
-                                match ui.bayer_pattern {
-                                    0 => (tl, if local < 2 { tr } else { bl }, br), // RGGB
-                                    1 => (tr, if local < 2 { tl } else { br }, bl), // GRBG
-                                    2 => (bl, if local < 2 { tl } else { br }, tr), // GBRG
-                                    3 => (br, if local < 2 { tr } else { bl }, tl), // BGGR
-                                    _ => (tl, if local < 2 { tr } else { bl }, br),
-                                }
-                            };
-                            // Black already subtracted above; just apply gain + matrix.
-                            let r = r * scale_avg;
-                            let g = g * scale_avg;
-                            let b = b * scale_avg;
-                            let (lr, lg, lb) = apply_display_matrix(ui, r, g, b);
+                            // 1:1 zoomed view is raw-direct greyscale: no debayer at all. Read THIS exact sensor pixel, black-subtract (sub, with the same clip indicator as every other path), gain, sqrt, and write it to all three channels. Showing the raw mosaic as luma at 1:1 lets you inspect per-pixel sensor data (CFA pattern, hot pixels, noise) without any colour interpolation. No display matrix here: it mixes channels and would tint a grey value.
+                            let v = sub(raw_average[idx.min(last)]) * scale_avg;
                             // No clamps: `as u8` saturates >255 -> 255 and negative -> sqrt = NaN -> 0 (black), the desired output.
-                            pixels[dst_idx] = lr.sqrt() as u8;
-                            pixels[dst_idx + 1] = lg.sqrt() as u8;
-                            pixels[dst_idx + 2] = lb.sqrt() as u8;
+                            let l = v.sqrt() as u8;
+                            pixels[dst_idx] = l;
+                            pixels[dst_idx + 1] = l;
+                            pixels[dst_idx + 2] = l;
                         }
                         RawMode::Difference | RawMode::Motion => {
                             let pixel_value = match current_mode {
