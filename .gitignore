@@ -23,5 +23,8 @@ local.properties
 # Local test assets - large 16-bit Rec.2020 reference TIFFs for P/Q demosaic tuning; not synced
 /Artwork/
 
+# Captured bias/dark calibration frames - large (~100MB each), device-specific; not synced
+/dark frames/
+
 # quad demosaic harness build output (source committed, build dir not)
 /rust/quad_harness/target/
