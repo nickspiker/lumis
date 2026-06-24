@@ -28,13 +28,19 @@ pub fn handle_touch(
         trace!("Touch event: action={:?}, pos=({:.1}, {:.1})", action, x, y);
     }
 
-    // After finalize the dark frame is shown; a tap dismisses it. (Returning all the way to the menu is
-    // a follow-up - the app has no runtime camera->menu teardown yet; for now dismiss clears the result
-    // view and falls through to the normal camera screen.)
+    // After finalize the dark frame is shown; a tap exits the app (same mechanism as the UI exit path:
+    // clear the result bit, stale the heartbeat so the camera process auto-nukes, then exit). Relaunching
+    // boots back to the camera-select menu - the app has no in-process camera->menu teardown, so a clean
+    // exit is the simplest correct "done" action here.
     if (ui.header[crate::shared_memory::FLAGS_IDX] & crate::shared_memory::CAL_SHOW_RESULT_BIT) != 0 {
         if let TouchAction::Down = action {
             ui.header[crate::shared_memory::FLAGS_IDX] &=
                 !crate::shared_memory::CAL_SHOW_RESULT_BIT;
+            ui.header[crate::shared_memory::FLAGS_IDX] &= !crate::shared_memory::CONTINUOUS_SAVE_BIT;
+            ui.header[crate::shared_memory::HEARTBEAT_SECS_IDX] -= 256;
+            unsafe {
+                libc::exit(0);
+            }
         }
         return true;
     }
