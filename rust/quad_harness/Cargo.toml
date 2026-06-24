@@ -1,0 +1,20 @@
+# Standalone host harness for tuning the quad-Bayer demosaic (P/Q diagonal discrimination).
+# It #[path]-includes the REAL rust/src/debayer/quad.rs (pure std, no Android deps) so it
+# always tests the shipping code - edit quad.rs and re-run. Kept out of the lumis_core crate
+# because that links ndk-sys (Android-only) and won't build on the host. Source is committed
+# (survives machine wipes); the target/ build dir is gitignored.
+[package]
+name = "quad_harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tiff = "0.7.2"
+png = "0.17.16"
+
+[[bin]]
+name = "quad_harness"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

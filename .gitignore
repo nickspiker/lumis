@@ -22,3 +22,6 @@ local.properties
 
 # Local test assets - large 16-bit Rec.2020 reference TIFFs for P/Q demosaic tuning; not synced
 /Artwork/
+
+# quad demosaic harness build output (source committed, build dir not)
+/rust/quad_harness/target/

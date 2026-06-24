@@ -2,7 +2,7 @@
 //!
 //! Algorithm (RCD adapted to quad-Bayer, all in the colour-DIFFERENCE domain for stability on saturated colours):
 //!   1. Each 2x2 same-colour cluster is a MEASURED low-pass anchor of its channel - exactly the LPF a standard-Bayer demosaic has to estimate. We get it for free.
-//!   2. Green is reconstructed at every pixel: measured greens kept full-res; in R/B clusters green is interpolated DIRECTIONALLY (H vs V chosen by the smaller cluster gradient = interpolate along edges) and added back as measured + (green_lpf - own_lpf).
+//!   2. Green is reconstructed at every pixel: measured greens kept full-res; in R/B clusters green is interpolated DIRECTIONALLY (H, V, or a diagonal P/Q built from the N/S/E/W green clusters, chosen by the smallest cluster gradient = interpolate along edges) and added back as measured + (green_lpf - own_lpf).
 //!   3. R and B reconstructed from the green-difference domain: colour = green + directional(colour_cluster - green_cluster_lpf).
 //!
 //! The 4x4 tile for an RGGB-base sensor (0=R 1=G 2=B), where each base colour expands to a 2x2 cluster:
@@ -115,6 +115,41 @@ pub fn quad_demosaic(
                 (0.0, f32::MAX, false)
             };
 
+            // Diagonal P/Q discrimination: a 45-degree edge has low H AND low V cross-gradient, so the
+            // H-vs-V choice above can't distinguish it and either direction smears across the edge.
+            // In quad-Bayer the (+-2,+-2) diagonal neighbours of an R/B pixel are the OPPOSITE colour
+            // (never green), so we cannot read a green directly on the diagonal. Instead we build the two
+            // diagonal corners from the green clusters that DO exist - the N/S/E/W neighbours at (+-2,0)/
+            // (0,+-2): the NW corner is bounded by the West and North greens, the SE corner by East and
+            // South, etc. P is the main diagonal (\, NW<->SE), Q the anti-diagonal (/, NE<->SW). The
+            // gradient measures variation ALONG the diagonal axis (small = smooth along that diagonal =
+            // edge runs that way), so a 45-degree edge interpolates along itself.
+            let w_ok = is_g(x - 2, y);
+            let e_ok = is_g(x + 2, y);
+            let n_ok = is_g(x, y - 2);
+            let s_ok = is_g(x, y + 2);
+            let gw = if w_ok { cmean(x - 2, y) } else { 0.0 };
+            let ge = if e_ok { cmean(x + 2, y) } else { 0.0 };
+            let gn = if n_ok { cmean(x, y - 2) } else { 0.0 };
+            let gs = if s_ok { cmean(x, y + 2) } else { 0.0 };
+            // P (\): NW corner = mean(W,N), SE corner = mean(E,S). Needs all four greens.
+            let (p_est, p_grad, p_ok) = if w_ok && n_ok && e_ok && s_ok {
+                let nw = 0.5 * (gw + gn);
+                let se = 0.5 * (ge + gs);
+                (0.5 * (nw + se), (nw - se).abs(), true)
+            } else {
+                (0.0, f32::MAX, false)
+            };
+            // Q (/): NE corner = mean(E,N), SW corner = mean(W,S).
+            let (q_est, q_grad, q_ok) = if w_ok && n_ok && e_ok && s_ok {
+                let ne = 0.5 * (ge + gn);
+                let sw = 0.5 * (gw + gs);
+                (0.5 * (ne + sw), (ne - sw).abs(), true)
+            } else {
+                (0.0, f32::MAX, false)
+            };
+
+            // Fallback if no direction is available: average whatever diagonal greens exist (the old behaviour).
             let mut diag_sum = 0.0;
             let mut diag_n = 0.0;
             for (nx, ny) in [
@@ -130,15 +165,30 @@ pub fn quad_demosaic(
             }
             let diag_est = if diag_n > 0.0 { diag_sum / diag_n } else { own };
 
-            let g_lpf = if h_ok && (h_grad <= v_grad) {
-                h_est
-            } else if v_ok {
-                v_est
-            } else if h_ok {
-                h_est
-            } else {
-                diag_est
-            };
+            // Pick the direction with the smallest gradient (interpolate along the edge, not across it).
+            // Candidates: H, V, P, Q - whichever are available. DIAG_BIAS multiplies the diagonal
+            // gradients to optionally penalise them (their corner estimates average two greens that are
+            // sqrt(2)x farther apart, a weaker locality cue). Swept on the Artwork references (QH_*
+            // harness): the score is nearly flat in BIAS and best at 1.0 (no penalty), since these scenes
+            // have few clean 45-degree edges. Kept as a constant so it can be re-tuned if that changes.
+            const DIAG_BIAS: f32 = 1.0;
+            let mut best_grad = f32::MAX;
+            let mut g_lpf = diag_est;
+            if h_ok && h_grad < best_grad {
+                best_grad = h_grad;
+                g_lpf = h_est;
+            }
+            if v_ok && v_grad < best_grad {
+                best_grad = v_grad;
+                g_lpf = v_est;
+            }
+            if p_ok && p_grad * DIAG_BIAS < best_grad {
+                best_grad = p_grad * DIAG_BIAS;
+                g_lpf = p_est;
+            }
+            if q_ok && q_grad * DIAG_BIAS < best_grad {
+                g_lpf = q_est;
+            }
 
             let est = g(x, y) + (g_lpf - own);
             // Rule 0: ALGORITHMIC floor - reconstructed green can't represent negative light, so floor to 0. Not a safety clamp; it prevents a physically impossible negative green value (from the green_lpf - own correction overshooting) leaking into the chroma-difference reconstruction in Step 2.
