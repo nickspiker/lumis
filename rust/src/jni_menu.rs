@@ -82,6 +82,9 @@ pub extern "C" fn Java_com_lumis_camera_UserInterface_nativeMenuHandleTouch<'loc
     // Prepare return values
     let mut needs_redraw = 0i32;
     let mut selected_camera = -1i32;
+    // Calibration intent for the selected camera: -1 = normal capture, 0 = bias (max ISO + shortest
+    // shutter), 1 = dark (max ISO + longest shutter). Kotlin reads this to open in calibration mode.
+    let mut cal_mode = -1i32;
 
     if needs_render {
         needs_redraw = 1;
@@ -96,16 +99,13 @@ pub extern "C" fn Java_com_lumis_camera_UserInterface_nativeMenuHandleTouch<'loc
                 selected_camera = camera_index as i32;
             }
             ui_main_menu::MenuAction::StartCalibration { index, dark } => {
-                // TODO(dark-frame cal, step 1 cont.): plumb the bias/dark intent to Kotlin so the
-                // camera opens in calibration mode (forced max ISO + shortest/longest shutter,
-                // no-reset accumulate of mean+variance). For now this opens the camera normally so
-                // the menu flow is verifiable on-device; the capture mode is wired in the next step.
                 info!(
                     "Menu action: Calibration requested on camera {} ({})",
                     index,
                     if dark { "dark / long shutter" } else { "bias / short shutter" }
                 );
                 selected_camera = index as i32;
+                cal_mode = if dark { 1 } else { 0 };
             }
             ui_main_menu::MenuAction::Exit => {
                 if crate::DEBUG {
@@ -118,10 +118,10 @@ pub extern "C" fn Java_com_lumis_camera_UserInterface_nativeMenuHandleTouch<'loc
         }
     }
 
-    // Return [needs_redraw, selected_camera] as int array
-    match _env.new_int_array(2) {
+    // Return [needs_redraw, selected_camera, cal_mode] as int array
+    match _env.new_int_array(3) {
         Ok(array) => {
-            let result_data = [needs_redraw, selected_camera];
+            let result_data = [needs_redraw, selected_camera, cal_mode];
             if let Err(e) = _env.set_int_array_region(&array, 0, &result_data) {
                 error!("Failed to set menu touch result: {}", e);
             }

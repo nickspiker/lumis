@@ -102,6 +102,31 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCameraGetSharedMem
     shared_memory_ptr as jlong
 }
 
+/// Engage dark-frame calibration capture on this integrator: sets CALIBRATING_BIT (and CAL_IS_DARK_BIT
+/// for a dark-current frame, clearing it for bias) so process_frame routes to the no-reset accumulate
+/// path that publishes mean/variance + convergence stats. The forced ISO/shutter were already seeded at
+/// init; the settings poll keeps pushing them to the HAL.
+#[no_mangle]
+pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeSetCalibrationMode(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    ptr: jlong,
+    dark: jboolean,
+) {
+    use crate::shared_memory::{CALIBRATING_BIT, CAL_IS_DARK_BIT, FLAGS_IDX};
+    let integrator = integrator_ptr(ptr);
+    integrator.header[FLAGS_IDX] |= CALIBRATING_BIT;
+    if dark != 0 {
+        integrator.header[FLAGS_IDX] |= CAL_IS_DARK_BIT;
+    } else {
+        integrator.header[FLAGS_IDX] &= !CAL_IS_DARK_BIT;
+    }
+    info!(
+        "Calibration mode engaged: {}",
+        if dark != 0 { "DARK" } else { "BIAS" }
+    );
+}
+
 #[no_mangle]
 pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCameraGetSharedMemoryFd(
     _env: JNIEnv<'_>,

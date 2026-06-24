@@ -55,6 +55,8 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
    // Menu state
    private var cameraArray: FloatArray? = null
    private var selectedCameraIndex: Int = -1
+   // Calibration capture intent for the camera being opened: -1 = normal, 0 = bias, 1 = dark.
+   private var calibrationMode: Int = -1
    
    // Surface properties
    private var surfaceWidth: Int = 0
@@ -548,17 +550,20 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
                    if (result.size >= 2) {
                        val needsRedraw = result[0] != 0
                        val cameraSelected = result[1]
-                       
+                       // Calibration intent: -1 = normal, 0 = bias, 1 = dark (result[2], absent on old contract).
+                       val calMode = if (result.size >= 3) result[2] else -1
+
                        // Only draw if button state changed
                        if (needsRedraw) {
                            drawFrame() // Redraw menu
                        }
-                       
+
                        if (cameraSelected >= 0) {
                            // Camera selected - freeze menu and open camera
                            selectedCameraIndex = cameraSelected
+                           calibrationMode = calMode
                            currentState = UIState.CAMERA_OPENING
-                           Log.i("UserInterface", "Camera $cameraSelected selected - opening camera")
+                           Log.i("UserInterface", "Camera $cameraSelected selected - opening camera (calMode=$calMode)")
                            openCamera(cameraSelected)
                        }
                    }
@@ -663,6 +668,9 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
        val msg = Message.obtain(null, CameraInterface.MSG_OPEN_CAMERA)
        msg.data = Bundle().apply {
            putInt("cameraIndex", cameraIndex)
+           // Calibration intent: -1 normal, 0 bias, 1 dark. CameraInterface forces max ISO +
+           // shortest/longest shutter and sets the calibration flags after the integrator inits.
+           putInt("calibrationMode", calibrationMode)
        }
        msg.replyTo = clientMessenger
        

@@ -47,6 +47,8 @@ class CameraInterface : Service() {
    
    // Active camera state tracking
    private var activeCameraIndex: Int = -1
+   // Calibration capture intent for the camera being opened: -1 = normal, 0 = bias, 1 = dark.
+   private var calibrationMode: Int = -1
    private var isCameraActive: Boolean = false
    private var isContinuousSaveActive: Boolean = false
    
@@ -66,7 +68,9 @@ class CameraInterface : Service() {
                
                MSG_OPEN_CAMERA -> {
                    val cameraIndex = msg.data.getInt("cameraIndex")
-                   
+                   // Calibration intent (-1 normal, 0 bias, 1 dark); applied at initIntegrator.
+                   calibrationMode = msg.data.getInt("calibrationMode", -1)
+
                    cameraProcessor.setReplyMessenger(msg.replyTo)
                    openCamera(cameraIndex)
                }
@@ -151,6 +155,11 @@ class CameraInterface : Service() {
        
        @JvmStatic
        external fun nativeGetCurrentSettings(contextPtr: Long): CameraSettings
+
+       // Engage dark-frame calibration capture: sets CALIBRATING_BIT (+ CAL_IS_DARK_BIT when dark) so
+       // the integrator accumulates mean+variance without per-exposure reset and publishes progress.
+       @JvmStatic
+       external fun nativeSetCalibrationMode(contextPtr: Long, dark: Boolean)
 
        @JvmStatic
        external fun nativeCameraGetSharedMemoryPtr(contextPtr: Long): Long
@@ -365,6 +374,19 @@ class CameraInterface : Service() {
    // Called by CameraProcessor once one-shot AE has settled, with the metered values.
    internal fun initIntegrator(aeIso: Int, aeShutterNs: Long) {
        val cameraInfo = activeCameraInfo ?: return
+       // Calibration capture overrides the metered AE seed with fixed extremes: max ISO always, and
+       // shortest shutter for a bias frame (read-noise floor, ~no dark current) or longest shutter for
+       // a dark-current frame. Normal capture uses the metered values.
+       val seedIso: Int
+       val seedShutterNs: Long
+       if (calibrationMode >= 0) {
+           seedIso = cameraInfo.maxIso
+           seedShutterNs = if (calibrationMode == 1) cameraInfo.maxExposure else cameraInfo.minExposure
+           Log.i("CameraInterface", "Calibration init: ${if (calibrationMode == 1) "DARK" else "BIAS"} - ISO=$seedIso shutter=${seedShutterNs}ns")
+       } else {
+           seedIso = aeIso
+           seedShutterNs = aeShutterNs
+       }
        nativeCameraContextPtr = nativeCameraInit(
            cameraInfo.widthPixels,
            cameraInfo.heightPixels,
@@ -378,10 +400,15 @@ class CameraInterface : Service() {
            cameraInfo.minExposure,
            cameraInfo.maxExposure,
            cameraInfo.minFocusDistance,
-           aeIso,
-           aeShutterNs
+           seedIso,
+           seedShutterNs
        )
        cameraProcessor.setNativeContext(nativeCameraContextPtr)
+       // Engage calibration mode in the integrator (sets CALIBRATING_BIT + CAL_IS_DARK_BIT) so it
+       // accumulates mean+variance without per-exposure reset and publishes progress stats.
+       if (calibrationMode >= 0) {
+           nativeSetCalibrationMode(nativeCameraContextPtr, calibrationMode == 1)
+       }
    }
    
    private fun getCameraInfo(cameraIndex: Int): CameraInfo? {
