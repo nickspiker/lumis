@@ -103,6 +103,34 @@ fn unpack_raw10(packed: &[u8], width: usize, height: usize, row_stride: usize) -
     out
 }
 
+/// Pearson correlation between two equal-length slices. Used for the dark-frame calibration's
+/// split-half convergence metric (even-frame averages vs odd-frame averages over the pixel sample):
+/// ~1.0 means the two independent halves agree, i.e. the fixed pattern has emerged from the noise.
+fn pearson(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len() as f64;
+    if n < 2.0 {
+        return 0.0;
+    }
+    let ma = a.iter().sum::<f64>() / n;
+    let mb = b.iter().sum::<f64>() / n;
+    let mut cov = 0.0;
+    let mut va = 0.0;
+    let mut vb = 0.0;
+    for k in 0..a.len() {
+        let da = a[k] - ma;
+        let db = b[k] - mb;
+        cov += da * db;
+        va += da * da;
+        vb += db * db;
+    }
+    let denom = (va * vb).sqrt();
+    if denom > 0.0 {
+        cov / denom
+    } else {
+        0.0
+    }
+}
+
 pub struct CameraIntegrator {
     shared_memory: SharedMemory, // Keep SharedMemory alive
     pub header: &'static mut [u64],
@@ -121,6 +149,22 @@ pub struct CameraIntegrator {
     last_frame_time: Instant,
     last_image_timestamp: SystemTime,
     last_saved_counter: u64,
+    // Dark-frame calibration state (only used while CALIBRATING_BIT is set). None until the first
+    // calibration frame arrives; reset when finalized so a later calibration starts fresh.
+    cal: Option<CalibrationState>,
+}
+
+// Accumulated state for a running dark-frame calibration capture. Mean and variance use the shared
+// IntegrationBuffer (accumulated / difference); this holds the extra state: the running frame count,
+// timers, and the SAMPLE-ONLY even/odd half-sums for the live split-half convergence correlation
+// (full even/odd frames would be ~400MB at 50MP, so we correlate a fixed random ~300k-pixel subset).
+struct CalibrationState {
+    frame_count: u64,
+    start_time: Instant,
+    last_snapshot: Instant,
+    sample_idx: Vec<usize>, // fixed random pixel indices used for the correlation sample
+    even_sum: Vec<u64>,     // per-sample sum over even-numbered frames
+    odd_sum: Vec<u64>,      // per-sample sum over odd-numbered frames
 }
 
 impl CameraIntegrator {
@@ -243,6 +287,7 @@ impl CameraIntegrator {
             last_frame_time: Instant::now(),
             last_image_timestamp: SystemTime::now(),
             last_saved_counter: u64::MAX,
+            cal: None,
         }
     }
 
@@ -318,6 +363,20 @@ impl CameraIntegrator {
             .unwrap();
         self.header[EXPOSURE_START_SECS_IDX] = start_time.as_secs();
         self.header[EXPOSURE_START_NANOS_IDX] = start_time.subsec_nanos() as u64;
+
+        // Dark-frame calibration: accumulate without the normal per-exposure reset/completion, write
+        // throttled progress stats, and finalize-to-disk on request. Handled entirely here so the
+        // verified normal exposure path below is never touched while calibrating.
+        if (self.header[FLAGS_IDX] & CALIBRATING_BIT) != 0 {
+            self.process_calibration_frame(frame_data);
+            // Return the header's current (forced) settings so Kotlin keeps pushing them to the HAL,
+            // same as the normal path's tail return.
+            return (
+                f64::from_bits(self.header[ISO_IDX]) as i32,
+                f64::from_bits(self.header[SHUTTER_NS_IDX]) as i64,
+                f64::from_bits(self.header[FOCUS_IDX]) as f32,
+            );
+        }
 
         if elapsed_ms >= self.exposure_time_ms || force_completion {
             // Exposure complete - write to SharedMemory
@@ -678,6 +737,150 @@ impl CameraIntegrator {
             current_shutter_ns as i64,
             current_focus as f32,
         )
+    }
+
+    /// One frame of a dark-frame calibration capture. Accumulates per-pixel mean (`accumulated`) and
+    /// frame-to-frame variability (`difference`) without the normal per-exposure reset, maintains a
+    /// sample-only even/odd half-sum for the live split-half convergence correlation, writes throttled
+    /// progress stats to shared memory (gated at ~1.5s so 16s darks snapshot every frame while fast bias
+    /// frames throttle), and finalizes to disk + stops when the UI sets CAL_FINALIZE_BIT.
+    fn process_calibration_frame(&mut self, frame_data: &[u8]) {
+        let pixel_count = self.width * self.height;
+
+        // First calibration frame: (re)initialise the accumulators and the fixed correlation sample.
+        if self.cal.is_none() {
+            for i in 0..pixel_count {
+                self.integration_buffer.accumulated[i] = 0;
+                self.integration_buffer.difference[i] = 0;
+                self.integration_buffer.prev_frame[i] = 0;
+            }
+            // Deterministic, evenly-spread sample of ~300k pixels (no RNG available in this env; a prime
+            // stride over the frame gives a well-distributed fixed subset that's stable across frames).
+            let target = 300_000usize.min(pixel_count);
+            let stride = (pixel_count / target).max(1);
+            let sample_idx: Vec<usize> = (0..pixel_count).step_by(stride).collect();
+            let n = sample_idx.len();
+            self.cal = Some(CalibrationState {
+                frame_count: 0,
+                start_time: Instant::now(),
+                last_snapshot: Instant::now() - std::time::Duration::from_secs(10), // force a snapshot on frame 1
+                sample_idx,
+                even_sum: vec![0u64; n],
+                odd_sum: vec![0u64; n],
+            });
+        }
+
+        // Accumulate this frame. Borrow split: read cal sample/index, write integration buffers.
+        let chunks = frame_data.chunks_exact(2);
+        let is_even = self.cal.as_ref().unwrap().frame_count % 2 == 0;
+        for (i, chunk) in chunks.enumerate() {
+            let pixel = u16::from_le_bytes([chunk[0], chunk[1]]);
+            self.integration_buffer.accumulated[i] += pixel as u32;
+            let diff = (pixel as i32 - self.integration_buffer.prev_frame[i] as i32).abs() as u32;
+            self.integration_buffer.difference[i] += diff;
+            self.integration_buffer.prev_frame[i] = pixel;
+        }
+        // Update the sample-only even/odd half-sums for the convergence correlation.
+        {
+            let cal = self.cal.as_mut().unwrap();
+            for (k, &idx) in cal.sample_idx.iter().enumerate() {
+                let chunk_off = idx * 2;
+                let pixel =
+                    u16::from_le_bytes([frame_data[chunk_off], frame_data[chunk_off + 1]]) as u64;
+                if is_even {
+                    cal.even_sum[k] += pixel;
+                } else {
+                    cal.odd_sum[k] += pixel;
+                }
+            }
+            cal.frame_count += 1;
+        }
+
+        // Throttled stats snapshot (~1.5s gate). For 16s darks every frame passes; fast bias throttles.
+        let do_snapshot = {
+            let cal = self.cal.as_ref().unwrap();
+            cal.last_snapshot.elapsed().as_millis() >= 1500
+        };
+        if do_snapshot {
+            self.write_calibration_stats();
+            self.cal.as_mut().unwrap().last_snapshot = Instant::now();
+        }
+
+        // Finalize on request: average + variance written to disk, then stop.
+        if (self.header[FLAGS_IDX] & CAL_FINALIZE_BIT) != 0 {
+            self.finalize_calibration();
+            self.header[FLAGS_IDX] &= !(CAL_FINALIZE_BIT | CALIBRATING_BIT);
+            self.cal = None;
+        }
+    }
+
+    /// Compute and publish the live calibration progress stats from the running accumulators.
+    fn write_calibration_stats(&mut self) {
+        let cal = self.cal.as_ref().unwrap();
+        let n = cal.frame_count.max(1);
+        // Even/odd half-sums -> per-sample averages, correlated to give split-half convergence.
+        // even frames count = ceil(n/2), odd = floor(n/2).
+        let even_n = ((cal.frame_count + 1) / 2).max(1) as f64;
+        let odd_n = (cal.frame_count / 2).max(1) as f64;
+        let m = cal.sample_idx.len();
+        let (mut a, mut b) = (Vec::with_capacity(m), Vec::with_capacity(m));
+        for k in 0..m {
+            a.push(cal.even_sum[k] as f64 / even_n);
+            b.push(cal.odd_sum[k] as f64 / odd_n);
+        }
+        let correlation = if cal.frame_count >= 2 { pearson(&a, &b) } else { 0.0 };
+
+        // Mean dark level and residual noise std from the full-res accumulators (sampled for speed).
+        let mut mean_sum = 0.0f64;
+        let mut var_sum = 0.0f64;
+        for &idx in &cal.sample_idx {
+            let mean = self.integration_buffer.accumulated[idx] as f64 / n as f64;
+            mean_sum += mean;
+            // `difference` accumulates |frame - prev|; per-frame mean abs difference approximates noise.
+            let noise = self.integration_buffer.difference[idx] as f64 / n as f64;
+            var_sum += noise * noise;
+        }
+        let mean = mean_sum / m as f64;
+        let noise = (var_sum / m as f64).sqrt();
+
+        self.header[CAL_FRAME_COUNT_IDX] = cal.frame_count;
+        self.header[CAL_ELAPSED_MS_IDX] = cal.start_time.elapsed().as_millis() as u64;
+        self.header[CAL_CORRELATION_IDX] = correlation.to_bits();
+        self.header[CAL_MEAN_IDX] = mean.to_bits();
+        self.header[CAL_NOISE_IDX] = noise.to_bits();
+    }
+
+    /// Write the finalized calibration (per-pixel mean + variance maps) to disk. For now writes raw
+    /// little-endian u16 .bin files to a fixed app-internal path so they can be pulled with ADB; the
+    /// VSF encoding and the Kotlin-provided files-dir path are wired in a later step.
+    fn finalize_calibration(&mut self) {
+        let cal = self.cal.as_ref().unwrap();
+        let n = cal.frame_count.max(1) as u32;
+        let pixel_count = self.width * self.height;
+        let is_dark = (self.header[FLAGS_IDX] & CAL_IS_DARK_BIT) != 0;
+        let kind = if is_dark { "dark" } else { "bias" };
+
+        // Mean map (per-pixel average) and variance map (per-pixel mean abs frame-to-frame diff), u16.
+        let mut mean_map = vec![0u8; pixel_count * 2];
+        let mut var_map = vec![0u8; pixel_count * 2];
+        for i in 0..pixel_count {
+            let mean = (self.integration_buffer.accumulated[i] / n).min(65535) as u16;
+            let var = (self.integration_buffer.difference[i] / n).min(65535) as u16;
+            mean_map[i * 2..i * 2 + 2].copy_from_slice(&mean.to_le_bytes());
+            var_map[i * 2..i * 2 + 2].copy_from_slice(&var.to_le_bytes());
+        }
+        let dir = "/data/data/com.lumis.camera/files";
+        let _ = std::fs::create_dir_all(dir);
+        let mean_path = format!("{dir}/cal_{kind}_mean_{}x{}.bin", self.width, self.height);
+        let var_path = format!("{dir}/cal_{kind}_var_{}x{}.bin", self.width, self.height);
+        let r1 = std::fs::write(&mean_path, &mean_map);
+        let r2 = std::fs::write(&var_path, &var_map);
+        if crate::DEBUG {
+            log::info!(
+                "Calibration finalized: {} frames, {} -> {} ({:?}), {} ({:?})",
+                cal.frame_count, kind, mean_path, r1.is_ok(), var_path, r2.is_ok()
+            );
+        }
     }
 
     /// Read the current manual settings (ISO, shutter ns, focus) straight from shared memory without processing a frame. Lets Kotlin poll and push setting changes to the HAL at a fixed fast rate instead of only once per delivered frame - critical for long exposures, where frames arrive seconds apart and a frame-coupled update made dial changes take several frames to reach the capture request.
