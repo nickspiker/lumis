@@ -95,6 +95,18 @@ pub extern "C" fn Java_com_lumis_camera_UserInterface_nativeMenuHandleTouch<'loc
                 }
                 selected_camera = camera_index as i32;
             }
+            ui_main_menu::MenuAction::StartCalibration { index, dark } => {
+                // TODO(dark-frame cal, step 1 cont.): plumb the bias/dark intent to Kotlin so the
+                // camera opens in calibration mode (forced max ISO + shortest/longest shutter,
+                // no-reset accumulate of mean+variance). For now this opens the camera normally so
+                // the menu flow is verifiable on-device; the capture mode is wired in the next step.
+                info!(
+                    "Menu action: Calibration requested on camera {} ({})",
+                    index,
+                    if dark { "dark / long shutter" } else { "bias / short shutter" }
+                );
+                selected_camera = index as i32;
+            }
             ui_main_menu::MenuAction::Exit => {
                 if crate::DEBUG {
                     info!("Menu action: Exit requested");

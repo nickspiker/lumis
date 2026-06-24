@@ -5,6 +5,10 @@ use ndk_sys::{ANativeWindow_Buffer, ANativeWindow_lock, ANativeWindow_unlockAndP
 #[derive(Clone, Debug)]
 pub enum MenuAction {
     StartCamera(usize),
+    // Start a dark-frame calibration capture on this camera index. `dark` selects which frame: true =
+    // dark-current (max ISO + longest shutter), false = bias (max ISO + shortest shutter). The capture
+    // accumulates mean + per-pixel variance over many frames until the user stops it.
+    StartCalibration { index: usize, dark: bool },
     Exit,
 }
 
@@ -12,14 +16,21 @@ pub enum MenuAction {
 enum Button {
     Empty,
     Camera { index: usize, info: CameraInfo },
+    // "Calibrate" entry on a lens's mode sub-screen -> opens the bias/dark shutter picker for that lens.
+    Calibrate { index: usize },
+    // The two shutter choices on the calibration picker. `dark` true = dark-current (longest shutter),
+    // false = bias (shortest shutter). `index` is the highest-res mode of the lens (calibration is always
+    // captured at full resolution; lower-res/crop modes derive from it by binning/cropping).
+    CalibrateChoice { index: usize, dark: bool },
     Back,
     Exit,
 }
 
 #[derive(Clone, PartialEq)]
 enum Screen {
-    Main,       // one row per lens (group heads)
-    Modes(i32), // the capture modes of one lens (group_id)
+    Main,            // one row per lens (group heads)
+    Modes(i32),      // the capture modes of one lens (group_id)
+    CalShutter(i32), // bias-vs-dark shutter picker for calibrating one lens (group_id)
 }
 pub struct MainMenu {
     width: u32,
@@ -105,6 +116,29 @@ impl MainMenu {
         const NUM_SLOTS: usize = 10;
         self.button_height = (self.height as f32 - self.y_margin * 2.) / NUM_SLOTS as f32;
 
+        // The CalShutter screen is a fixed two-choice picker, not a camera list - build it directly.
+        if let Screen::CalShutter(g) = self.screen {
+            // Calibration is captured at the lens's highest-res (group head) mode.
+            let head_index = self
+                .all_cameras
+                .iter()
+                .filter(|c| c.group_id == g)
+                .map(|c| c.index)
+                .min()
+                .unwrap_or(0);
+            // Two choices + Back + Exit = 4 slots; pad the rest empty so they sit at the bottom.
+            let used = 4;
+            for _ in 0..(NUM_SLOTS - used) {
+                self.buttons.push(Button::Empty);
+            }
+            self.buttons.push(Button::Back);
+            self.buttons.push(Button::CalibrateChoice { index: head_index, dark: true }); // dark-current (longest shutter)
+            self.buttons.push(Button::CalibrateChoice { index: head_index, dark: false }); // bias (shortest shutter)
+            self.buttons.push(Button::Exit);
+            self.render_buttons_to_buffers();
+            return;
+        }
+
         // Pick the rows to show for this screen, each as (camera index, info).
         let rows: Vec<(usize, CameraInfo)> = match self.screen {
             Screen::Main => self
@@ -120,11 +154,14 @@ impl MainMenu {
                 .filter(|c| c.group_id == g)
                 .map(|c| (c.index, c.clone()))
                 .collect(),
+            Screen::CalShutter(_) => unreachable!(), // handled above
         };
 
-        // A "Back" row occupies a slot on the sub-screen.
-        let has_back = matches!(self.screen, Screen::Modes(_));
-        let reserved = if has_back { 2 } else { 1 }; // Back (top of list) + Exit
+        // The Modes sub-screen gets a "Calibrate" entry below the modes; both sub-screens get a Back row.
+        let on_modes = matches!(self.screen, Screen::Modes(_));
+        let has_back = on_modes;
+        // reserved slots: Back (top) + Exit (bottom) + a Calibrate row on the Modes screen.
+        let reserved = 1 + has_back as usize + on_modes as usize;
         let max_rows = NUM_SLOTS - reserved;
         let rows_to_show = rows.len().min(max_rows);
         let empty_slots = NUM_SLOTS - reserved - rows_to_show;
@@ -135,8 +172,20 @@ impl MainMenu {
         if has_back {
             self.buttons.push(Button::Back);
         }
+        let modes_group = if let Screen::Modes(g) = self.screen { Some(g) } else { None };
         for (index, info) in rows.into_iter().take(rows_to_show) {
             self.buttons.push(Button::Camera { index, info });
+        }
+        // Calibrate row sits just below the mode list on the Modes screen.
+        if let Some(g) = modes_group {
+            let head_index = self
+                .all_cameras
+                .iter()
+                .filter(|c| c.group_id == g)
+                .map(|c| c.index)
+                .min()
+                .unwrap_or(0);
+            self.buttons.push(Button::Calibrate { index: head_index });
         }
         self.buttons.push(Button::Exit);
         self.render_buttons_to_buffers();
@@ -185,6 +234,14 @@ impl MainMenu {
             }
             Button::Back => {
                 self.draw_back_button(y, pressed);
+            }
+            Button::Calibrate { .. } => {
+                self.draw_label_button(y, pressed, "CALIBRATE");
+            }
+            Button::CalibrateChoice { dark, .. } => {
+                // DARK = max ISO + longest shutter (dark current); BIAS = max ISO + shortest shutter
+                // (read-noise floor). Labels kept short so they centre cleanly within the button.
+                self.draw_label_button(y, pressed, if *dark { "DARK" } else { "BIAS" });
             }
             Button::Exit => {
                 self.draw_exit_button(y, pressed);
@@ -1493,6 +1550,13 @@ impl MainMenu {
 
     // "Back" button for the mode sub-screen. Same rounded shape as Exit but tinted teal/blue (channels swapped) with a "< BACK" label.
     fn draw_back_button(&mut self, y: f32, pressed: bool) {
+        self.draw_label_button(y, pressed, "< BACK");
+    }
+
+    // A teal text button (same look as Back) with an arbitrary centred label. Used for Back and the
+    // calibration entries (Calibrate / bias / dark), which are simple labelled actions rather than
+    // camera rows.
+    fn draw_label_button(&mut self, y: f32, pressed: bool, label: &str) {
         let pixels = if pressed {
             &mut self.pressed_buffer
         } else {
@@ -1578,7 +1642,7 @@ impl MainMenu {
             pixels,
             self.width,
             self.height,
-            "< BACK",
+            label,
             self.width as f32 / 2.,
             y + self.button_height / 2.,
             self.button_height * 0.5,
@@ -1767,8 +1831,27 @@ impl MainMenu {
                                     }
                                 }
                                 Button::Back => {
-                                    navigate = Some(Screen::Main);
+                                    // From the calibration shutter picker, Back returns to that lens's
+                                    // mode screen; from a mode screen, Back returns to Main.
+                                    navigate = Some(match self.screen {
+                                        Screen::CalShutter(g) => Screen::Modes(g),
+                                        _ => Screen::Main,
+                                    });
                                     None
+                                }
+                                Button::Calibrate { index } => {
+                                    // Open the bias/dark shutter picker for this lens (calibration is
+                                    // always at the lens's highest-res mode, so key by its group).
+                                    let g = self
+                                        .all_cameras
+                                        .get(*index)
+                                        .map(|c| c.group_id)
+                                        .unwrap_or(-1);
+                                    navigate = Some(Screen::CalShutter(g));
+                                    None
+                                }
+                                Button::CalibrateChoice { index, dark } => {
+                                    Some(MenuAction::StartCalibration { index: *index, dark: *dark })
                                 }
                                 Button::Exit => Some(MenuAction::Exit),
                                 Button::Empty => None,
