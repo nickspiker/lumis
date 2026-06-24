@@ -229,6 +229,38 @@ fn draw_camera_or_histogram(
         }
     } else {
         let pixel_count = ui.sensor_x_size * ui.sensor_y_size;
+        // Quad-Bayer (Tetracell) mode: the CFA is a 4x4 tile of four 2x2 same-colour clusters, so a 2x2 block is a single colour and naive debayer renders grey. When set, both preview paths resolve colour from the 4x4 quad tile instead. Matches ui.rs's `is_quad` usage.
+        let is_quad = ui.header[crate::shared_memory::QUAD_BAYER_IDX] != 0;
+        // Quad tile -> (R cluster, G cluster, B cluster) top-left offsets within the 4x4 tile. base_2x2 gives the per-cluster colour (0=R,1=G,2=B) in (cluster_row, cluster_col) order; cluster k sits at offset ((k&1)*2, (k>>1)*2) = (col,row). We pick one representative cluster per channel (R, the first G, B); a single representative pixel per cluster is sampled below for speed (full averaging is unnecessary for the live preview).
+        let base_2x2 = |bayer_pattern: u32| -> [usize; 4] {
+            match bayer_pattern {
+                0 => [0, 1, 1, 2], // RGGB
+                1 => [1, 0, 2, 1], // GRBG
+                2 => [1, 2, 0, 1], // GBRG
+                3 => [2, 1, 1, 0], // BGGR
+                _ => [0, 1, 1, 2],
+            }
+        };
+        // For the active pattern, return the (dx,dy) cluster offsets within the 4x4 tile for the R, G and B channels. cluster index k -> offset (col=(k&1)*2, row=(k>>1)*2). First matching G cluster wins.
+        let quad_offsets = |bayer_pattern: u32| -> [(usize, usize); 3] {
+            let base = base_2x2(bayer_pattern);
+            let mut offs = [(0usize, 0usize); 3]; // [R, G, B]
+            let mut have_g = false;
+            for k in 0..4 {
+                let off = ((k & 1) * 2, (k >> 1) * 2);
+                match base[k] {
+                    0 => offs[0] = off,
+                    2 => offs[2] = off,
+                    _ => {
+                        if !have_g {
+                            offs[1] = off;
+                            have_g = true;
+                        }
+                    }
+                }
+            }
+            offs
+        };
 
         // While calibration holds the feed, render from the snapshot taken at freeze time (avg at 0, diff at pixel_count) so the camera thread can't change it. Otherwise read the current live slot.
         let frozen = ui.frozen_image_counter.is_some() && ui.frozen_image.len() >= 2 * pixel_count;
@@ -320,11 +352,7 @@ fn draw_camera_or_histogram(
                     let idx = sensor_y * ui.sensor_x_size + sensor_x;
                     match current_mode {
                         RawMode::Average => {
-                            // 2x2-block colour debayer at (sensor_x, sensor_y), same scheme as the fit-to-screen preview and the save fallback.
-                            let bx = sensor_x & !1;
-                            let by = sensor_y & !1;
                             let last = ui.sensor_x_size * ui.sensor_y_size - 1;
-                            let base = (by * ui.sensor_x_size + bx).min(last);
                             // Black-level subtract, mirroring the fit-to-screen path EXACTLY so both clip indicators match: controls visible -> white-clip zeros over-threshold channels (-> dark/false colour) AND black-clip uses a WRAPPING sub so a pixel below black_level underflows to a huge u16 -> renders WHITE (the crushed-shadow indicator). Controls hidden -> saturating sub (no overlay).
                             let bk = ui.raw_black_level;
                             let sub = |v: u16| -> f32 {
@@ -338,17 +366,38 @@ fn draw_camera_or_histogram(
                                     v.saturating_sub(bk) as f32
                                 }
                             };
-                            let tl = sub(raw_average[base]);
-                            let tr = sub(raw_average[(base + 1).min(last)]);
-                            let bl = sub(raw_average[(base + ui.sensor_x_size).min(last)]);
-                            let br = sub(raw_average[(base + ui.sensor_x_size + 1).min(last)]);
-                            let local = (sensor_x - bx) + (sensor_y - by);
-                            let (r, g, b) = match ui.bayer_pattern {
-                                0 => (tl, if local < 2 { tr } else { bl }, br), // RGGB
-                                1 => (tr, if local < 2 { tl } else { br }, bl), // GRBG
-                                2 => (bl, if local < 2 { tl } else { br }, tr), // GBRG
-                                3 => (br, if local < 2 { tr } else { bl }, tl), // BGGR
-                                _ => (tl, if local < 2 { tr } else { bl }, br),
+                            let (r, g, b) = if is_quad {
+                                // Quad-Bayer: a 2x2 block is one colour, so resolve from the 4x4 tile. Sample one representative pixel (the cluster top-left) of the R, G and B clusters; full per-cluster averaging is not needed for the live preview.
+                                let tx = sensor_x & !3;
+                                let ty = sensor_y & !3;
+                                let [(rdx, rdy), (gdx, gdy), (bdx, bdy)] =
+                                    quad_offsets(ui.bayer_pattern);
+                                // .min(last): every computed index feeds raw_average[..]; clamping to the last valid element prevents an out-of-bounds index (panic / UB) when the tile origin lands at the sensor's right/bottom edge.
+                                let ridx = ((ty + rdy) * ui.sensor_x_size + tx + rdx).min(last);
+                                let gidx = ((ty + gdy) * ui.sensor_x_size + tx + gdx).min(last);
+                                let bidx = ((ty + bdy) * ui.sensor_x_size + tx + bdx).min(last);
+                                (
+                                    sub(raw_average[ridx]),
+                                    sub(raw_average[gidx]),
+                                    sub(raw_average[bidx]),
+                                )
+                            } else {
+                                // 2x2-block colour debayer at (sensor_x, sensor_y), same scheme as the fit-to-screen preview and the save fallback.
+                                let bx = sensor_x & !1;
+                                let by = sensor_y & !1;
+                                let base = (by * ui.sensor_x_size + bx).min(last);
+                                let tl = sub(raw_average[base]);
+                                let tr = sub(raw_average[(base + 1).min(last)]);
+                                let bl = sub(raw_average[(base + ui.sensor_x_size).min(last)]);
+                                let br = sub(raw_average[(base + ui.sensor_x_size + 1).min(last)]);
+                                let local = (sensor_x - bx) + (sensor_y - by);
+                                match ui.bayer_pattern {
+                                    0 => (tl, if local < 2 { tr } else { bl }, br), // RGGB
+                                    1 => (tr, if local < 2 { tl } else { br }, bl), // GRBG
+                                    2 => (bl, if local < 2 { tl } else { br }, tr), // GBRG
+                                    3 => (br, if local < 2 { tr } else { bl }, tl), // BGGR
+                                    _ => (tl, if local < 2 { tr } else { bl }, br),
+                                }
                             };
                             // Black already subtracted above; just apply gain + matrix.
                             let r = r * scale_avg;
@@ -389,9 +438,13 @@ fn draw_camera_or_histogram(
                 }
             }
         } else {
-            // In-place calibration overlay (live_overlay): held until tap, composited per sensor pixel below. (min_x, min_y, ov_w, ov_h are full-res sensor coords at 2x scale; rgba_f32 linear 0..1.)
+            // In-place calibration overlay (live_overlay): held until tap, composited per sensor pixel below. (min_x, min_y, ov_w, ov_h are in chameleon's tstats space = 2x the scan-input frame; see the composite site for the full-res mapping. rgba_f32 in display-linear / terminal space, white=65535.)
             let cal_hold = ui.calibration_hold.load();
             let cal_overlay = cal_hold.as_ref().as_ref();
+            // TEMPORARY calibration-overlay coordinate trace: confirms the actual overlay dimensions vs the full-res sensor so the per-pixel cal_factor (1 for quad, 2 for standard) can be verified on-device. Logged once per draw only while an overlay is held. Remove once the live overlay scale is confirmed correct.
+            if let Some((min_x, min_y, ov_w, ov_h, overlay)) = cal_overlay {
+                log::info!("cal_overlay trace: is_quad={} min_x={} min_y={} ov_w={} ov_h={} overlay_len={} sensor={}x{}", is_quad, min_x, min_y, ov_w, ov_h, overlay.len(), ui.sensor_x_size, ui.sensor_y_size);
+            }
 
             // Normal fit-to-screen view with debayering
             // Calculate scale to fit rotated sensor (if needed) in display while maintaining aspect ratio
@@ -604,6 +657,37 @@ fn draw_camera_or_histogram(
                         _ => panic!("Unknown bayer pattern!"),
                     };
 
+                    // Quad-Bayer override: the 2x2 (tl,tr,bl,br) above is a single-colour cluster, so the standard pick produces grey. In Average mode resolve colour from the 4x4 tile instead by sampling one representative pixel of the R, G and B clusters and applying the SAME clip/black-subtract semantics as the 2x2 path. Diff/Motion stay monochrome, so leave them on the 2x2 pick.
+                    let (r, g, b) = if is_quad && current_mode == RawMode::Average {
+                        let last = ui.sensor_x_size * ui.sensor_y_size - 1;
+                        let tx = sensor_x & !3;
+                        let ty = sensor_y & !3;
+                        let [(rdx, rdy), (gdx, gdy), (bdx, bdy)] = quad_offsets(ui.bayer_pattern);
+                        // .min(last): these indices feed raw_average[..]; clamping to the last valid element prevents an out-of-bounds index (panic / UB) when the tile origin lands at the sensor's right/bottom edge.
+                        let ridx = ((ty + rdy) * ui.sensor_x_size + tx + rdx).min(last);
+                        let gidx = ((ty + gdy) * ui.sensor_x_size + tx + gdx).min(last);
+                        let bidx = ((ty + bdy) * ui.sensor_x_size + tx + bdx).min(last);
+                        // Same black-subtract / clip indicator as the Average arm above: controls visible -> white-clip zeros over-threshold samples AND black-clip via WRAPPING sub (crushed shadows render WHITE); controls hidden -> saturating sub.
+                        let sub = |v: u16| -> u16 {
+                            if ui.controls_visible {
+                                if v > ui_constants::CLIPPING_THRESHOLD {
+                                    0
+                                } else {
+                                    v.wrapping_sub(ui.raw_black_level)
+                                }
+                            } else {
+                                v.saturating_sub(ui.raw_black_level)
+                            }
+                        };
+                        (
+                            sub(raw_average[ridx]),
+                            sub(raw_average[gidx]),
+                            sub(raw_average[bidx]),
+                        )
+                    } else {
+                        (r, g, b)
+                    };
+
                     // Apply display scaling based on mode
                     let scale = match current_mode {
                         RawMode::Average => {
@@ -613,34 +697,33 @@ fn draw_camera_or_histogram(
                     };
 
                     // Linear scale, then apply the camera->Rec.2020 display matrix in LINEAR space (mixes channels), then sqrt-encode for the BT.2020 surface. Average mode is colour (debayered) so colour-correct; diff/motion are monochrome magnitudes - leave them unmixed.
-                    let (mut lr, mut lg, mut lb) =
-                        (r as f32 * scale, g as f32 * scale, b as f32 * scale);
+                    let (lr, lg, lb) = (r as f32 * scale, g as f32 * scale, b as f32 * scale);
 
-                    // Composite the in-place calibration overlay in linear space, before the display matrix. Overlay coords are in raw sensor frame (1x); map this pixel's sensor coord directly into it.
+                    let (mut lr, mut lg, mut lb) = if current_mode == RawMode::Average {
+                        apply_display_matrix(ui, lr, lg, lb)
+                    } else {
+                        (lr, lg, lb)
+                    };
+
+                    // Composite the in-place calibration overlay AFTER the display matrix, in display-linear space. Chameleon now builds the overlay already in terminal (camera->Rec.2020) space normalized so white=65535, exactly like the calibration-button thumbnail, so the existing sqrt() encode below produces matching colour - we must NOT run it through apply_display_matrix again (that double-transformed it and was the wrong-colour bug). Overlay coordinates are in chameleon's tstats space, which is 2x the scan-input frame (image_processing::transform doubles width/minw/matrix). The scan-input frame is the full sensor for standard Bayer but the half-res binned frame for quad-Bayer (ui.rs bins by 2 before scan_target). So overlay-coord = 2x(scan-input) = 2x(sensor) for standard, and 2x(sensor/2)=1x(sensor) for quad. cal_factor maps a full-res sensor coord into the overlay accordingly: 2 for standard, 1 for quad.
                     if let Some((min_x, min_y, ov_w, ov_h, overlay)) = cal_overlay {
-                        let ox = sensor_x;
-                        let oy = sensor_y;
+                        let cal_factor = if is_quad { 1 } else { 2 };
+                        let ox = sensor_x * cal_factor;
+                        let oy = sensor_y * cal_factor;
                         if ox >= *min_x && ox < min_x + ov_w && oy >= *min_y && oy < min_y + ov_h {
                             let ov_idx = ((oy - min_y) * ov_w + (ox - min_x)) * 4;
                             if ov_idx + 3 < overlay.len() {
                                 let alpha = overlay[ov_idx + 3];
                                 if alpha > 0.0 {
-                                    // Overlay 0..1 linear -> lumis linear units (white * scale).
-                                    let k = 65535.0 * scale;
+                                    // Overlay is already in display-linear units (white=65535); blend straight into the post-matrix linear value, no extra scale.
                                     let ia = 1.0 - alpha;
-                                    lr = overlay[ov_idx] * k * alpha + lr * ia;
-                                    lg = overlay[ov_idx + 1] * k * alpha + lg * ia;
-                                    lb = overlay[ov_idx + 2] * k * alpha + lb * ia;
+                                    lr = overlay[ov_idx] * alpha + lr * ia;
+                                    lg = overlay[ov_idx + 1] * alpha + lg * ia;
+                                    lb = overlay[ov_idx + 2] * alpha + lb * ia;
                                 }
                             }
                         }
                     }
-
-                    let (lr, lg, lb) = if current_mode == RawMode::Average {
-                        apply_display_matrix(ui, lr, lg, lb)
-                    } else {
-                        (lr, lg, lb)
-                    };
                     pixels[dst_idx] = (lr.max(0.).sqrt()) as u8;
                     pixels[dst_idx + 1] = (lg.max(0.).sqrt()) as u8;
                     pixels[dst_idx + 2] = (lb.max(0.).sqrt()) as u8;
@@ -719,55 +802,99 @@ fn draw_progress(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWind
         ui.device_rotation as u16,
     );
 
-    // Draw green progress bar on exposure time slider
+    // Draw the progress bar on the exposure-time slider: rounded end caps plus a red->yellow->green colour sweep along its length (fresh exposure reads red at the leading edge, near-complete reads green).
     if ui.slider_thickness > 0.0 && total_ms > 0 {
-        // Calculate progress based on timescale, not actual exposure duration
+        // Calculate progress based on timescale, not actual exposure duration.
         let timescale_ms = ui.time_base.duration_ms();
         let progress = (elapsed as f64 / timescale_ms).sqrt().min(1.0) as f32;
 
-        // Determine if slider is horizontal or vertical
         let is_vertical = (ui.slider_start_x - ui.slider_end_x).abs() < 1.0;
+        let radius = ui.slider_thickness; // cap radius == bar half-thickness => fully rounded semicircular caps
+
+        // Red->yellow->green sweep for fill fraction f in [0,1]: red fades out over the first half, green fades in over the first half, giving yellow at the midpoint and solid green by the end. f is in [0,1] by construction so *255 lands in range; the .min(1.0).max(0.0) guards float drift at the endpoints before the saturating `as u8` cast (value shaping for the colour ramp, not memory safety).
+        let ryg = |f: f32| -> (u8, u8, u8) {
+            let r = (((1.0 - f) * 2.0).min(1.0).max(0.0) * 255.0) as u8;
+            let g = ((f * 2.0).min(1.0).max(0.0) * 255.0) as u8;
+            (r, g, 0)
+        };
 
         if is_vertical {
-            // Vertical slider - interpolate Y coordinates
             let progress_y = ui.slider_start_y + (ui.slider_end_y - ui.slider_start_y) * progress;
-            let thickness = ui.slider_thickness as i32;
-
-            let start_y = ui.slider_start_y as usize;
-            let end_y = progress_y as usize;
-            let center_x = ui.slider_start_x as i32;
-
-            for y in start_y.min(end_y)..=start_y.max(end_y) {
-                for dx in -thickness..=thickness {
-                    let x = center_x + dx;
+            let center_x = ui.slider_start_x;
+            let y0 = ui.slider_start_y.min(progress_y);
+            let y1 = ui.slider_start_y.max(progress_y);
+            // .max(1.0): the body span is a divisor for the colour fraction; a zero-length bar (no progress yet) would divide by zero, so floor at one pixel.
+            let span = (y1 - y0).max(1.0);
+            // Clamp the scanned row range into the buffer: y0-radius can go negative (top cap) and y1+radius past the bottom; these are memory-safety bounds on the row index.
+            let yi0 = (y0 - radius).max(0.0) as usize;
+            let yi1 = ((y1 + radius) as usize).min(buffer.height as usize - 1);
+            for y in yi0..=yi1 {
+                let yc = y as f32;
+                // Rounded caps: past the straight body (rows below y0 or above y1) the drawn half-width follows a circle of `radius` about the nearer end, so the bar terminates in semicircles rather than square edges. dist is how far past the body this row sits.
+                let dist = if yc < y0 {
+                    y0 - yc
+                } else if yc > y1 {
+                    yc - y1
+                } else {
+                    0.0
+                };
+                if dist > radius {
+                    continue;
+                }
+                // Half-width at this row: full thickness in the body, narrowing to 0 at the cap tip via sqrt(r^2 - dist^2). .max(0.0) guards a tiny negative from float error before sqrt (NaN guard, not value shaping).
+                let half_w = (radius * radius - dist * dist).max(0.0).sqrt();
+                // Colour fraction along the body; caps inherit their nearer end's colour via the clamp. Flip when the bar grows upward so red still leads.
+                let f = ((yc - y0) / span).clamp(0.0, 1.0);
+                let (cr, cg, cb) = ryg(if ui.slider_start_y <= progress_y { f } else { 1.0 - f });
+                let hw = half_w as i32;
+                for dx in -hw..=hw {
+                    let x = center_x as i32 + dx;
                     if x >= 0 && (x as usize) < buffer.stride as usize {
                         let idx = (y * buffer.stride as usize + x as usize) * 3;
                         if idx + 2 < pixels.len() {
-                            pixels[idx] = 0; // R
-                            pixels[idx + 1] = 255; // G
-                            pixels[idx + 2] = 0; // B
+                            pixels[idx] = cr;
+                            pixels[idx + 1] = cg;
+                            pixels[idx + 2] = cb;
                         }
                     }
                 }
             }
         } else {
-            // Horizontal slider - interpolate X coordinates
             let progress_x = ui.slider_start_x + (ui.slider_end_x - ui.slider_start_x) * progress;
-            let thickness = ui.slider_thickness as i32;
-
-            let start_x = ui.slider_start_x as usize;
-            let end_x = progress_x as usize;
-            let center_y = ui.slider_start_y as i32;
-
-            for x in start_x.min(end_x)..=start_x.max(end_x) {
-                for dy in -thickness..=thickness {
-                    let y = center_y + dy;
+            let center_y = ui.slider_start_y;
+            let x0 = ui.slider_start_x.min(progress_x);
+            let x1 = ui.slider_start_x.max(progress_x);
+            // .max(1.0): see the vertical branch - avoids divide-by-zero on a zero-length bar.
+            let span = (x1 - x0).max(1.0);
+            // Memory-safety bounds on the scanned column range (caps can extend past either end of the buffer).
+            let xi0 = (x0 - radius).max(0.0) as usize;
+            let xi1 = ((x1 + radius) as usize).min(buffer.stride as usize - 1);
+            for x in xi0..=xi1 {
+                let xc = x as f32;
+                // Rounded caps: the drawn half-height narrows to 0 over `radius` past each body end (semicircular caps).
+                let dist = if xc < x0 {
+                    x0 - xc
+                } else if xc > x1 {
+                    xc - x1
+                } else {
+                    0.0
+                };
+                if dist > radius {
+                    continue;
+                }
+                // .max(0.0) before sqrt: float-error NaN guard, not value shaping.
+                let half_h = (radius * radius - dist * dist).max(0.0).sqrt();
+                let f = ((xc - x0) / span).clamp(0.0, 1.0);
+                let (cr, cg, cb) = ryg(if ui.slider_start_x <= progress_x { f } else { 1.0 - f });
+                let hh = half_h as i32;
+                for dy in -hh..=hh {
+                    let y = center_y as i32 + dy;
                     if y >= 0 && (y as usize) < buffer.height as usize {
                         let idx = (y as usize * buffer.stride as usize + x) * 3;
                         if idx + 2 < pixels.len() {
-                            pixels[idx] = 0; // R
-                            pixels[idx + 1] = 255; // G
-                            pixels[idx + 2] = 0; // B
+                            pixels[idx] = cr;
+                            pixels[idx + 1] = cg;
+                            pixels[idx + 2] = cb;
                         }
                     }
                 }

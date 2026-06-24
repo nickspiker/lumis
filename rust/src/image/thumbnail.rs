@@ -8,7 +8,7 @@
 
 use std::io::Cursor;
 
-/// Build an embedded-preview JPEG from a raw Bayer/quad-Bayer frame. `target` is the max thumbnail dimension (longest side). `quad` selects 4x4 quad-Bayer binning vs standard 2x2. `matrix` is the camera->Rec.2020 3x3 (row-major). Returns JPEG bytes, or None on encode failure.
+/// Build an embedded-preview JPEG from a raw Bayer/quad-Bayer frame. `target` is the max thumbnail dimension (longest side). `quad` selects 4x4 quad-Bayer binning vs standard 2x2. `matrix` is the camera->Rec.2020 3x3 (row-major). Returns (JPEG bytes, width, height), or None on encode failure.
 pub fn build_preview_jpeg(
     raw: &[u16],
     width: usize,
@@ -18,7 +18,7 @@ pub fn build_preview_jpeg(
     quad: bool,
     matrix: &[f32; 9],
     target: usize,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, u32, u32)> {
     // --- 1. Bin to half-res linear RGB (no demosaic) ---
     // Quad: one RGB pixel per 4x4 tile (R/B = one cluster, G = mean of the two G clusters).
     // Standard Bayer: one RGB pixel per 2x2 cell.
@@ -66,7 +66,7 @@ pub fn build_preview_jpeg(
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
     enc.encode(&rgb8, tw as u32, th as u32, image::ColorType::Rgb8)
         .ok()?;
-    Some(out.into_inner())
+    Some((out.into_inner(), tw as u32, th as u32))
 }
 
 /// Quad-Bayer -> half(quarter)-res linear RGB. One RGB pixel per 4x4 tile: each 2x2 cluster sums to its channel; the two green clusters are averaged. Black-subtracted, no gain (auto-white handles exposure later).

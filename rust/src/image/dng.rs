@@ -49,6 +49,8 @@ pub fn initialize_raw_info() -> RawInfo {
         duck: false,
         save_scan: false,
         cfapatternoffset: 0,
+        preview_jpeg: None,
+        preview_dims: (0, 0),
     }
 }
 pub struct RawInfo {
@@ -84,6 +86,10 @@ pub struct RawInfo {
     pub save_scan: bool,
     /// Patched with the file offset of the out-of-line 16-byte (4x4 quad-Bayer) CFA pattern. Unused (0) for inline 2x2 patterns.
     pub cfapatternoffset: u32,
+    /// Optional embedded preview JPEG. When Some, make_base_dng chains a second IFD (IFD1) describing it as a reduced-resolution JPEG image, so viewers/thumbnailers can show the photo without demosaicing the raw. None = no preview.
+    pub preview_jpeg: Option<Vec<u8>>,
+    /// The preview JPEG's pixel dimensions (width, height), needed for IFD1's ImageWidth/ImageLength. Only read when preview_jpeg is Some.
+    pub preview_dims: (u32, u32),
 }
 
 pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
@@ -231,7 +237,17 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
     basedng.extend([253, 198, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]); //Colour profile embedding permission
     numifd += 1;
 
-    basedng.extend([0, 0, 0, 0]); //disable chaining
+    // SubIFDs (0x014A, type 4=LONG): points at the embedded-preview sub-IFD. This is the DNG-spec preview location (raw tools / exiftool report it as PreviewImage). Only emitted when a preview is present; its value is patched once the sub-IFD's file offset is known. Left absent (no tag) when there's no preview.
+    let mut subifd_ptr_pos = 0usize;
+    if rawinfo.preview_jpeg.is_some() {
+        basedng.extend([74, 1, 4, 0, 1, 0, 0, 0]); //SubIFDs
+        subifd_ptr_pos = basedng.len();
+        basedng.extend([0, 0, 0, 0]); // placeholder offset, patched below
+        numifd += 1;
+    }
+
+    // Next-IFD pointer. 0 = no chained sibling IFD (the preview is a SubIFD child of IFD0, not a chained IFD1).
+    basedng.extend([0, 0, 0, 0]);
 
     if basedng.len() % word != 0 {
         basedng.extend(vec![0u8; word - basedng.len() % word]);
@@ -338,6 +354,46 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
         if basedng.len() % word != 0 {
             basedng.extend(vec![0u8; word - basedng.len() % word]);
         }
+    }
+
+    // Embedded preview: append the JPEG, then a SubIFD describing it as a reduced-resolution JPEG
+    // image, and patch IFD0's SubIFDs tag to point at it. Done BEFORE the raw-data-offset patch below
+    // so the raw still appends at the very end (the integrator appends it after we return). Raw tools
+    // read the SubIFD's JPEGInterchangeFormat as the preview without ever demosaicing the raw.
+    if let Some(jpeg) = rawinfo.preview_jpeg.clone() {
+        if basedng.len() % word != 0 {
+            basedng.extend(vec![0u8; word - basedng.len() % word]);
+        }
+        let jpeg_offset = basedng.len() as u32;
+        basedng.extend(&jpeg);
+        if basedng.len() % word != 0 {
+            basedng.extend(vec![0u8; word - basedng.len() % word]);
+        }
+        // The sub-IFD starts here; patch IFD0's SubIFDs tag value to this offset.
+        let subifd_offset = basedng.len() as u32;
+        basedng[subifd_ptr_pos..subifd_ptr_pos + 4].copy_from_slice(&subifd_offset.to_le_bytes());
+
+        // Build the preview sub-IFD. TIFF tags (LE): tag(2) type(2) count(4) value/offset(4). Types: 3=SHORT, 4=LONG.
+        let (pw, ph) = rawinfo.preview_dims;
+        let entries: [(u16, u16, u32, u32); 8] = [
+            (254, 4, 1, 1),                 // NewSubfileType = 1 (reduced-resolution / preview)
+            (256, 4, 1, pw),                // ImageWidth
+            (257, 4, 1, ph),                // ImageLength
+            (258, 3, 1, 8),                 // BitsPerSample = 8
+            (259, 3, 1, 7),                 // Compression = 7 (JPEG)
+            (262, 3, 1, 6),                 // PhotometricInterpretation = 6 (YCbCr, JPEG)
+            (513, 4, 1, jpeg_offset),       // JPEGInterchangeFormat (offset to JPEG)
+            (514, 4, 1, jpeg.len() as u32), // JPEGInterchangeFormatLength
+        ];
+        basedng.extend((entries.len() as u16).to_le_bytes());
+        for (tag, typ, count, val) in entries {
+            basedng.extend(tag.to_le_bytes());
+            basedng.extend(typ.to_le_bytes());
+            basedng.extend(count.to_le_bytes());
+            // For SHORT (type 3) the value sits in the low 2 bytes of the 4-byte field, LE.
+            basedng.extend(val.to_le_bytes());
+        }
+        basedng.extend([0, 0, 0, 0]); // sub-IFD next-IFD pointer = 0 (end of chain)
     }
 
     let offset = (basedng.len() as u32).to_le_bytes(); //Assign raw data offset

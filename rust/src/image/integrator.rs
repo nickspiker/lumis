@@ -503,11 +503,11 @@ impl CameraIntegrator {
                 .as_millis();
             let millis = timestamp_ms % 1000;
 
-            // Base filename without extension; each encoder appends its own.
+            // Base filename without extension; each encoder appends its own. Colons are ILLEGAL in Android/FUSE filenames - a DISPLAY_NAME with ':' yields a MediaStore row whose backing file can't be materialised, so it "saves" then vanishes when the scanner reaps the dangling row. Use '-' between H/M/S instead of the usual ':'.
             let filename_base = format!(
                 "{} {} {:03}",
                 mode_str,
-                datetime.format("%Y-%m-%d %H:%M:%S"),
+                datetime.format("%Y-%m-%d %H-%M-%S"),
                 millis
             );
 
@@ -532,6 +532,22 @@ impl CameraIntegrator {
 
                 let (bytes, ext): (Vec<u8>, &str) = if save_format == SAVE_FORMAT_DNG {
                     // DNG: raw bayer + the real chameleon ColorMatrix1 (magic9inv) + D50.
+                    // Build an embedded preview JPEG from the average half so any viewer/thumbnailer can show the photo without demosaicing the raw (esp. for quad-Bayer, which most tools can't read).
+                    let avg_half = &raw_slot[0..(width * height).min(raw_slot.len())];
+                    let (preview_jpeg, preview_dims) =
+                        match crate::image::thumbnail::build_preview_jpeg(
+                            avg_half,
+                            width,
+                            height,
+                            image_black_level,
+                            bayer_pattern,
+                            raw10,
+                            &display_matrix,
+                            1024,
+                        ) {
+                            Some((bytes, pw, ph)) => (Some(bytes), (pw, ph)),
+                            None => (None, (0, 0)),
+                        };
                     let mut raw_info = RawInfo {
                         make: "Android".to_owned(),
                         makeoffset: 0,
@@ -574,6 +590,8 @@ impl CameraIntegrator {
                         duck: false,
                         save_scan: false,
                         cfapatternoffset: 0,
+                        preview_jpeg,
+                        preview_dims,
                     };
                     let mut dng_bytes = make_base_dng(&mut raw_info);
                     let image_bytes = unsafe {

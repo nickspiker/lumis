@@ -222,32 +222,48 @@ class CameraInterface : Service() {
            }
        }
        
+       if (imageData.isEmpty()) {
+           Log.e("CameraInterface", "Refusing to save '$filename': image data is empty (0 bytes)")
+           return false
+       }
        return try {
            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
            if (uri != null) {
+               var written = 0L
                contentResolver.openOutputStream(uri)?.use { stream ->
                    stream.write(imageData)
+                   stream.flush()
+                   written = imageData.size.toLong()
                }
-               
+               if (written == 0L) {
+                   // openOutputStream returned null or wrote nothing: the row would be a dangling
+                   // 0-byte entry that the media scanner reaps. Delete it and report failure.
+                   Log.e("CameraInterface", "0 bytes written for '$filename' - deleting dangling entry")
+                   contentResolver.delete(uri, null, null)
+                   return false
+               }
+
                // Mark as complete (Android 10+)
                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                    values.clear()
                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
                    contentResolver.update(uri, values, null, null)
                }
-               
+
                // Get the actual filename that was created
                val actualName = contentResolver.query(uri, arrayOf(MediaStore.Images.Media.DISPLAY_NAME), null, null, null)?.use { cursor ->
                    if (cursor.moveToFirst()) cursor.getString(0) else null
                }
-               Log.i("CameraInterface", "Saved image to MediaStore - requested: '$filename', actual: '$actualName', uri: $uri")
+               Log.i("CameraInterface", "Saved image to MediaStore - requested: '$filename', actual: '$actualName', bytes: $written, uri: $uri")
                true
            } else {
-               Log.e("CameraInterface", "Failed to create MediaStore entry for $filename")
+               Log.e("CameraInterface", "Failed to create MediaStore entry for $filename (insert returned null)")
                false
            }
-       } catch (e: IOException) {
-           Log.e("CameraInterface", "Failed to save image: ${e.message}")
+       } catch (e: Exception) {
+           // Broadened from IOException: a bad DISPLAY_NAME (illegal chars) or unsupported MIME throws
+           // IllegalArgumentException from insert(), which previously escaped uncaught and lost the save.
+           Log.e("CameraInterface", "Failed to save image '$filename': ${e.javaClass.simpleName}: ${e.message}")
            false
        }
    }
@@ -770,7 +786,7 @@ class CameraInterface : Service() {
        val sensorHeight = if (activeArray != null && pxH > 0) physH * (activeArray.height() / pxH.toFloat()) else physH
 
        val pixelArrayWidth = pxW
-       
+
        val whiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023
        val blackLevel = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)?.getOffsetForIndex(0, 0) ?: 64
        val bayerPattern = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: 0

@@ -77,19 +77,15 @@ pub fn draw_histogram_overlay(
         }
     }
 
-    // Any gaps in the A/D conversion should be filled in and scaled
-    let mut channel_scales = vec![vec![0u16; hist_oversampled_width]; channels];
-
-    for channel in 0..channels {
-        let mut scale = 1;
-        let mut prev = hist_oversampled_width;
-        for w in (0..hist_oversampled_width).rev() {
-            if channel_data[channel][w] != 0 {
-                scale = (prev - w) as u16;
-                prev = w
-            }
-            channel_scales[channel][w] = scale;
-        }
+    // A/D values are integers, but the x-axis is log2(brightness), so adjacent integer codes map to bins that are far apart at the bright end and tightly packed at the dark end. Each occupied bin therefore represents a whole span of "missing" bins between it and the next reachable integer code; we divide its count by that span to get a density (counts-per-bin) so the curve isn't a comb of spikes. Previously this span was measured per frame as the distance to the nearest other occupied bin - but that distance jumps as scene noise changes WHICH sparse bins are hit, making bar heights flicker frame to frame. The span between adjacent integer codes is actually a fixed function of the bin position (the local stretch of the log mapping), so we compute it analytically here: scene-independent, identical every frame, no flicker.
+    let mut bin_span = vec![1.0f64; hist_oversampled_width];
+    let bins_per_log = (hist_oversampled_width - 1) as f64 / max_brightness_log;
+    for w in 0..hist_oversampled_width {
+        // Recover the brightness value at this bin (inverse of the log2 mapping used when binning), then measure how many bins one integer step (v -> v+1) covers locally. That width is the number of bins a single integer code "owns", i.e. the density divisor. Floored at 1.0 because at the dark end multiple integer codes share one bin (span < 1) and we must never divide the count by less than one bin's worth.
+        let v = 2f64.powf(w as f64 / bins_per_log);
+        let span = bins_per_log * ((v + 1.0) / v).log2();
+        // .max(1.0): a sub-1 span at the dark end would inflate counts; clamp so the divisor is at least one bin. This is a value floor on a density divisor (not memory safety), justified because span < 1 means several codes fall in one bin and the natural divisor is then 1 bin, not a fraction.
+        bin_span[w] = span.max(1.0);
     }
 
     // Use 3 channels for oversampled histogram (only the graph area)
@@ -115,7 +111,7 @@ pub fn draw_histogram_overlay(
                     max_vals[channel] = w;
                 }
                 let count_log =
-                    (channel_data[channel][w] as f64 / channel_scales[channel][w] as f64 + 2.)
+                    (channel_data[channel][w] as f64 / bin_span[w] + 2.)
                         .log2();
                 let height_normalized = count_log / max_count_log;
                 rem_vals[channel] = height_normalized * hist_screen_height as f64;

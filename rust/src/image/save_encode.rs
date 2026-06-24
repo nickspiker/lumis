@@ -195,9 +195,11 @@ pub fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     Some(jpeg_with_icc(&out.into_inner(), rec2020_icc()))
 }
 
-/// Encode RGB8 to lossless Deflate-compressed TIFF bytes.
+/// Encode RGB8 to lossless Deflate-compressed TIFF bytes, with a small JPEG thumbnail embedded in a chained IFD1.
 ///
 /// The `image` crate's TIFF encoder is uncompressed-only, so we use the `tiff` crate directly to get lossless Deflate (≈1.5-2x smaller than raw RGB, still universally readable).
+///
+/// Big 50MP TIFFs fail to thumbnail in Android file managers/galleries (ExifInterface logs "No image meets the size requirements of a thumbnail image"). The `tiff` crate writes IFD0 with a next-IFD pointer of 0 and does not expose that pointer, so we post-process its output: append a thumbnail JPEG and a chained IFD1 (classic TIFF thumbnail convention - exiftool/galleries read IFD1 of a TIFF as the thumbnail), then patch IFD0's next-IFD u32 to point at IFD1. If thumbnail generation fails we still return the valid TIFF without a thumbnail rather than failing the whole save.
 pub fn encode_tiff(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     use crate::image::icc::rec2020_icc;
     use tiff::encoder::{colortype::RGB8, compression::Deflate, TiffEncoder};
@@ -215,7 +217,143 @@ pub fn encode_tiff(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
             .ok()?;
         image.write_data(rgb).ok()?;
     }
-    Some(out.into_inner())
+    let tiff = out.into_inner();
+    // Try to embed a thumbnail; on any failure fall back to the plain (still valid) TIFF.
+    match embed_tiff_thumbnail(tiff.clone(), rgb, width, height) {
+        Some(with_thumb) => Some(with_thumb),
+        None => Some(tiff),
+    }
+}
+
+/// Downscale a u8 RGB image so the longest side is <= `target`, preserving aspect, and JPEG-encode it (quality 85). Returns (JPEG bytes, thumb_width, thumb_height) or None on failure.
+fn build_tiff_thumbnail(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    target: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let (w, h) = (width as usize, height as usize);
+    // Fit so the longest side == target, preserving aspect. .max(1): a very wide/tall aspect can round the short side to 0; a 0 dimension makes the downscale divide by zero and the JPEG encoder reject a 0-size image, so guarantee at least 1px. .min(w/h): never upscale past the source.
+    let (tw, th) = if w >= h {
+        let t = (target as usize).min(w);
+        (t, (target as usize * h / w).max(1).min(h))
+    } else {
+        let t = (target as usize).min(h);
+        ((target as usize * w / h).max(1).min(w), t)
+    };
+    // Bilinear downscale over u8 RGB. The clamps below are MEMORY SAFETY on array indexing: x0/x1/y0/y1 index rgb[(y*w+x)*3+c]; an out-of-range index panics. The source coord sx/sy can be negative at the top/left edge (the -0.5 pixel-centre offset) or reach w-1/h-1 at the bottom/right, so: .max(0.0) before `as usize` prevents a negative float casting to a huge usize (which would index far out of bounds); .min(w-1)/.min(h-1) keep the +1 neighbour in range; the weight .clamp(0,1) keeps the interpolation fraction valid where the coord was edge-clamped.
+    let mut small = vec![0u8; tw * th * 3];
+    let fx = w as f32 / tw as f32;
+    let fy = h as f32 / th as f32;
+    for dy in 0..th {
+        let sy = (dy as f32 + 0.5) * fy - 0.5;
+        let y0 = sy.floor().max(0.0) as usize;
+        let y1 = (y0 + 1).min(h - 1);
+        let wy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for dx in 0..tw {
+            let sx = (dx as f32 + 0.5) * fx - 0.5;
+            let x0 = sx.floor().max(0.0) as usize;
+            let x1 = (x0 + 1).min(w - 1);
+            let wx = (sx - x0 as f32).clamp(0.0, 1.0);
+            for c in 0..3 {
+                let p00 = rgb[(y0 * w + x0) * 3 + c] as f32;
+                let p01 = rgb[(y0 * w + x1) * 3 + c] as f32;
+                let p10 = rgb[(y1 * w + x0) * 3 + c] as f32;
+                let p11 = rgb[(y1 * w + x1) * 3 + c] as f32;
+                let top = p00 * (1.0 - wx) + p01 * wx;
+                let bot = p10 * (1.0 - wx) + p11 * wx;
+                let v = top * (1.0 - wy) + bot * wy;
+                // The +0.5 rounds to nearest; the bilinear of in-range u8 values stays within [0,255] so no clamp is needed before the cast, but the `as u8` would wrap a stray out-of-range value - the inputs are u8 so v is provably in [0,255].
+                small[(dy * tw + dx) * 3 + c] = (v + 0.5) as u8;
+            }
+        }
+    }
+    let mut out = Cursor::new(Vec::new());
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+    enc.encode(&small, tw as u32, th as u32, image::ColorType::Rgb8)
+        .ok()?;
+    Some((out.into_inner(), tw as u32, th as u32))
+}
+
+/// Post-process the crate's single-IFD TIFF: append a thumbnail JPEG and a chained IFD1, then patch IFD0's next-IFD pointer to it. Returns the augmented TIFF, or None if the thumbnail could not be generated or the header didn't match the expected little-endian classic-TIFF layout.
+fn embed_tiff_thumbnail(
+    mut tiff: Vec<u8>,
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    // Thumbnail: max 512px longest side, JPEG quality 85.
+    let (jpeg, tw, th) = build_tiff_thumbnail(rgb, width, height, 512)?;
+
+    // Parse the classic-TIFF header: "II" (little-endian), magic 0x2A, then a u32 offset to IFD0. We only support the little-endian layout the `tiff` crate emits.
+    if tiff.len() < 8 || &tiff[0..2] != b"II" {
+        return None;
+    }
+    if u16::from_le_bytes([tiff[2], tiff[3]]) != 0x2A {
+        return None;
+    }
+    let ifd0_offset = u32::from_le_bytes([tiff[4], tiff[5], tiff[6], tiff[7]]) as usize;
+    if ifd0_offset + 2 > tiff.len() {
+        return None;
+    }
+    let count = u16::from_le_bytes([tiff[ifd0_offset], tiff[ifd0_offset + 1]]) as usize;
+    // The next-IFD pointer is the u32 at ifd0_offset + 2 + count*12 (after the 2-byte entry count and each 12-byte entry).
+    let next_ifd_ptr_pos = ifd0_offset + 2 + count * 12;
+    if next_ifd_ptr_pos + 4 > tiff.len() {
+        return None;
+    }
+    // Confirm the crate wrote 0 there (single-IFD file). If not, the layout isn't what we expect and we must not corrupt it.
+    let existing = u32::from_le_bytes([
+        tiff[next_ifd_ptr_pos],
+        tiff[next_ifd_ptr_pos + 1],
+        tiff[next_ifd_ptr_pos + 2],
+        tiff[next_ifd_ptr_pos + 3],
+    ]);
+    if existing != 0 {
+        return None;
+    }
+
+    let word = 2usize; // word-align appended blocks to 2 bytes (classic TIFF alignment).
+    // Append the thumbnail JPEG, word-aligned.
+    if tiff.len() % word != 0 {
+        tiff.extend(vec![0u8; word - tiff.len() % word]);
+    }
+    let jpeg_offset = tiff.len() as u32;
+    tiff.extend(&jpeg);
+    if tiff.len() % word != 0 {
+        tiff.extend(vec![0u8; word - tiff.len() % word]);
+    }
+
+    // The chained IFD1 (thumbnail) starts here.
+    let ifd1_offset = tiff.len() as u32;
+    // TIFF tags (LE): tag(2) type(2) count(4) value/offset(4). Types: 3=SHORT, 4=LONG.
+    let entries: [(u16, u16, u32, u32); 8] = [
+        (254, 4, 1, 1),                 // NewSubfileType = 1 (reduced-resolution / thumbnail)
+        (256, 4, 1, tw),                // ImageWidth
+        (257, 4, 1, th),                // ImageLength
+        (258, 3, 1, 8),                 // BitsPerSample = 8
+        (259, 3, 1, 7),                 // Compression = 7 (JPEG)
+        (262, 3, 1, 6),                 // PhotometricInterpretation = 6 (YCbCr, JPEG)
+        (513, 4, 1, jpeg_offset),       // JPEGInterchangeFormat (offset to JPEG)
+        (514, 4, 1, jpeg.len() as u32), // JPEGInterchangeFormatLength
+    ];
+    tiff.extend((entries.len() as u16).to_le_bytes());
+    for (tag, typ, count, val) in entries {
+        tiff.extend(tag.to_le_bytes());
+        tiff.extend(typ.to_le_bytes());
+        tiff.extend(count.to_le_bytes());
+        // For SHORT (type 3) the value sits in the low 2 bytes of the 4-byte field, LE.
+        tiff.extend(val.to_le_bytes());
+    }
+    tiff.extend([0u8, 0, 0, 0]); // IFD1 next-IFD pointer = 0 (end of chain)
+
+    // Patch IFD0's next-IFD pointer to point at IFD1.
+    tiff[next_ifd_ptr_pos..next_ifd_ptr_pos + 4].copy_from_slice(&ifd1_offset.to_le_bytes());
+
+    Some(tiff)
 }
 
 /// Encode RGB8 to JPEG XL bytes (lossless, via zune-jpegxl).
