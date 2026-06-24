@@ -875,12 +875,48 @@ impl CameraIntegrator {
         let var_path = format!("{dir}/cal_{kind}_var_{}x{}.bin", self.width, self.height);
         let r1 = std::fs::write(&mean_path, &mean_map);
         let r2 = std::fs::write(&var_path, &var_map);
+
+        // Publish the averaged dark frame into the display image_buffer so the UI can show it (gamma 4)
+        // after finalize. Write the per-pixel mean (u16) into slot 0's avg region and point the image
+        // counter there, then set CAL_SHOW_RESULT_BIT so the UI renders the result-view until tapped.
+        let frame = self.image_buffer.len() / 8; // 4 slots * 2 (avg+diff) = 8 regions
+        if frame >= pixel_count {
+            for i in 0..pixel_count {
+                self.image_buffer[i] = (self.integration_buffer.accumulated[i] / n).min(65535) as u16;
+            }
+            self.header[IMAGE_COUNTER_IDX] = 0; // slot 0
+            self.header[FLAGS_IDX] |= CAL_SHOW_RESULT_BIT;
+        }
+
         if crate::DEBUG {
             log::info!(
                 "Calibration finalized: {} frames, {} -> {} ({:?}), {} ({:?})",
                 cal.frame_count, kind, mean_path, r1.is_ok(), var_path, r2.is_ok()
             );
         }
+    }
+
+    /// Poll-driven finalize: if the UI has requested finalize (CAL_FINALIZE_BIT) and a calibration is
+    /// running, average + write to disk and stop NOW, returning true. Called from the camera process's
+    /// 30Hz settings poll so finalize happens within ~33ms instead of waiting for the next 16s frame.
+    /// Safe to call between frames: during a long exposure the camera thread is blocked in Java waiting
+    /// for the frame, not inside process_frame, so the accumulation buffers are not being mutated.
+    pub fn check_and_finalize_calibration(&mut self) -> bool {
+        if (self.header[FLAGS_IDX] & CALIBRATING_BIT) == 0 {
+            return false;
+        }
+        if (self.header[FLAGS_IDX] & CAL_FINALIZE_BIT) == 0 {
+            return false;
+        }
+        if self.cal.is_none() {
+            // Finalize requested but no frames accumulated yet; just clear the flags and stop.
+            self.header[FLAGS_IDX] &= !(CAL_FINALIZE_BIT | CALIBRATING_BIT);
+            return true;
+        }
+        self.finalize_calibration();
+        self.header[FLAGS_IDX] &= !(CAL_FINALIZE_BIT | CALIBRATING_BIT);
+        self.cal = None;
+        true
     }
 
     /// Read the current manual settings (ISO, shutter ns, focus) straight from shared memory without processing a frame. Lets Kotlin poll and push setting changes to the HAL at a fixed fast rate instead of only once per delivered frame - critical for long exposures, where frames arrive seconds apart and a frame-coupled update made dial changes take several frames to reach the capture request.

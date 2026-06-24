@@ -161,6 +161,11 @@ class CameraInterface : Service() {
        @JvmStatic
        external fun nativeSetCalibrationMode(contextPtr: Long, dark: Boolean)
 
+       // Poll-driven finalize check (camera process). Returns true if it finalized this call (the UI set
+       // CAL_FINALIZE_BIT). Called from the settings poll so finalize is immediate, not frame-gated.
+       @JvmStatic
+       external fun nativeCheckFinalizeCalibration(contextPtr: Long): Boolean
+
        @JvmStatic
        external fun nativeCameraGetSharedMemoryPtr(contextPtr: Long): Long
        
@@ -486,6 +491,14 @@ class CameraInterface : Service() {
        return null
    }
    
+   // Called from the settings poll when a calibration capture has been finalized (averaged + written
+   // to disk). The integrator has cleared CALIBRATING_BIT, so the UI process leaves the stats screen.
+   // The post-finalize "show the dark frame, tap to return to menu" view is wired in a later step; for
+   // now finalize just stops the capture (immediate, no longer frame-gated).
+   internal fun onCalibrationFinalized() {
+       calibrationMode = -1
+   }
+
    internal fun onCameraInitializationComplete(replyTo: Messenger?) {
        val sharedMemoryPtr = nativeCameraGetSharedMemoryPtr(nativeCameraContextPtr)
        val sharedMemoryFd = nativeCameraGetSharedMemoryFd(nativeCameraContextPtr)
@@ -1008,6 +1021,12 @@ class CameraProcessor(private val service: CameraInterface) {
            val ptr = nativeContextPtr
            if (ptr != 0L && captureSession != null && !aeWarmingUp) {
                try {
+                   // Calibration finalize is checked here (not frame-gated) so a FINALIZE tap takes
+                   // effect within one poll tick (~33ms) instead of after the next 16s frame.
+                   if (CameraInterface.nativeCheckFinalizeCalibration(ptr)) {
+                       Log.i("CameraInterface", "Calibration finalized - notifying UI to show result")
+                       service.onCalibrationFinalized()
+                   }
                    val s = CameraInterface.nativeGetCurrentSettings(ptr)
                    updateCameraSettings(s.iso, s.shutterNs, s.focusDistance)
                } catch (e: Exception) {

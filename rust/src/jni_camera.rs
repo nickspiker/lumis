@@ -127,6 +127,24 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeSetCalibrationMode
     );
 }
 
+/// Poll-driven calibration finalize check (camera process). Returns true if it finalized this call, so
+/// Kotlin can transition the UI out of calibration. Called from the 30Hz settings poll so a FINALIZE
+/// tap (which set CAL_FINALIZE_BIT via shared memory from the UI process) takes effect within ~33ms
+/// instead of waiting for the next 16s frame.
+#[no_mangle]
+pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCheckFinalizeCalibration(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    ptr: jlong,
+) -> jboolean {
+    let integrator = integrator_ptr(ptr);
+    if integrator.check_and_finalize_calibration() {
+        1
+    } else {
+        0
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCameraGetSharedMemoryFd(
     _env: JNIEnv<'_>,

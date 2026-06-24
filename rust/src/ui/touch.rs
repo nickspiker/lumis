@@ -28,6 +28,17 @@ pub fn handle_touch(
         trace!("Touch event: action={:?}, pos=({:.1}, {:.1})", action, x, y);
     }
 
+    // After finalize the dark frame is shown; a tap dismisses it. (Returning all the way to the menu is
+    // a follow-up - the app has no runtime camera->menu teardown yet; for now dismiss clears the result
+    // view and falls through to the normal camera screen.)
+    if (ui.header[crate::shared_memory::FLAGS_IDX] & crate::shared_memory::CAL_SHOW_RESULT_BIT) != 0 {
+        if let TouchAction::Down = action {
+            ui.header[crate::shared_memory::FLAGS_IDX] &=
+                !crate::shared_memory::CAL_SHOW_RESULT_BIT;
+        }
+        return true;
+    }
+
     // Dark-frame calibration screen: the only interactive element is FINALIZE. A tap inside that
     // button requests finalize+stop (the integrator writes the cal to disk and clears CALIBRATING_BIT);
     // everything else on this screen is inert. Handled before all normal camera-touch logic.

@@ -34,8 +34,9 @@ pub fn draw_screen(ui: &mut UserInterface, window: &NativeWindow, mut full_draw:
     ui.previous_hold_present = hold_present;
 
     // Dark-frame calibration screen: frames arrive ~16s apart but the stats update on a ~1.5s throttle,
-    // so force a full draw every render-loop tick to keep the live stats refreshing smoothly.
-    if (ui.header[FLAGS_IDX] & CALIBRATING_BIT) != 0 {
+    // so force a full draw every render-loop tick to keep the live stats refreshing smoothly. The
+    // post-finalize result view also forces a draw so it paints promptly when finalize completes.
+    if (ui.header[FLAGS_IDX] & (CALIBRATING_BIT | CAL_SHOW_RESULT_BIT)) != 0 {
         full_draw = true;
     }
 
@@ -195,9 +196,16 @@ fn spawn_histogram_calculation(ui: &UserInterface, image_counter: u64) {
 }
 
 fn draw_full_screen(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_Buffer) {
+    use crate::shared_memory::{CALIBRATING_BIT, CAL_SHOW_RESULT_BIT, FLAGS_IDX};
+    // After finalize: show the captured dark frame, brightened (gamma ~4) so the noise is visible, until
+    // the user taps to return to the menu. Checked before the live-stats screen.
+    if (ui.header[FLAGS_IDX] & CAL_SHOW_RESULT_BIT) != 0 {
+        draw_calibration_result(ui, pixels, buffer);
+        return;
+    }
     // Dark-frame calibration capture has its own minimal screen: just progress stats and an
     // End/Finalize button - no live image, no camera controls. Render it and return.
-    if (ui.header[crate::shared_memory::FLAGS_IDX] & crate::shared_memory::CALIBRATING_BIT) != 0 {
+    if (ui.header[FLAGS_IDX] & CALIBRATING_BIT) != 0 {
         draw_calibration_screen(ui, pixels, buffer);
         return;
     }
@@ -298,6 +306,47 @@ fn draw_calibration_screen(
         0xFF,
         0,
     );
+}
+
+// The finalized dark frame, brightened so the noise is visible. Renders the per-pixel mean (in
+// image_buffer slot 0) fit-to-screen with a gamma of ~4 (double sqrt) and NO scaling - the raw dark
+// level, just lifted into a visible range. A tap returns to the menu (handled in touch.rs).
+fn draw_calibration_result(
+    ui: &mut UserInterface,
+    pixels: &mut [u8],
+    buffer: &ANativeWindow_Buffer,
+) {
+    let sw = buffer.stride as usize;
+    let sh = buffer.height as usize;
+    let iw = ui.sensor_x_size;
+    let ih = ui.sensor_y_size;
+    for p in pixels.iter_mut() {
+        *p = 0;
+    }
+    if iw == 0 || ih == 0 {
+        return;
+    }
+    // Fit-to-screen scale (preserve aspect), centred.
+    let scale = (sw as f32 / iw as f32).min(sh as f32 / ih as f32);
+    let dw = (iw as f32 * scale) as usize;
+    let dh = (ih as f32 * scale) as usize;
+    let off_x = (sw - dw) / 2;
+    let off_y = (sh - dh) / 2;
+    for dy in 0..dh {
+        let sy = (dy as f32 / scale) as usize;
+        for dx in 0..dw {
+            let sx = (dx as f32 / scale) as usize;
+            let v = ui.image_buffer[(sy * iw + sx).min(iw * ih - 1)] as f32 / 65535.0;
+            // gamma 4 = double sqrt: cheap and strongly brightens the dark frame.
+            let b = (v.sqrt().sqrt() * 255.0).min(255.0) as u8;
+            let off = ((off_y + dy) * sw + (off_x + dx)) * 3;
+            if off + 2 < pixels.len() {
+                pixels[off] = b;
+                pixels[off + 1] = b;
+                pixels[off + 2] = b;
+            }
+        }
+    }
 }
 
 // The on-screen rectangle (x0,y0,x1,y1) of the calibration FINALIZE button, in buffer pixels. Shared

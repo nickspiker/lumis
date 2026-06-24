@@ -62,6 +62,9 @@ pub const CALIBRATING_BIT: u64 = 1 << 4;
 pub const CAL_IS_DARK_BIT: u64 = 1 << 5;
 // Set by the UI to request the running calibration be finalized (averaged + written to disk) and stopped.
 pub const CAL_FINALIZE_BIT: u64 = 1 << 6;
+// Set by the integrator after finalize: the averaged dark frame is in the display image_buffer slot and
+// the UI should show it (bright, gamma ~4) until tapped. Tapping clears this and returns to the menu.
+pub const CAL_SHOW_RESULT_BIT: u64 = 1 << 7;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum RawMode {
