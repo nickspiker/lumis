@@ -503,12 +503,12 @@ impl CameraIntegrator {
                 .as_millis();
             let millis = timestamp_ms % 1000;
 
-            // Base filename without extension; each encoder appends its own. Colons are ILLEGAL in Android/FUSE filenames - a DISPLAY_NAME with ':' yields a MediaStore row whose backing file can't be materialised, so it "saves" then vanishes when the scanner reaps the dangling row. Use '-' between H/M/S instead of the usual ':'.
+            // Base filename without extension; each encoder appends its own. Format: "YYYYMMDD HHMMSS mmm Mode" (compact date, compact time, milliseconds, then the integration mode last). No colons - they are ILLEGAL in Android/FUSE filenames (a DISPLAY_NAME with ':' yields a MediaStore row whose backing file can't be materialised, so it "saves" then vanishes when the scanner reaps the dangling row). Uses the CAPTURE timestamp (last_image_timestamp, set when the exposure started), so re-saving the same displayed frame produces the same filename and the existing-file check dedups it.
             let filename_base = format!(
-                "{} {} {:03}",
-                mode_str,
-                datetime.format("%Y-%m-%d %H-%M-%S"),
-                millis
+                "{} {:03} {}",
+                datetime.format("%Y%m%d %H%M%S"),
+                millis,
+                mode_str
             );
 
             // Copy the slot's raw u16 data for the save thread (the camera thread keeps overwriting the live slots). DNG needs the full data_length (avg, or avg+diff for motion); RGB exports debayer the average half.

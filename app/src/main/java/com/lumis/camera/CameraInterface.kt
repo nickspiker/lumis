@@ -209,6 +209,7 @@ class CameraInterface : Service() {
        )?.use { cursor ->
            if (cursor.moveToFirst()) {
                val existingName = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME))
+               // Skip the save: a matching capture-time filename means this exact frame is already saved. This guard is LOAD-BEARING - verified on-device that without it MediaStore writes the full bytes again AND renames the duplicate to " (1)" (no content check, no write-and-forget). Since the filename encodes the capture timestamp (down to the millisecond), a name match reliably means identical content.
                Log.i("CameraInterface", "File already exists: '$existingName' - skipping save to prevent duplicate")
                return true // File exists, don't save again
            } else {
