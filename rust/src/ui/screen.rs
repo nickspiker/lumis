@@ -799,100 +799,76 @@ fn draw_progress(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWind
         ui.device_rotation as u16,
     );
 
-    // Draw the progress bar on the exposure-time slider: rounded end caps plus a red->yellow->green colour sweep along its length (fresh exposure reads red at the leading edge, near-complete reads green).
+    // Progress bar on the exposure-time slider. A flat line/band of the original slider thickness grows from the slider START toward a moving point ("fill"), and each scanline of the band stops at the LEFT/NEAR OUTLINE of the slider circle positioned at that fill point - so the leading end is a CONCAVE cup the slider dot nestles into (rows near the band centre reach furthest toward the dot; rows near the band edges stop shorter where the circle bulges into them). fill = exposure-completion (elapsed/total_ms, 0..1, resets each exposure) scaled to the exposure-time dot's slider position (ui.exposure_time_slider, which already has the sqrt log mapping baked in - we do NOT re-apply it). Colour sweeps red (fresh) -> yellow (half) -> green (complete) on the same completion fraction.
     if ui.slider_thickness > 0.0 && total_ms > 0 {
-        // Calculate progress based on timescale, not actual exposure duration.
-        let timescale_ms = ui.time_base.duration_ms();
-        let progress = (elapsed as f64 / timescale_ms).sqrt().min(1.0) as f32;
+        // Fraction through the CURRENT exposure (0 at start, 1 at completion); resets each exposure. min(1.0) caps overrun.
+        let completion = (elapsed as f32 / total_ms as f32).min(1.0);
+        let fill = completion * ui.exposure_time_slider as f32;
+
+        // Bar colour from completion: red fades out, green fades in -> yellow mid -> green at completion. .clamp guards float drift before the saturating u8 cast.
+        let cr = (((1.0 - completion) * 2.0).clamp(0.0, 1.0) * 255.0) as u8;
+        let cg = ((completion * 2.0).clamp(0.0, 1.0) * 255.0) as u8;
+        let (cr, cg, cb) = (cr, cg, 0u8);
 
         let is_vertical = (ui.slider_start_x - ui.slider_end_x).abs() < 1.0;
-        let radius = ui.slider_thickness; // cap radius == bar half-thickness => fully rounded semicircular caps
-
-        // Red->yellow->green sweep for fill fraction f in [0,1]: red fades out over the first half, green fades in over the first half, giving yellow at the midpoint and solid green by the end. f is in [0,1] by construction so *255 lands in range; the .min(1.0).max(0.0) guards float drift at the endpoints before the saturating `as u8` cast (value shaping for the colour ramp, not memory safety).
-        let ryg = |f: f32| -> (u8, u8, u8) {
-            let r = (((1.0 - f) * 2.0).min(1.0).max(0.0) * 255.0) as u8;
-            let g = ((f * 2.0).min(1.0).max(0.0) * 255.0) as u8;
-            (r, g, 0)
-        };
+        let stroke = ui.slider_thickness as i32; // band half-thickness (original line width, unchanged)
+        let circle_r = ui.slider_thickness * 2.0; // slider dot radius (slider_thickness is stored as circle_radius/2)
 
         if is_vertical {
-            let progress_y = ui.slider_start_y + (ui.slider_end_y - ui.slider_start_y) * progress;
-            let center_x = ui.slider_start_x;
-            let y0 = ui.slider_start_y.min(progress_y);
-            let y1 = ui.slider_start_y.max(progress_y);
-            // .max(1.0): the body span is a divisor for the colour fraction; a zero-length bar (no progress yet) would divide by zero, so floor at one pixel.
-            let span = (y1 - y0).max(1.0);
-            // Clamp the scanned row range into the buffer: y0-radius can go negative (top cap) and y1+radius past the bottom; these are memory-safety bounds on the row index.
-            let yi0 = (y0 - radius).max(0.0) as usize;
-            let yi1 = ((y1 + radius) as usize).min(buffer.height as usize - 1);
-            for y in yi0..=yi1 {
-                let yc = y as f32;
-                // Rounded caps: past the straight body (rows below y0 or above y1) the drawn half-width follows a circle of `radius` about the nearer end, so the bar terminates in semicircles rather than square edges. dist is how far past the body this row sits.
-                let dist = if yc < y0 {
-                    y0 - yc
-                } else if yc > y1 {
-                    yc - y1
-                } else {
-                    0.0
-                };
-                if dist > radius {
+            // Band runs vertically (along Y); scanlines are columns offset in X from the centre line.
+            let center_x = ui.slider_start_x as i32;
+            let start_y = ui.slider_start_y;
+            let circle_cy = start_y + (ui.slider_end_y - ui.slider_start_y) * fill; // dot centre at the fill point
+            let grows_down = ui.slider_end_y >= ui.slider_start_y;
+            for dx in -stroke..=stroke {
+                let x = center_x + dx;
+                if x < 0 || (x as usize) >= buffer.stride as usize {
                     continue;
                 }
-                // Half-width at this row: full thickness in the body, narrowing to 0 at the cap tip via sqrt(r^2 - dist^2). .max(0.0) guards a tiny negative from float error before sqrt (NaN guard, not value shaping).
-                let half_w = (radius * radius - dist * dist).max(0.0).sqrt();
-                // Colour fraction along the body; caps inherit their nearer end's colour via the clamp. Flip when the bar grows upward so red still leads.
-                let f = ((yc - y0) / span).clamp(0.0, 1.0);
-                let (cr, cg, cb) = ryg(if ui.slider_start_y <= progress_y { f } else { 1.0 - f });
-                let hw = half_w as i32;
-                for dx in -hw..=hw {
-                    let x = center_x as i32 + dx;
-                    if x >= 0 && (x as usize) < buffer.stride as usize {
-                        let idx = (y * buffer.stride as usize + x as usize) * 3;
-                        if idx + 2 < pixels.len() {
-                            pixels[idx] = cr;
-                            pixels[idx + 1] = cg;
-                            pixels[idx + 2] = cb;
-                        }
+                // This scanline stops at the circle's near outline at its X offset: the circle reaches (circle_r^2 - dx^2) past its centre along Y. .max(0.0) guards float error before sqrt; columns outside the circle's X extent (|dx|>circle_r) just stop at the centre.
+                let reach = (circle_r * circle_r - (dx * dx) as f32).max(0.0).sqrt();
+                let edge = if grows_down { circle_cy - reach } else { circle_cy + reach };
+                let (lo, hi) = if grows_down { (start_y, edge) } else { (edge, start_y) };
+                let yi0 = lo.max(0.0) as usize;
+                let yi1 = (hi.max(0.0) as usize).min(buffer.height as usize - 1);
+                if yi0 > yi1 {
+                    continue;
+                }
+                for y in yi0..=yi1 {
+                    let idx = (y * buffer.stride as usize + x as usize) * 3;
+                    if idx + 2 < pixels.len() {
+                        pixels[idx] = cr;
+                        pixels[idx + 1] = cg;
+                        pixels[idx + 2] = cb;
                     }
                 }
             }
         } else {
-            let progress_x = ui.slider_start_x + (ui.slider_end_x - ui.slider_start_x) * progress;
-            let center_y = ui.slider_start_y;
-            let x0 = ui.slider_start_x.min(progress_x);
-            let x1 = ui.slider_start_x.max(progress_x);
-            // .max(1.0): see the vertical branch - avoids divide-by-zero on a zero-length bar.
-            let span = (x1 - x0).max(1.0);
-            // Memory-safety bounds on the scanned column range (caps can extend past either end of the buffer).
-            let xi0 = (x0 - radius).max(0.0) as usize;
-            let xi1 = ((x1 + radius) as usize).min(buffer.stride as usize - 1);
-            for x in xi0..=xi1 {
-                let xc = x as f32;
-                // Rounded caps: the drawn half-height narrows to 0 over `radius` past each body end (semicircular caps).
-                let dist = if xc < x0 {
-                    x0 - xc
-                } else if xc > x1 {
-                    xc - x1
-                } else {
-                    0.0
-                };
-                if dist > radius {
+            // Band runs horizontally (along X); scanlines are rows offset in Y from the centre line.
+            let center_y = ui.slider_start_y as i32;
+            let start_x = ui.slider_start_x;
+            let circle_cx = start_x + (ui.slider_end_x - ui.slider_start_x) * fill; // dot centre at the fill point
+            let grows_right = ui.slider_end_x >= ui.slider_start_x;
+            for dy in -stroke..=stroke {
+                let y = center_y + dy;
+                if y < 0 || (y as usize) >= buffer.height as usize {
                     continue;
                 }
-                // .max(0.0) before sqrt: float-error NaN guard, not value shaping.
-                let half_h = (radius * radius - dist * dist).max(0.0).sqrt();
-                let f = ((xc - x0) / span).clamp(0.0, 1.0);
-                let (cr, cg, cb) = ryg(if ui.slider_start_x <= progress_x { f } else { 1.0 - f });
-                let hh = half_h as i32;
-                for dy in -hh..=hh {
-                    let y = center_y as i32 + dy;
-                    if y >= 0 && (y as usize) < buffer.height as usize {
-                        let idx = (y as usize * buffer.stride as usize + x) * 3;
-                        if idx + 2 < pixels.len() {
-                            pixels[idx] = cr;
-                            pixels[idx + 1] = cg;
-                            pixels[idx + 2] = cb;
-                        }
+                // Stop this row at the circle's near outline at its Y offset. .max(0.0) guards float error before sqrt; rows outside the circle's Y extent stop at the centre.
+                let reach = (circle_r * circle_r - (dy * dy) as f32).max(0.0).sqrt();
+                let edge = if grows_right { circle_cx - reach } else { circle_cx + reach };
+                let (lo, hi) = if grows_right { (start_x, edge) } else { (edge, start_x) };
+                let xi0 = lo.max(0.0) as usize;
+                let xi1 = (hi.max(0.0) as usize).min(buffer.stride as usize - 1);
+                if xi0 > xi1 {
+                    continue;
+                }
+                for x in xi0..=xi1 {
+                    let idx = (y as usize * buffer.stride as usize + x) * 3;
+                    if idx + 2 < pixels.len() {
+                        pixels[idx] = cr;
+                        pixels[idx + 1] = cg;
+                        pixels[idx + 2] = cb;
                     }
                 }
             }
