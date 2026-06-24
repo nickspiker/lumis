@@ -19,3 +19,6 @@ local.properties
 .DS_Store
 *.swp
 /app/libs/
+
+# Local test assets - large 16-bit Rec.2020 reference TIFFs for P/Q demosaic tuning; not synced
+/Artwork/
