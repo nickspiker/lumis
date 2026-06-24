@@ -625,67 +625,80 @@ fn draw_camera_or_histogram(
                         }
                     };
 
-                    // Pick R, G, B based on Bayer pattern (unchanged)
+                    // Diff/Motion only: pick R, G, B from the 2x2 block by Bayer pattern (monochrome magnitudes; Average mode bins the whole region instead, below). local_x/local_y select the green nearest this pixel.
                     let local_x = sensor_x - block_x;
                     let local_y = sensor_y - block_y;
-
-                    let (r, g, b) = match ui.bayer_pattern {
+                    let (r_mono, g_mono, b_mono) = match ui.bayer_pattern {
                         0 => {
-                            // RGGB: R G / G B
                             let g = if local_x + local_y < 2 { tr } else { bl };
                             (tl, g, br)
                         }
                         1 => {
-                            // GRBG: G R / B G
                             let g = if local_x + local_y < 2 { tl } else { br };
                             (tr, g, bl)
                         }
                         2 => {
-                            // GBRG: G B / R G
                             let g = if local_x + local_y < 2 { tl } else { br };
                             (bl, g, tr)
                         }
                         3 => {
-                            // BGGR: B G / G R
                             let g = if local_x + local_y < 2 { tr } else { bl };
                             (br, g, tl)
                         }
                         _ => panic!("Unknown bayer pattern!"),
                     };
 
-                    // Quad-Bayer override: the 2x2 (tl,tr,bl,br) above is a single-colour cluster, so the standard pick produces grey. In Average mode resolve colour from the 4x4 tile instead by sampling one representative pixel of the R, G and B clusters and applying the SAME clip/black-subtract semantics as the 2x2 path. Diff/Motion stay monochrome, so leave them on the 2x2 pick.
-                    let (r, g, b) = if is_quad && current_mode == RawMode::Average {
+                    // Average mode: collapse the source CFA region under this screen pixel into one RGB pixel by binning every pixel of the region into its channel, then normalising each channel by how many samples it received. This one path serves BOTH layouts - standard Bayer (region = the 2x2 cell, colours 1xR 2xG 1xB) and quad-Bayer (region = the 4x4 Tetracell tile, colours 4xR 8xG 4xB). Binning every pixel (not point-sampling one representative) is what removes the quad grid and the standard 2x2 single-pick; summing both greens then dividing each channel by its own sample count keeps the colour balance correct for either layout. No divide in the loop: the per-channel normalisation is a single reciprocal multiply per channel. Diff/Motion keep the monochrome 2x2 pick below.
+                    let (r, g, b) = if current_mode == RawMode::Average {
                         let last = ui.sensor_x_size * ui.sensor_y_size - 1;
-                        let tx = sensor_x & !3;
-                        let ty = sensor_y & !3;
-                        let [(rdx, rdy), (gdx, gdy), (bdx, bdy)] = quad_offsets(ui.bayer_pattern);
-                        // .min(last): these indices feed raw_average[..]; clamping to the last valid element prevents an out-of-bounds index (panic / UB) when the tile origin lands at the sensor's right/bottom edge.
-                        let ridx = ((ty + rdy) * ui.sensor_x_size + tx + rdx).min(last);
-                        let gidx = ((ty + gdy) * ui.sensor_x_size + tx + gdx).min(last);
-                        let bidx = ((ty + bdy) * ui.sensor_x_size + tx + bdx).min(last);
+                        // Region size: quad collapses a 4x4 tile, standard a single 2x2 cell. tx/ty is the region origin (tile-aligned for quad, cell-aligned for standard).
+                        let region = if is_quad { 4 } else { 2 };
+                        let mask = !(region - 1);
+                        let tx = sensor_x & mask;
+                        let ty = sensor_y & mask;
+                        // Per-2x2-cell colour (0=R,1=G,2=B) of the active pattern, indexed row-major (idx = row*2 + col). For quad this is the colour of each 2x2 CLUSTER of the 4x4 tile; for standard it is the colour of each pixel of the 2x2 cell. cstep is how many source pixels one base cell spans (2 for quad clusters, 1 for standard pixels).
+                        let cells = base_2x2(ui.bayer_pattern);
+                        let cstep = region / 2; // 2 for quad, 1 for standard
                         // Same black-subtract / clip indicator as the Average arm above: controls visible -> white-clip zeros over-threshold samples AND black-clip via WRAPPING sub (crushed shadows render WHITE); controls hidden -> saturating sub.
-                        let sub = |v: u16| -> u16 {
+                        let sub = |v: u16| -> usize {
                             if ui.controls_visible {
                                 if v > ui_constants::CLIPPING_THRESHOLD {
                                     0
                                 } else {
-                                    v.wrapping_sub(ui.raw_black_level)
+                                    v.wrapping_sub(ui.raw_black_level) as usize
                                 }
                             } else {
-                                v.saturating_sub(ui.raw_black_level)
+                                v.saturating_sub(ui.raw_black_level) as usize
                             }
                         };
+                        let (mut rsum, mut gsum, mut bsum) = (0usize, 0usize, 0usize);
+                        for dy in 0..region {
+                            for dx in 0..region {
+                                // Which base 2x2 cell this source pixel falls in -> its CFA colour. (dx/cstep, dy/cstep) is 0..1 for both layouts.
+                                let cell = (dy / cstep) * 2 + (dx / cstep);
+                                // .min(last): clamps the index feeding raw_average[..] to the last valid element so a region origin at the sensor's right/bottom edge can't index out of bounds (panic / UB).
+                                let idx = ((ty + dy) * ui.sensor_x_size + tx + dx).min(last);
+                                let s = sub(raw_average[idx]);
+                                match cells[cell] {
+                                    0 => rsum += s,
+                                    2 => bsum += s,
+                                    _ => gsum += s,
+                                }
+                            }
+                        }
+                        // Normalise each channel to single-pixel magnitude (the same domain as the calibration overlay and `scale` below) by dividing by its own sample count. Counts: standard 1/2/1, quad 4/8/4. Reciprocals are multiplies - no divide in the loop. half = region*region/4 is the R/B count (a quarter of the region); green gets twice that.
+                        let half = (region * region / 4) as f32;
                         (
-                            sub(raw_average[ridx]),
-                            sub(raw_average[gidx]),
-                            sub(raw_average[bidx]),
+                            rsum as f32 / half,
+                            gsum as f32 / (half * 2.),
+                            bsum as f32 / half,
                         )
                     } else {
-                        (r, g, b)
+                        (r_mono as f32, g_mono as f32, b_mono as f32)
                     };
 
                     // Composite the calibration overlay HERE, in RAW space, BEFORE scale/matrix/sqrt - the overlay holds raw-native values (chameleon builds it from injectmagic9, the same raw the RAW-injection path writes), so it must replace the raw sensor values and then flow through the EXACT SAME display pipeline as every other pixel (scale -> display matrix -> sqrt). Compositing it after the adjustments was the whole bug: it then had to fake-replicate scale/matrix and never matched. Overlay coords (min_x/min_y/ov_w/ov_h) are in the scan-input frame: full sensor for standard Bayer, half-res binned for quad (ui.rs bins by 2 before scan_target), so a full-res sensor coord maps in via >>1 for quad and unchanged for standard.
-                    let (mut r, mut g, mut b) = (r as f32, g as f32, b as f32);
+                    let (mut r, mut g, mut b) = (r, g, b);
                     if let Some((min_x, min_y, ov_w, ov_h, overlay)) = cal_overlay {
                         let ox = if is_quad { sensor_x >> 1 } else { sensor_x };
                         let oy = if is_quad { sensor_y >> 1 } else { sensor_y };
