@@ -150,6 +150,9 @@ class CameraInterface : Service() {
        ): CameraSettings
        
        @JvmStatic
+       external fun nativeGetCurrentSettings(contextPtr: Long): CameraSettings
+
+       @JvmStatic
        external fun nativeCameraGetSharedMemoryPtr(contextPtr: Long): Long
        
        @JvmStatic
@@ -967,6 +970,36 @@ class CameraProcessor(private val service: CameraInterface) {
    private var backgroundThread: HandlerThread? = null
    private var backgroundHandler: Handler? = null
    private var cameraId: String? = null
+
+   // Settings poll: decouples HAL setting application from frame delivery. Frames clock the old update path once per delivered frame, so at long exposures (seconds per frame) a dial change took several frames to reach the capture request. This poll reads the current ISO/shutter/focus from shared memory at a fixed fast rate and pushes any change immediately via updateCameraSettings (which itself no-ops when nothing changed).
+   private val SETTINGS_POLL_MS = 33L // ~30Hz; fine-grained enough that dial changes feel instant regardless of frame rate.
+   private var settingsPollActive = false
+   private val settingsPollRunnable = object : Runnable {
+       override fun run() {
+           if (!settingsPollActive) return
+           val ptr = nativeContextPtr
+           if (ptr != 0L && captureSession != null && !aeWarmingUp) {
+               try {
+                   val s = CameraInterface.nativeGetCurrentSettings(ptr)
+                   updateCameraSettings(s.iso, s.shutterNs, s.focusDistance)
+               } catch (e: Exception) {
+                   Log.w("CameraInterface", "settings poll failed: $e")
+               }
+           }
+           backgroundHandler?.postDelayed(this, SETTINGS_POLL_MS)
+       }
+   }
+
+   private fun startSettingsPoll() {
+       if (settingsPollActive) return
+       settingsPollActive = true
+       backgroundHandler?.postDelayed(settingsPollRunnable, SETTINGS_POLL_MS)
+   }
+
+   private fun stopSettingsPoll() {
+       settingsPollActive = false
+       backgroundHandler?.removeCallbacks(settingsPollRunnable)
+   }
    // Set when the selected sensor is a hidden physical sub-camera; targeted via OutputConfiguration.setPhysicalCameraId() on its parent logical camera.
    private var physicalCameraId: String? = null
    // True when the selected mode is the maximum-resolution (non-binned) readout: the ImageReader uses the max-res size and every capture request sets SENSOR_PIXEL_MODE.
@@ -1171,7 +1204,7 @@ class CameraProcessor(private val service: CameraInterface) {
        currentShutterSpeedNs = shutterSpeedNs
        currentFocusDistance = focusDistance
        
-       // Apply to current Camera2 session
+       // Apply to current Camera2 session. The new repeating request carries the new manual settings; the HAL applies them on the next exposure it starts (verified instant: a request carrying 1s yields a 1s result on the very next started frame). We deliberately do NOT abortCaptures() here - it only drops not-yet-started queued frames (not the one mid-integration), made zero difference to the switch latency in testing, and calling it on every change would stall the stream. The real latency was the once-per-frame update cadence, now fixed by the fixed-rate settings poll that calls this immediately on change.
        captureSession?.let { session ->
            cameraDevice?.let { device ->
                try {
@@ -1224,6 +1257,8 @@ class CameraProcessor(private val service: CameraInterface) {
                    override fun onConfigured(session: CameraCaptureSession) {
                        captureSession = session
                        startCapture()
+                       // Poll settings independently of frame delivery so dial changes reach the HAL immediately even at long exposures (the poll no-ops during AE warm-up and when nothing changed).
+                       startSettingsPoll()
                        Log.i("CameraInterface", "Capture session configured")
                    }
                    

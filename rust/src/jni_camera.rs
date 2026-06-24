@@ -198,6 +198,31 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCameraOnFrame<'loc
     settings_obj
 }
 
+/// Return the current manual settings (ISO, shutter ns, focus) from shared memory WITHOUT processing a frame. Kotlin polls this at a fixed fast rate so a dial change reaches the capture request immediately, instead of waiting for the next delivered frame (which at long exposures can be seconds away - the cause of settings taking several frames to switch).
+#[no_mangle]
+pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeGetCurrentSettings<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    ptr: jlong,
+) -> JObject<'local> {
+    let integrator = unsafe { &mut *(ptr as *mut CameraIntegrator) };
+    let (iso, shutter_ns, focus) = integrator.current_settings();
+
+    let settings_class = env
+        .find_class("com/lumis/camera/CameraSettings")
+        .expect("Failed to find CameraSettings class");
+    env.new_object(
+        settings_class,
+        "(IJF)V",
+        &[
+            jni::objects::JValue::Int(iso),
+            jni::objects::JValue::Long(shutter_ns),
+            jni::objects::JValue::Float(focus),
+        ],
+    )
+    .expect("Failed to create CameraSettings object")
+}
+
 #[no_mangle]
 pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeGetSavedDngData<'local>(
     mut env: JNIEnv<'local>,

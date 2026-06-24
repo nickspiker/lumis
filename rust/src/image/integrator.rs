@@ -680,6 +680,14 @@ impl CameraIntegrator {
         )
     }
 
+    /// Read the current manual settings (ISO, shutter ns, focus) straight from shared memory without processing a frame. Lets Kotlin poll and push setting changes to the HAL at a fixed fast rate instead of only once per delivered frame - critical for long exposures, where frames arrive seconds apart and a frame-coupled update made dial changes take several frames to reach the capture request.
+    pub fn current_settings(&self) -> (i32, i64, f32) {
+        let iso = f64::from_bits(self.header[ISO_IDX]);
+        let shutter_ns = f64::from_bits(self.header[SHUTTER_NS_IDX]);
+        let focus = f64::from_bits(self.header[FOCUS_IDX]);
+        (iso as i32, shutter_ns as i64, focus as f32)
+    }
+
     pub fn get_shared_memory_ptr(&self) -> *mut u8 {
         self.header.as_ptr() as *mut u8
     }

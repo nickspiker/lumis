@@ -441,10 +441,6 @@ fn draw_camera_or_histogram(
             // In-place calibration overlay (live_overlay): held until tap, composited per sensor pixel below. (min_x, min_y, ov_w, ov_h are in chameleon's tstats space = 2x the scan-input frame; see the composite site for the full-res mapping. rgba_f32 in display-linear / terminal space, white=65535.)
             let cal_hold = ui.calibration_hold.load();
             let cal_overlay = cal_hold.as_ref().as_ref();
-            // TEMPORARY calibration-overlay coordinate trace: confirms the actual overlay dimensions vs the full-res sensor so the per-pixel cal_factor (1 for quad, 2 for standard) can be verified on-device. Logged once per draw only while an overlay is held. Remove once the live overlay scale is confirmed correct.
-            if let Some((min_x, min_y, ov_w, ov_h, overlay)) = cal_overlay {
-                log::info!("cal_overlay trace: is_quad={} min_x={} min_y={} ov_w={} ov_h={} overlay_len={} sensor={}x{}", is_quad, min_x, min_y, ov_w, ov_h, overlay.len(), ui.sensor_x_size, ui.sensor_y_size);
-            }
 
             // Normal fit-to-screen view with debayering
             // Calculate scale to fit rotated sensor (if needed) in display while maintaining aspect ratio
@@ -688,6 +684,26 @@ fn draw_camera_or_histogram(
                         (r, g, b)
                     };
 
+                    // Composite the calibration overlay HERE, in RAW space, BEFORE scale/matrix/sqrt - the overlay holds raw-native values (chameleon builds it from injectmagic9, the same raw the RAW-injection path writes), so it must replace the raw sensor values and then flow through the EXACT SAME display pipeline as every other pixel (scale -> display matrix -> sqrt). Compositing it after the adjustments was the whole bug: it then had to fake-replicate scale/matrix and never matched. Overlay coords (min_x/min_y/ov_w/ov_h) are in the scan-input frame: full sensor for standard Bayer, half-res binned for quad (ui.rs bins by 2 before scan_target), so a full-res sensor coord maps in via >>1 for quad and unchanged for standard.
+                    let (mut r, mut g, mut b) = (r as f32, g as f32, b as f32);
+                    if let Some((min_x, min_y, ov_w, ov_h, overlay)) = cal_overlay {
+                        let ox = if is_quad { sensor_x >> 1 } else { sensor_x };
+                        let oy = if is_quad { sensor_y >> 1 } else { sensor_y };
+                        if ox >= *min_x && ox < min_x + ov_w && oy >= *min_y && oy < min_y + ov_h {
+                            let ov_idx = ((oy - min_y) * ov_w + (ox - min_x)) * 4;
+                            if ov_idx + 3 < overlay.len() {
+                                let alpha = overlay[ov_idx + 3];
+                                if alpha > 0.0 {
+                                    // Overlay is already in black-subtracted raw counts (chameleon scaled reflectance by the scanned white-patch level minus black), the SAME domain as the scene r/g/b here. Composite raw-for-raw; the normal scale/matrix/sqrt below then renders it identically to the real target at the current exposure.
+                                    let ia = 1.0 - alpha;
+                                    r = overlay[ov_idx] * alpha + r * ia;
+                                    g = overlay[ov_idx + 1] * alpha + g * ia;
+                                    b = overlay[ov_idx + 2] * alpha + b * ia;
+                                }
+                            }
+                        }
+                    }
+
                     // Apply display scaling based on mode
                     let scale = match current_mode {
                         RawMode::Average => {
@@ -697,33 +713,14 @@ fn draw_camera_or_histogram(
                     };
 
                     // Linear scale, then apply the camera->Rec.2020 display matrix in LINEAR space (mixes channels), then sqrt-encode for the BT.2020 surface. Average mode is colour (debayered) so colour-correct; diff/motion are monochrome magnitudes - leave them unmixed.
-                    let (lr, lg, lb) = (r as f32 * scale, g as f32 * scale, b as f32 * scale);
+                    let (lr, lg, lb) = (r * scale, g * scale, b * scale);
 
-                    let (mut lr, mut lg, mut lb) = if current_mode == RawMode::Average {
+                    let (lr, lg, lb) = if current_mode == RawMode::Average {
                         apply_display_matrix(ui, lr, lg, lb)
                     } else {
                         (lr, lg, lb)
                     };
 
-                    // Composite the in-place calibration overlay AFTER the display matrix, in display-linear space. Chameleon now builds the overlay already in terminal (camera->Rec.2020) space normalized so white=65535, exactly like the calibration-button thumbnail, so the existing sqrt() encode below produces matching colour - we must NOT run it through apply_display_matrix again (that double-transformed it and was the wrong-colour bug). Overlay coordinates are in chameleon's tstats space, which is 2x the scan-input frame (image_processing::transform doubles width/minw/matrix). The scan-input frame is the full sensor for standard Bayer but the half-res binned frame for quad-Bayer (ui.rs bins by 2 before scan_target). So overlay-coord = 2x(scan-input) = 2x(sensor) for standard, and 2x(sensor/2)=1x(sensor) for quad. cal_factor maps a full-res sensor coord into the overlay accordingly: 2 for standard, 1 for quad.
-                    if let Some((min_x, min_y, ov_w, ov_h, overlay)) = cal_overlay {
-                        let cal_factor = if is_quad { 1 } else { 2 };
-                        let ox = sensor_x * cal_factor;
-                        let oy = sensor_y * cal_factor;
-                        if ox >= *min_x && ox < min_x + ov_w && oy >= *min_y && oy < min_y + ov_h {
-                            let ov_idx = ((oy - min_y) * ov_w + (ox - min_x)) * 4;
-                            if ov_idx + 3 < overlay.len() {
-                                let alpha = overlay[ov_idx + 3];
-                                if alpha > 0.0 {
-                                    // Overlay is already in display-linear units (white=65535); blend straight into the post-matrix linear value, no extra scale.
-                                    let ia = 1.0 - alpha;
-                                    lr = overlay[ov_idx] * alpha + lr * ia;
-                                    lg = overlay[ov_idx + 1] * alpha + lg * ia;
-                                    lb = overlay[ov_idx + 2] * alpha + lb * ia;
-                                }
-                            }
-                        }
-                    }
                     pixels[dst_idx] = (lr.max(0.).sqrt()) as u8;
                     pixels[dst_idx + 1] = (lg.max(0.).sqrt()) as u8;
                     pixels[dst_idx + 2] = (lb.max(0.).sqrt()) as u8;
