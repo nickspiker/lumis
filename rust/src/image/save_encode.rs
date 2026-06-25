@@ -186,13 +186,33 @@ pub fn quad_to_rgb8(
 }
 
 /// Encode RGB8 to JPEG bytes (quality 95), tagged with the Rec.2020 ICC profile (APP2 marker).
-pub fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+pub fn encode_jpeg(rgb: &[u8], width: u32, height: u32, description: &str) -> Option<Vec<u8>> {
     use crate::image::icc::{jpeg_with_icc, rec2020_icc};
     let mut out = Cursor::new(Vec::new());
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95);
     enc.encode(rgb, width, height, image::ColorType::Rgb8)
         .ok()?;
-    Some(jpeg_with_icc(&out.into_inner(), rec2020_icc()))
+    let with_icc = jpeg_with_icc(&out.into_inner(), rec2020_icc());
+    Some(jpeg_with_comment(&with_icc, description))
+}
+
+/// Insert a JPEG COM (comment) marker carrying `text` right after SOI. exiftool/most tools surface this
+/// as the image Comment. Used to carry the exposure summary (per-frame + composite), matching DNG/TIFF.
+/// Empty text returns the input unchanged. The COM payload is capped at the 65533-byte marker limit.
+fn jpeg_with_comment(jpeg: &[u8], text: &str) -> Vec<u8> {
+    if text.is_empty() || jpeg.len() < 2 {
+        return jpeg.to_vec();
+    }
+    let bytes = text.as_bytes();
+    let payload = &bytes[..bytes.len().min(65533)];
+    let seg_len = (payload.len() + 2) as u16; // length field includes its own 2 bytes
+    let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+    out.extend_from_slice(&jpeg[0..2]); // SOI
+    out.extend_from_slice(&[0xFF, 0xFE]); // COM marker
+    out.extend_from_slice(&seg_len.to_be_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&jpeg[2..]); // rest of the JPEG
+    out
 }
 
 /// Encode RGB8 to lossless Deflate-compressed TIFF bytes, with a small JPEG thumbnail embedded in a chained IFD1.
@@ -200,7 +220,7 @@ pub fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 /// The `image` crate's TIFF encoder is uncompressed-only, so we use the `tiff` crate directly to get lossless Deflate (≈1.5-2x smaller than raw RGB, still universally readable).
 ///
 /// Big 50MP TIFFs fail to thumbnail in Android file managers/galleries (ExifInterface logs "No image meets the size requirements of a thumbnail image"). The `tiff` crate writes IFD0 with a next-IFD pointer of 0 and does not expose that pointer, so we post-process its output: append a thumbnail JPEG and a chained IFD1 (classic TIFF thumbnail convention - exiftool/galleries read IFD1 of a TIFF as the thumbnail), then patch IFD0's next-IFD u32 to point at IFD1. If thumbnail generation fails we still return the valid TIFF without a thumbnail rather than failing the whole save.
-pub fn encode_tiff(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+pub fn encode_tiff(rgb: &[u8], width: u32, height: u32, description: &str) -> Option<Vec<u8>> {
     use crate::image::icc::rec2020_icc;
     use tiff::encoder::{colortype::RGB8, compression::Deflate, TiffEncoder};
     use tiff::tags::Tag;
@@ -215,6 +235,14 @@ pub fn encode_tiff(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
             .encoder()
             .write_tag(Tag::Unknown(34675), rec2020_icc())
             .ok()?;
+        // ImageDescription (tag 270): the exposure summary (per-frame + composite/effective), matching
+        // the DNG. Skip when empty so we don't write a stray empty tag.
+        if !description.is_empty() {
+            image
+                .encoder()
+                .write_tag(Tag::Unknown(270), description)
+                .ok()?;
+        }
         image.write_data(rgb).ok()?;
     }
     let tiff = out.into_inner();

@@ -774,10 +774,10 @@ impl CameraIntegrator {
                     };
                     let encoded = match save_format {
                         SAVE_FORMAT_TIFF => {
-                            encode_tiff(&rgb, ow as u32, oh as u32).map(|b| (b, "tiff"))
+                            encode_tiff(&rgb, ow as u32, oh as u32, &exposure_desc).map(|b| (b, "tiff"))
                         }
                         SAVE_FORMAT_JPEGXL => encode_jpegxl(&rgb, ow, oh).map(|b| (b, "jxl")),
-                        _ => encode_jpeg(&rgb, ow as u32, oh as u32).map(|b| (b, "jpg")),
+                        _ => encode_jpeg(&rgb, ow as u32, oh as u32, &exposure_desc).map(|b| (b, "jpg")),
                     };
                     match encoded {
                         Some((b, e)) => (b, e),
