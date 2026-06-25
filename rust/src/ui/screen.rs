@@ -347,9 +347,10 @@ fn draw_calibration_screen(
     draw_fancy_button(pixels, w as usize, h, rect, "FINALIZE", false, &mut ui.text_renderer);
 }
 
-// The finalized dark frame, brightened so the noise is visible. Renders the per-pixel mean (in
-// image_buffer slot 0) fit-to-screen with a gamma of ~4 (double sqrt) and NO scaling - the raw dark
-// level, just lifted into a visible range. A tap returns to the menu (handled in touch.rs).
+// The finalized dark frame, brightened so the noise is visible: fit-to-screen, mean-subtracted (so the
+// brighter half of pixels - hot pixels and high-noise excursions - show against the frame's own centre),
+// auto-scaled to the positive spread, and gamma-4 (double sqrt) stretched. A tap exits (handled in
+// touch.rs). If this still looks flat black, the capture itself is suspect (e.g. sensor clamping at max ISO).
 fn draw_calibration_result(
     ui: &mut UserInterface,
     pixels: &mut [u8],
@@ -371,18 +372,36 @@ fn draw_calibration_result(
     let dh = (ih as f32 * scale) as usize;
     let off_x = (sw - dw) / 2;
     let off_y = (sh - dh) / 2;
-    // A dark frame sits just above the sensor black level (~black_level on a 0..65535 scale), so the
-    // raw values are all ~6% grey - displaying them straight gives a flat grey box. Subtract the black
-    // pedestal first so 0 maps to black, THEN apply the strong gamma-4 (double sqrt) stretch: now the
-    // small per-pixel noise/hot-pixel excursions above black fill the visible range.
-    let black = ui.raw_black_level as f32;
-    let span = (65535.0 - black).max(1.0);
+    // Subtract the frame's OWN mean rather than the metadata black level: at extreme ISO the reported
+    // black point is unreliable (often wrong), so subtracting it over/undershoots and the preview goes
+    // flat/dark. The mean is the true centre of THIS data, so subtracting it puts ~half the pixels - the
+    // brighter half (hot pixels, high-noise excursions, exactly what we want to inspect) - above zero,
+    // and the gamma-4 (double sqrt) stretch lifts them into view. One O(n) pass for the mean (median
+    // would be a full sort - far too slow over 50MP for a UI render). span auto-scales to the positive
+    // spread so the visible noise fills the brightness range regardless of absolute level.
+    let npix = iw * ih;
+    let mut sum = 0.0f64;
+    for i in 0..npix {
+        sum += ui.image_buffer[i] as f64;
+    }
+    let mean = (sum / npix as f64) as f32;
+    // Auto-scale: max positive excursion above the mean (sampled cheaply by stepping) sets full white.
+    let mut max_above = 1.0f32;
+    let mut i = 0usize;
+    while i < npix {
+        let d = ui.image_buffer[i] as f32 - mean;
+        if d > max_above {
+            max_above = d;
+        }
+        i += 37; // sparse sample - enough to find the bright tail without a second full pass
+    }
+    let span = max_above.max(1.0);
     for dy in 0..dh {
         let sy = (dy as f32 / scale) as usize;
         for dx in 0..dw {
             let sx = (dx as f32 / scale) as usize;
-            let raw = ui.image_buffer[(sy * iw + sx).min(iw * ih - 1)] as f32;
-            let v = ((raw - black) / span).max(0.0); // black-subtracted, 0..1
+            let raw = ui.image_buffer[(sy * iw + sx).min(npix - 1)] as f32;
+            let v = ((raw - mean) / span).max(0.0); // mean-subtracted, 0..1 over the positive spread
             // gamma 4 = double sqrt: cheap and strongly brightens the dark-frame noise.
             let b = (v.sqrt().sqrt() * 255.0).min(255.0) as u8;
             let off = ((off_y + dy) * sw + (off_x + dx)) * 3;
