@@ -1349,6 +1349,14 @@ class CameraProcessor(private val service: CameraInterface) {
                val builder = buildManualRequest(device)
                session.setRepeatingRequest(builder.build(), captureCallback, backgroundHandler)
                Log.i("CameraInterface", "Calibration: skipped AE warm-up, manual capture at ISO=$calIso shutter=${calShutterNs}ns")
+               // Hand the UI the shared-memory FD NOW. Normally this is piggybacked on the first
+               // delivered frame, but a calibration's first frame is ~16s away (long exposure) - waiting
+               // for it would trip the UI's focus/timeout auto-nuke and kill both processes. Launch the
+               // UI immediately so it switches to the stats screen and starts heartbeating.
+               if (replyMessenger != null) {
+                   service.onCameraInitializationComplete(replyMessenger)
+                   replyMessenger = null
+               }
            } catch (e: Exception) {
                Log.e("CameraInterface", "Failed to start calibration manual capture: $e")
            }
