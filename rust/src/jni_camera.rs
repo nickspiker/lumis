@@ -357,12 +357,17 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeClearSaveInProgres
     _env: JNIEnv<'local>,
     _this: JObject<'local>,
     ptr: jlong,
+    wrote: jboolean,
 ) {
     let integrator = integrator_ptr(ptr);
 
-    // Clear both CURRENTLY_SAVING and MANUAL_SAVE bits, increment saved counter
+    // Clear both CURRENTLY_SAVING and MANUAL_SAVE bits. Only bump the saved counter when a NEW file was
+    // actually written - a dedup skip (filename already on disk) still shows the green save indicator but
+    // must NOT increment the counter, since nothing new was saved.
     integrator.header[FLAGS_IDX] &= !(CURRENTLY_SAVING | MANUAL_SAVE_BIT);
-    integrator.header[SAVED_COUNTER_IDX] += 1;
+    if wrote != 0 {
+        integrator.header[SAVED_COUNTER_IDX] += 1;
+    }
 
     if crate::DEBUG {
         info!(

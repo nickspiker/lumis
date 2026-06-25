@@ -186,11 +186,16 @@ class CameraInterface : Service() {
        // Static instance reference for JNI access
        @JvmStatic
        var instance: CameraInterface? = null
-       
+
+       // saveImageToMediaStoreImpl status codes.
+       const val SAVE_FAILED = -1
+       const val SAVE_DUPLICATE = 0 // filename already on disk: skipped, success-for-indicator, NOT a new save
+       const val SAVE_WRITTEN = 1
+
        // Static method called from JNI to save DNG data
        @JvmStatic
        fun saveDngData(dngData: ByteArray, filename: String): Boolean {
-           return instance?.saveImageToMediaStoreImpl(dngData, filename, "image/x-adobe-dng") ?: false
+           return (instance?.saveImageToMediaStoreImpl(dngData, filename, "image/x-adobe-dng") ?: SAVE_FAILED) != SAVE_FAILED
        }
 
        init {
@@ -200,7 +205,8 @@ class CameraInterface : Service() {
    
    // Native methods
    external fun nativeGetSavedDngData(): SaveDng?
-   external fun nativeClearSaveInProgress(ptr: Long)
+   // wrote = true only when a NEW file was written (so the saved counter bumps). A dedup skip passes false.
+   external fun nativeClearSaveInProgress(ptr: Long, wrote: Boolean)
 
    // Map the Rust-assigned file extension to a MediaStore mime type.
    fun mimeForFilename(filename: String): String = when (filename.substringAfterLast('.').lowercase()) {
@@ -211,14 +217,16 @@ class CameraInterface : Service() {
    }
 
    // Called from JNI to save image data using MediaStore
-   fun saveImageToMediaStoreImpl(imageData: ByteArray, filename: String, mimeType: String): Boolean {
+   // Returns a save status: SAVE_WRITTEN (a new file was written), SAVE_DUPLICATE (filename already on
+   // disk - skipped, still a "success" for the green indicator but NOT a new save), or SAVE_FAILED.
+   fun saveImageToMediaStoreImpl(imageData: ByteArray, filename: String, mimeType: String): Int {
        Log.i("CameraInterface", "Attempting to save: $filename")
-       
+
        // Check if file already exists
        val projection = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DISPLAY_NAME)
        val selection = "${MediaStore.Images.Media.DISPLAY_NAME} = ?"
        val selectionArgs = arrayOf(filename)
-       
+
        contentResolver.query(
            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
            projection,
@@ -230,7 +238,7 @@ class CameraInterface : Service() {
                val existingName = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME))
                // Skip the save: a matching capture-time filename means this exact frame is already saved. This guard is LOAD-BEARING - verified on-device that without it MediaStore writes the full bytes again AND renames the duplicate to " (1)" (no content check, no write-and-forget). Since the filename encodes the capture timestamp (down to the millisecond), a name match reliably means identical content.
                Log.i("CameraInterface", "File already exists: '$existingName' - skipping save to prevent duplicate")
-               return true // File exists, don't save again
+               return SAVE_DUPLICATE // File exists, don't save again (and don't bump the counter)
            } else {
                Log.i("CameraInterface", "No existing file found with name: $filename - proceeding with save")
            }
@@ -247,7 +255,7 @@ class CameraInterface : Service() {
        
        if (imageData.isEmpty()) {
            Log.e("CameraInterface", "Refusing to save '$filename': image data is empty (0 bytes)")
-           return false
+           return SAVE_FAILED
        }
        return try {
            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
@@ -263,7 +271,7 @@ class CameraInterface : Service() {
                    // 0-byte entry that the media scanner reaps. Delete it and report failure.
                    Log.e("CameraInterface", "0 bytes written for '$filename' - deleting dangling entry")
                    contentResolver.delete(uri, null, null)
-                   return false
+                   return SAVE_FAILED
                }
 
                // Mark as complete (Android 10+)
@@ -278,16 +286,16 @@ class CameraInterface : Service() {
                    if (cursor.moveToFirst()) cursor.getString(0) else null
                }
                Log.i("CameraInterface", "Saved image to MediaStore - requested: '$filename', actual: '$actualName', bytes: $written, uri: $uri")
-               true
+               SAVE_WRITTEN
            } else {
                Log.e("CameraInterface", "Failed to create MediaStore entry for $filename (insert returned null)")
-               false
+               SAVE_FAILED
            }
        } catch (e: Exception) {
            // Broadened from IOException: a bad DISPLAY_NAME (illegal chars) or unsupported MIME throws
            // IllegalArgumentException from insert(), which previously escaped uncaught and lost the save.
            Log.e("CameraInterface", "Failed to save image '$filename': ${e.javaClass.simpleName}: ${e.message}")
-           false
+           SAVE_FAILED
        }
    }
    
@@ -1065,13 +1073,15 @@ class CameraProcessor(private val service: CameraInterface) {
        service.nativeGetSavedDngData()?.let { savedData: SaveDng ->
            val mimeType = service.mimeForFilename(savedData.filename)
            Log.i("CameraInterface", "Processing saved image: ${savedData.dngData.size} bytes, filename: ${savedData.filename}, mime: $mimeType")
-           if (service.saveImageToMediaStoreImpl(savedData.dngData, savedData.filename, mimeType)) {
-               Log.i("CameraInterface", "Successfully saved: ${savedData.filename}")
-               service.nativeClearSaveInProgress(service.nativeCameraContextPtr)
-           } else {
-               Log.e("CameraInterface", "Failed to save: ${savedData.filename}")
-               service.nativeClearSaveInProgress(service.nativeCameraContextPtr)
+           val status = service.saveImageToMediaStoreImpl(savedData.dngData, savedData.filename, mimeType)
+           when (status) {
+               CameraInterface.SAVE_WRITTEN -> Log.i("CameraInterface", "Successfully saved: ${savedData.filename}")
+               CameraInterface.SAVE_DUPLICATE -> Log.i("CameraInterface", "Duplicate (not re-saved, counter unchanged): ${savedData.filename}")
+               else -> Log.e("CameraInterface", "Failed to save: ${savedData.filename}")
            }
+           // Bump the saved counter only on a genuinely new file; a dedup skip still clears the in-progress
+           // flag (and shows the green indicator) but must not increment.
+           service.nativeClearSaveInProgress(service.nativeCameraContextPtr, status == CameraInterface.SAVE_WRITTEN)
        }
    }
 
