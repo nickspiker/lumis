@@ -368,7 +368,7 @@ impl CameraIntegrator {
         // throttled progress stats, and finalize-to-disk on request. Handled entirely here so the
         // verified normal exposure path below is never touched while calibrating.
         if (self.header[FLAGS_IDX] & CALIBRATING_BIT) != 0 {
-            self.process_calibration_frame(frame_data, _captured_shutter_ns);
+            self.process_calibration_frame(frame_data);
             // Return the header's current (forced) settings so Kotlin keeps pushing them to the HAL,
             // same as the normal path's tail return.
             return (
@@ -744,29 +744,15 @@ impl CameraIntegrator {
     /// sample-only even/odd half-sum for the live split-half convergence correlation, writes throttled
     /// progress stats to shared memory (gated at ~1.5s so 16s darks snapshot every frame while fast bias
     /// frames throttle), and finalizes to disk + stops when the UI sets CAL_FINALIZE_BIT.
-    fn process_calibration_frame(&mut self, frame_data: &[u8], captured_shutter_ns: i64) {
+    fn process_calibration_frame(&mut self, frame_data: &[u8]) {
         let pixel_count = self.width * self.height;
 
-        // Reject contaminated transitional frames: when a calibration camera opens, the AE-warmup tail
-        // and the switch-to-manual deliver a few SHORT-exposure frames before the forced calibration
-        // shutter actually takes effect. Only accumulate a frame whose ACTUAL shutter matches the forced
-        // one (within 10%), so those fast frames can't pollute the dark/bias average. This is why the
-        // count used to jump 1 -> 5 instantly then settle to one per 16s.
-        let forced_shutter_ns = f64::from_bits(self.header[SHUTTER_NS_IDX]);
-        if forced_shutter_ns > 0.0 && captured_shutter_ns > 0 {
-            let ratio = captured_shutter_ns as f64 / forced_shutter_ns;
-            if !(0.9..=1.1).contains(&ratio) {
-                // Log every reject so we can confirm whether skipping AE warm-up (Kotlin side) already
-                // removed these at the source - if this never fires now, the gate is redundant insurance.
-                log::info!(
-                    "Calibration: rejected frame (shutter {}ns vs forced {:.0}ns, ratio {:.3})",
-                    captured_shutter_ns, forced_shutter_ns, ratio
-                );
-                return; // not at the forced exposure yet - skip (don't count, don't init)
-            }
-        }
+        // No exposure gate needed: calibration skips AE warm-up and goes straight to the forced manual
+        // exposure (CameraProcessor.startCapture), so every delivered frame is already at the calibration
+        // shutter - there are no contaminated transitional frames to reject. (Confirmed on-device: zero
+        // rejects with the warm-up skip in place.)
 
-        // First (matching) calibration frame: (re)initialise the accumulators and the correlation sample.
+        // First calibration frame: (re)initialise the accumulators and the correlation sample.
         if self.cal.is_none() {
             for i in 0..pixel_count {
                 self.integration_buffer.accumulated[i] = 0;
