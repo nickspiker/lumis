@@ -723,6 +723,13 @@ fn get_element_from_touch(ui: &mut UserInterface, x: f32, y: f32) -> Option<Trac
         );
     }
 
+    // Track 1 is FOCUS. On a fixed-focus lens (min focus distance 0, e.g. the 0.5x ultrawide) focus
+    // can't be controlled, so the track is greyed and its touches are inert - return None here so no
+    // arrow/slider/drag is produced for it.
+    if track == 1 && ui.min_focus_distance <= 0.0 {
+        return None;
+    }
+
     match track {
         // Tracks 0-4: Sliders with arrows
         0..=4 => {

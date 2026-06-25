@@ -1369,7 +1369,19 @@ class CameraProcessor(private val service: CameraInterface) {
        val b = device.createCaptureRequest(CameraDevice.TEMPLATE_MANUAL)
        b.addTarget(imageReader!!.surface)
        // Manual sensor keys on the logical request propagate to the single physical RAW stream on this HAL, so per-physical-camera keys aren't needed (and setPhysicalCameraKey is rejected for a non-streaming-config physical id).
+       // Full manual via CONTROL_MODE_OFF. NOTE on manual focus across devices: the AOSP 3A spec says
+       // CONTROL_MODE_OFF disables the whole AF subsystem (CONTROL_AF_MODE is "only effective if
+       // CONTROL_MODE == AUTO"), so strictly-spec-compliant HALs won't drive the focus actuator here.
+       // - Pixel: lenient - honors LENS_FOCUS_DISTANCE under CONTROL_MODE_OFF, so manual focus WORKS.
+       // - Samsung (Note 10): will NOT move the lens on the RAW pipeline under manual mode. We tried the
+       //   documented CONTROL_MODE_AUTO + AE_MODE_OFF + AF_MODE_OFF workaround; it made things worse (the
+       //   HAL then OVERRODE our LENS_FOCUS_DISTANCE, parking focus at closest) without ever racking the
+       //   lens. This is the known Samsung "manual controls don't apply on the RAW stream" limitation
+       //   (cf. FreeDcam #48), not a Lumis bug - the focus value is plumbed correctly end to end. So we
+       //   keep CONTROL_MODE_OFF (solid manual exposure everywhere, working focus on Pixel) and accept
+       //   that manual focus is a no-op on the Note's RAW path.
        b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_OFF)
+       b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
        b.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
        b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentShutterSpeedNs)
        b.set(CaptureRequest.LENS_FOCUS_DISTANCE, currentFocusDistance)

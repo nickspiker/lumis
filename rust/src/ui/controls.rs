@@ -132,6 +132,16 @@ pub fn draw_controls(
             if track < 5 {
                 let slider_value = slider_values[track];
                 let slider_horizontal = slider_to_horizontal(ui, slider_value as f32);
+                // Track 1 is FOCUS. A fixed-focus lens (e.g. the 0.5x ultrawide) reports min focus
+                // distance 0, so focus can't be controlled - draw that track greyed (and the touch
+                // handler ignores it) instead of a live black/white slider.
+                let focus_disabled = track == 1 && ui.min_focus_distance <= 0.0;
+                // Greyed slider colours when disabled; normal white(left)/black(right) otherwise.
+                let (lr, lg, lb, rr, rg, rb) = if focus_disabled {
+                    (90u8, 90, 90, 60, 60, 60)
+                } else {
+                    (255u8, 255, 255, 0, 0, 0)
+                };
 
                 let (start_x, start_y) = user_to_screen(ui, slider_start, track_center);
                 let (pos_x, pos_y) = user_to_screen(ui, slider_horizontal, track_center);
@@ -140,17 +150,17 @@ pub fn draw_controls(
                 for y in start_y.min(pos_y) as usize..=start_y.max(pos_y) as usize {
                     for x in start_x.min(pos_x) as usize..=start_x.max(pos_x) as usize {
                         let idx = (y * screen_buffer.stride as usize + x) * 3;
-                        pixels[idx] = 255;
-                        pixels[idx + 1] = 255;
-                        pixels[idx + 2] = 255;
+                        pixels[idx] = lr;
+                        pixels[idx + 1] = lg;
+                        pixels[idx + 2] = lb;
                     }
                 }
                 for y in end_y.min(pos_y) as usize..=end_y.max(pos_y) as usize {
                     for x in end_x.min(pos_x) as usize..=end_x.max(pos_x) as usize {
                         let idx = (y * screen_buffer.stride as usize + x) * 3;
-                        pixels[idx] = 0;
-                        pixels[idx + 1] = 0;
-                        pixels[idx + 2] = 0;
+                        pixels[idx] = rr;
+                        pixels[idx + 1] = rg;
+                        pixels[idx + 2] = rb;
                     }
                 }
 
