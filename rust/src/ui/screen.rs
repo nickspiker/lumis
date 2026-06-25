@@ -249,6 +249,20 @@ fn draw_calibration_screen(
     let mean = f64::from_bits(ui.header[CAL_MEAN_IDX]);
     let noise = f64::from_bits(ui.header[CAL_NOISE_IDX]);
 
+    // Record one noise sample per new frame (the stats publish on a throttle, so dedup on frame count).
+    // A reset (frame count went backwards, e.g. a new capture) clears the history.
+    if frames < ui.cal_noise_last_frame {
+        ui.cal_noise_history.clear();
+    }
+    if frames > 0 && frames != ui.cal_noise_last_frame {
+        ui.cal_noise_history.push(noise as f32);
+        ui.cal_noise_last_frame = frames;
+        // Cap the history so the plot stays bounded on very long runs (keep the most recent points).
+        if ui.cal_noise_history.len() > 2048 {
+            ui.cal_noise_history.remove(0);
+        }
+    }
+
     let cx = w as f32 / 2.;
     let line_h = h as f32 * 0.055;
     let size = line_h * 0.6;
@@ -278,6 +292,54 @@ fn draw_calibration_screen(
         let y = y0 + i as f32 * line_h + if i > 0 { line_h * 0.5 } else { 0. };
         ui.text_renderer
             .draw_text_center(pixels, w, h, text, cx, y, size, 0, *r, *g, *b, 0);
+    }
+
+    // Noise-over-time graph: the ~1/sqrt(N) decrease. Auto-scaled Y to the data range so the curve fills
+    // the plot and the flattening is obvious; the user watches it level off and taps FINALIZE when happy.
+    let gx0 = (w as f32 * 0.12) as usize;
+    let gx1 = (w as f32 * 0.88) as usize;
+    let gy0 = (h as f32 * 0.50) as usize;
+    let gy1 = (h as f32 * 0.72) as usize;
+    // Plot border (dim grey).
+    for x in gx0..gx1 {
+        for &yy in &[gy0, gy1 - 1] {
+            let off = (yy * w as usize + x) * 3;
+            if off + 2 < pixels.len() {
+                pixels[off] = 0x40;
+                pixels[off + 1] = 0x40;
+                pixels[off + 2] = 0x40;
+            }
+        }
+    }
+    let hist = &ui.cal_noise_history;
+    if hist.len() >= 2 {
+        let nmin = hist.iter().cloned().fold(f32::MAX, f32::min);
+        let nmax = hist.iter().cloned().fold(f32::MIN, f32::max);
+        let range = (nmax - nmin).max(1e-6);
+        let gw = (gx1 - gx0) as f32;
+        let gh = (gy1 - gy0) as f32;
+        let plot_x = |i: usize| gx0 as f32 + gw * i as f32 / (hist.len() - 1) as f32;
+        // Higher noise = higher on screen (smaller y). Map value -> y within the plot box.
+        let plot_y = |v: f32| gy1 as f32 - gh * (v - nmin) / range;
+        // Draw line segments between consecutive points (simple DDA), in green.
+        for i in 0..hist.len() - 1 {
+            let (x0, y0p) = (plot_x(i), plot_y(hist[i]));
+            let (x1, y1p) = (plot_x(i + 1), plot_y(hist[i + 1]));
+            let steps = ((x1 - x0).abs().max((y1p - y0p).abs())).ceil().max(1.0) as usize;
+            for s in 0..=steps {
+                let t = s as f32 / steps as f32;
+                let px = (x0 + (x1 - x0) * t) as usize;
+                let py = (y0p + (y1p - y0p) * t) as usize;
+                if px < w as usize && py < h as usize {
+                    let off = (py * w as usize + px) * 3;
+                    if off + 2 < pixels.len() {
+                        pixels[off] = 0x40;
+                        pixels[off + 1] = 0xFF;
+                        pixels[off + 2] = 0x60;
+                    }
+                }
+            }
+        }
     }
 
     // FINALIZE button - a teal bar near the bottom. Rect kept in sync with the touch hit-test.
@@ -332,12 +394,19 @@ fn draw_calibration_result(
     let dh = (ih as f32 * scale) as usize;
     let off_x = (sw - dw) / 2;
     let off_y = (sh - dh) / 2;
+    // A dark frame sits just above the sensor black level (~black_level on a 0..65535 scale), so the
+    // raw values are all ~6% grey - displaying them straight gives a flat grey box. Subtract the black
+    // pedestal first so 0 maps to black, THEN apply the strong gamma-4 (double sqrt) stretch: now the
+    // small per-pixel noise/hot-pixel excursions above black fill the visible range.
+    let black = ui.raw_black_level as f32;
+    let span = (65535.0 - black).max(1.0);
     for dy in 0..dh {
         let sy = (dy as f32 / scale) as usize;
         for dx in 0..dw {
             let sx = (dx as f32 / scale) as usize;
-            let v = ui.image_buffer[(sy * iw + sx).min(iw * ih - 1)] as f32 / 65535.0;
-            // gamma 4 = double sqrt: cheap and strongly brightens the dark frame.
+            let raw = ui.image_buffer[(sy * iw + sx).min(iw * ih - 1)] as f32;
+            let v = ((raw - black) / span).max(0.0); // black-subtracted, 0..1
+            // gamma 4 = double sqrt: cheap and strongly brightens the dark-frame noise.
             let b = (v.sqrt().sqrt() * 255.0).min(255.0) as u8;
             let off = ((off_y + dy) * sw + (off_x + dx)) * 3;
             if off + 2 < pixels.len() {

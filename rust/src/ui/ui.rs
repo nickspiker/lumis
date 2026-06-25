@@ -193,6 +193,11 @@ pub struct UserInterface {
     // Counter text save/restore for partial redraws
     pub counter_buffers: Vec<Vec<u8>>, // 4 buffers for saved/frame/fps/format
     pub counter_areas: Vec<(usize, usize, usize, usize)>, // (x, y, end_x, end_y) for each
+    // Dark-frame calibration: history of the noise stat sampled over the capture, for the live noise
+    // graph on the stats screen. Appended (deduped on the frame count) as the capture runs so the user
+    // can watch the ~1/sqrt(N) decrease flatten and stop when satisfied. Reset when a capture starts.
+    pub cal_noise_history: Vec<f32>,
+    pub cal_noise_last_frame: u64, // frame count of the last appended sample (dedup)
 }
 
 impl UserInterface {
@@ -547,6 +552,8 @@ impl UserInterface {
             previous_histogram_counter: 0,
             counter_buffers: vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             counter_areas: vec![(0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)],
+            cal_noise_history: Vec::new(),
+            cal_noise_last_frame: 0,
         };
 
         if crate::DEBUG {
