@@ -41,6 +41,11 @@ pub const CAL_CORRELATION_IDX: usize = 50; // f64 bits: split-half correlation (
 pub const CAL_MEAN_IDX: usize = 51; // f64 bits: mean dark level across the frame (raw counts)
 pub const CAL_NOISE_IDX: usize = 52; // f64 bits: residual per-pixel noise std (falls ~1/sqrt(N) as it converges)
 
+// JXL save support, probed by Kotlin at startup (some devices' MediaStore reject image/jxl). 0 = unknown
+// (treat as supported - the default), 1 = supported, 2 = NOT supported (the save-format cycle skips JXL
+// and the default falls back to JPEG). Numbered so the zero-init default doesn't accidentally disable JXL.
+pub const JXL_SUPPORTED_IDX: usize = 53;
+
 pub const IMAGE_START: usize = 64;
 
 // Save format values (SAVE_FORMAT_IDX). Numbered to match the tap-cycle order JXL -> JPEG -> DNG -> TIFF, and JXL is 0 so it's the zero-initialized default.

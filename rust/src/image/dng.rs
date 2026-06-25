@@ -51,6 +51,8 @@ pub fn initialize_raw_info() -> RawInfo {
         cfapatternoffset: 0,
         preview_jpeg: None,
         preview_dims: (0, 0),
+        description: String::new(),
+        descriptionoffset: 0,
     }
 }
 pub struct RawInfo {
@@ -90,6 +92,11 @@ pub struct RawInfo {
     pub preview_jpeg: Option<Vec<u8>>,
     /// The preview JPEG's pixel dimensions (width, height), needed for IFD1's ImageWidth/ImageLength. Only read when preview_jpeg is Some.
     pub preview_dims: (u32, u32),
+    /// Human-readable exposure summary written to ImageDescription (TIFF tag 270). Carries per-frame and
+    /// composite/effective exposure (the integrator knows frame_count, per-frame shutter and ISO at save).
+    /// Empty = tag omitted. Structured exposure fields are deferred to the VSF rollout.
+    pub description: String,
+    pub descriptionoffset: u32,
 }
 
 pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
@@ -121,6 +128,18 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
 
     basedng.extend([6, 1, 3, 0, 1, 0, 0, 0, 35, 128, 0, 0]); //Photometric interpretation
     numifd += 1;
+
+    // ImageDescription (tag 270 = 0x010E). ASCII, out-of-line like Make/Model. Ordering: sits between
+    // Photometric (262) and Make (271), as TIFF requires ascending tag ids. Only emitted when set.
+    if !rawinfo.description.is_empty() {
+        basedng.extend([14, 1, 2, 0]); //ImageDescription
+        let mut descstr = rawinfo.description.clone();
+        descstr.push('\0');
+        basedng.extend((descstr.len() as u32).to_le_bytes());
+        rawinfo.descriptionoffset = basedng.len() as u32;
+        basedng.extend([0; 4]);
+        numifd += 1;
+    }
 
     basedng.extend([15, 1, 2, 0]); //Make
     let mut makestr = rawinfo.make.clone();
@@ -259,6 +278,20 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
     basedng[rawinfo.makeoffset as usize + 2] = offset[2];
     basedng[rawinfo.makeoffset as usize + 3] = offset[3];
     basedng.extend(makestr.as_bytes());
+
+    // Append ImageDescription string + patch its offset (only emitted when the tag was written above).
+    if rawinfo.descriptionoffset != 0 {
+        if basedng.len() % word != 0 {
+            basedng.extend(vec![0u8; word - basedng.len() % word]);
+        }
+        let offset = (basedng.len() as u32).to_le_bytes();
+        basedng[rawinfo.descriptionoffset as usize] = offset[0];
+        basedng[rawinfo.descriptionoffset as usize + 1] = offset[1];
+        basedng[rawinfo.descriptionoffset as usize + 2] = offset[2];
+        basedng[rawinfo.descriptionoffset as usize + 3] = offset[3];
+        basedng.extend(rawinfo.description.as_bytes());
+        basedng.push(0); // null terminator
+    }
 
     if basedng.len() % word != 0 {
         basedng.extend(vec![0u8; word - basedng.len() % word]);

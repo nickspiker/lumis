@@ -171,6 +171,11 @@ class CameraInterface : Service() {
        @JvmStatic
        external fun nativeCheckSave(contextPtr: Long)
 
+       // Record whether this device's MediaStore accepts image/jxl (probed once at startup) so the UI
+       // save-format cycle can skip JXL and the save path can fall back to JPEG on devices that reject it.
+       @JvmStatic
+       external fun nativeSetJxlSupported(contextPtr: Long, supported: Boolean)
+
        @JvmStatic
        external fun nativeCameraGetSharedMemoryPtr(contextPtr: Long): Long
        
@@ -208,12 +213,45 @@ class CameraInterface : Service() {
    // wrote = true only when a NEW file was written (so the saved counter bumps). A dedup skip passes false.
    external fun nativeClearSaveInProgress(ptr: Long, wrote: Boolean)
 
-   // Map the Rust-assigned file extension to a MediaStore mime type.
+   // Map the Rust-assigned file extension to a MediaStore mime type. JXL uses its true "image/jxl";
+   // devices whose MediaStore rejects it (older Android) are handled by disabling JXL as a save option
+   // up front (see jxlSupported probe) rather than spoofing the mime - spoofing made MediaStore rename
+   // the file to ".jxl.jpg" (extension corrected to match the fake mime), which is worse.
    fun mimeForFilename(filename: String): String = when (filename.substringAfterLast('.').lowercase()) {
        "dng" -> "image/x-adobe-dng"
        "tiff", "tif" -> "image/tiff"
        "jxl" -> "image/jxl"
        else -> "image/jpeg"
+   }
+
+   // Probe whether MediaStore.Images accepts an "image/jxl" entry on this device. Some (older) Android
+   // versions throw IllegalArgumentException: Unsupported MIME type on insert. We do a no-bytes test
+   // insert into Pictures/Lumis with IS_PENDING, then delete it - if insert throws, JXL is unsupported.
+   // Records the result in shared memory so the UI cycle skips JXL and saves fall back to JPEG.
+   private fun probeAndRecordJxlSupport() {
+       if (nativeCameraContextPtr == 0L) return
+       val supported = try {
+           val values = ContentValues().apply {
+               put(MediaStore.Images.Media.DISPLAY_NAME, ".lumis_jxl_probe.jxl")
+               put(MediaStore.Images.Media.MIME_TYPE, "image/jxl")
+               if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                   put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Lumis")
+                   put(MediaStore.Images.Media.IS_PENDING, 1)
+               }
+           }
+           val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+           if (uri != null) {
+               contentResolver.delete(uri, null, null) // clean up the probe row
+               true
+           } else {
+               false
+           }
+       } catch (e: Exception) {
+           Log.i("CameraInterface", "JXL unsupported by MediaStore on this device: ${e.javaClass.simpleName}")
+           false
+       }
+       Log.i("CameraInterface", "JXL save support: $supported")
+       nativeSetJxlSupported(nativeCameraContextPtr, supported)
    }
 
    // Called from JNI to save image data using MediaStore
@@ -422,6 +460,9 @@ class CameraInterface : Service() {
            seedShutterNs
        )
        cameraProcessor.setNativeContext(nativeCameraContextPtr)
+       // Probe whether this device's MediaStore accepts image/jxl, and record it so the UI cycle skips
+       // JXL / the save path falls back to JPEG on devices (older Android) that reject the mime.
+       probeAndRecordJxlSupport()
        // Engage calibration mode in the integrator (sets CALIBRATING_BIT + CAL_IS_DARK_BIT) so it
        // accumulates mean+variance without per-exposure reset and publishes progress stats.
        if (calibrationMode >= 0) {

@@ -70,9 +70,15 @@ pub fn handle_touch(
 
             // Tapping the top-right counter block cycles the save format. This lives in the margin (handled before the dead-zone check below). counter_areas is kept up to date by save_counter_areas during rendering.
             if point_in_counter_block(ui, x, y) {
-                let next = (ui.header[crate::shared_memory::SAVE_FORMAT_IDX] + 1)
-                    % crate::shared_memory::SAVE_FORMAT_COUNT;
-                ui.header[crate::shared_memory::SAVE_FORMAT_IDX] = next;
+                use crate::shared_memory::*;
+                // Skip JXL in the cycle on devices whose MediaStore rejects image/jxl (flag = 2).
+                let jxl_off = ui.header[JXL_SUPPORTED_IDX] == 2;
+                let mut next =
+                    (ui.header[SAVE_FORMAT_IDX] + 1) % SAVE_FORMAT_COUNT;
+                if jxl_off && next == SAVE_FORMAT_JPEGXL {
+                    next = (next + 1) % SAVE_FORMAT_COUNT;
+                }
+                ui.header[SAVE_FORMAT_IDX] = next;
                 ui.touch_is_dead = true; // consume; don't also drive controls
                 return true; // request redraw so the indicator updates
             }

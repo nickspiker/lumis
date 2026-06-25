@@ -488,7 +488,35 @@ impl CameraIntegrator {
             let bayer_pattern = self.header[SENSOR_BAYER_PATTERN_IDX] as u32;
             let device_orientation = self.header[SENSOR_ORIENTATION_IDX] as u16;
             let pixel_count = self.width * self.height;
-            let save_format = self.header[SAVE_FORMAT_IDX];
+            // JXL fallback: if the format is JXL but this device's MediaStore can't accept it (flag = 2),
+            // save as JPEG instead. Belt-and-suspenders for the zero-init default (JXL=0); the UI cycle
+            // also skips JXL when unsupported, but the very first save could still land on the default.
+            let save_format = {
+                let f = self.header[SAVE_FORMAT_IDX];
+                if f == SAVE_FORMAT_JPEGXL && self.header[JXL_SUPPORTED_IDX] == 2 {
+                    SAVE_FORMAT_JPEG
+                } else {
+                    f
+                }
+            };
+            // Exposure provenance for ImageDescription: per-frame shutter + ISO that the HAL set, the
+            // number of integrated frames, and the composite/effective exposure. Summing/averaging N
+            // frames gathers N x the light, so the EFFECTIVE integration time is N x shutter and the
+            // effective ISO drops by N (the gain you no longer need). frame_count resets per exposure,
+            // so .max(1) guards a mid-first-frame save.
+            let frame_count = self.header[FRAME_COUNTER_IDX].max(1);
+            let per_frame_shutter_ns = f64::from_bits(self.header[SHUTTER_NS_IDX]);
+            let per_frame_iso = f64::from_bits(self.header[ISO_IDX]);
+            let integ_s = per_frame_shutter_ns * frame_count as f64 / 1.0e9;
+            let eff_iso = per_frame_iso / frame_count as f64;
+            let exposure_desc = format!(
+                "Lumis integration: {}x {:.4}s @ ISO {:.0} | effective {:.3}s @ ISO {:.1}",
+                frame_count,
+                per_frame_shutter_ns / 1.0e9,
+                per_frame_iso,
+                integ_s,
+                eff_iso
+            );
             // XYZ matrix for RGB exports, and the magic9inv bytes for the DNG ColorMatrix1. magic_9_dng_xyz lives in zero-initialized shared memory and is only populated by a calibration scan. Pre-calibration it is all zeros, which would multiply every exported pixel to black; fall back to identity so uncalibrated RGB exports show the raw debayered scene (accuracy doesn't matter until calibrated anyway).
             let xyz_matrix = {
                 let m = *self.magic_9_dng_xyz;
@@ -687,6 +715,8 @@ impl CameraIntegrator {
                         cfapatternoffset: 0,
                         preview_jpeg,
                         preview_dims,
+                        description: exposure_desc.clone(),
+                        descriptionoffset: 0,
                     };
                     let mut dng_bytes = make_base_dng(&mut raw_info);
                     let image_bytes = unsafe {

@@ -145,6 +145,27 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCheckFinalizeCalib
     }
 }
 
+/// Record whether this device's MediaStore accepts image/jxl (probed once by Kotlin at startup). Writes
+/// JXL_SUPPORTED_IDX = 1 (supported) or 2 (not), so the UI save-format cycle skips JXL and the save path
+/// falls back to JPEG on devices that reject it.
+#[no_mangle]
+pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeSetJxlSupported(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    ptr: jlong,
+    supported: jboolean,
+) {
+    use crate::shared_memory::*;
+    let integrator = integrator_ptr(ptr);
+    integrator.header[JXL_SUPPORTED_IDX] = if supported != 0 { 1 } else { 2 };
+    // JXL is the zero-init default (format 0). If it's unsupported, move the selected format off JXL to
+    // JPEG so the on-screen indicator matches what actually gets saved (otherwise it shows "JXL" while
+    // the save silently falls back to JPEG - confusing).
+    if supported == 0 && integrator.header[SAVE_FORMAT_IDX] == SAVE_FORMAT_JPEGXL {
+        integrator.header[SAVE_FORMAT_IDX] = SAVE_FORMAT_JPEG;
+    }
+}
+
 /// Poll-driven save check (camera process). Runs try_save from the 30Hz settings poll so a manual save
 /// at a long exposure fires within ~33ms (from the already-published image_buffer) instead of waiting up
 /// to a full exposure for the next frame - the data already exists; only the flag check was frame-gated.
