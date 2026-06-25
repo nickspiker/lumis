@@ -1045,6 +1045,9 @@ class CameraProcessor(private val service: CameraInterface) {
                    // Also poll the save flag so a manual save at a long exposure fires immediately from
                    // the already-integrated frame instead of waiting for the next (up to 16s) frame.
                    CameraInterface.nativeCheckSave(ptr)
+                   // ...and pick up the encoded result + write it to MediaStore here too, so the file
+                   // lands within a poll tick rather than waiting for the next frame to drain it.
+                   drainPendingSave()
                    val s = CameraInterface.nativeGetCurrentSettings(ptr)
                    updateCameraSettings(s.iso, s.shutterNs, s.focusDistance)
                } catch (e: Exception) {
@@ -1052,6 +1055,23 @@ class CameraProcessor(private val service: CameraInterface) {
                }
            }
            backgroundHandler?.postDelayed(this, SETTINGS_POLL_MS)
+       }
+   }
+
+   // Pick up an encoded save from Rust (if any) and write it to MediaStore, then clear the in-progress
+   // flag. Idempotent and safe to call from both the frame handler and the settings poll - whichever runs
+   // first drains it; nativeGetSavedDngData returns null when there's nothing pending.
+   private fun drainPendingSave() {
+       service.nativeGetSavedDngData()?.let { savedData: SaveDng ->
+           val mimeType = service.mimeForFilename(savedData.filename)
+           Log.i("CameraInterface", "Processing saved image: ${savedData.dngData.size} bytes, filename: ${savedData.filename}, mime: $mimeType")
+           if (service.saveImageToMediaStoreImpl(savedData.dngData, savedData.filename, mimeType)) {
+               Log.i("CameraInterface", "Successfully saved: ${savedData.filename}")
+               service.nativeClearSaveInProgress(service.nativeCameraContextPtr)
+           } else {
+               Log.e("CameraInterface", "Failed to save: ${savedData.filename}")
+               service.nativeClearSaveInProgress(service.nativeCameraContextPtr)
+           }
        }
    }
 
@@ -1154,21 +1174,10 @@ class CameraProcessor(private val service: CameraInterface) {
                rowStride
            )
            
-           // Check if there's saved image data to process (any format)
-           service.nativeGetSavedDngData()?.let { savedData: SaveDng ->
-               val mimeType = service.mimeForFilename(savedData.filename)
-               Log.i("CameraInterface", "Processing saved image: ${savedData.dngData.size} bytes, filename: ${savedData.filename}, mime: $mimeType")
-               if (service.saveImageToMediaStoreImpl(savedData.dngData, savedData.filename, mimeType)) {
-                   Log.i("CameraInterface", "Successfully saved: ${savedData.filename}")
-                   // Clear save in progress flag so next save can proceed
-                   service.nativeClearSaveInProgress(service.nativeCameraContextPtr)
-               } else {
-                   Log.e("CameraInterface", "Failed to save DNG: ${savedData.filename}")
-                   // Also clear on failure so we don't block forever
-                   service.nativeClearSaveInProgress(service.nativeCameraContextPtr)
-               }
-           }
-           
+           // Pick up any encoded save and write it to MediaStore. Also done from the settings poll, so a
+           // save at a long exposure lands immediately rather than waiting for this (up to 16s) frame.
+           drainPendingSave()
+
            // Apply camera settings and launch UI immediately
            Log.i("CameraInterface", "Camera settings received: ISO=${cameraSettings.iso}, shutter=${cameraSettings.shutterNs}, focus=${cameraSettings.focusDistance}")
 
