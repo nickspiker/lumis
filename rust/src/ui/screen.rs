@@ -349,7 +349,7 @@ fn draw_calibration_screen(
 
 // The finalized dark frame, brightened so the noise is visible: fit-to-screen, mean-subtracted (so the
 // brighter half of pixels - hot pixels and high-noise excursions - show against the frame's own centre),
-// auto-scaled to the positive spread, and gamma-4 (double sqrt) stretched. A tap exits (handled in
+// auto-scaled to the positive spread, and gamma-2 (single sqrt) stretched. A tap exits (handled in
 // touch.rs). If this still looks flat black, the capture itself is suspect (e.g. sensor clamping at max ISO).
 fn draw_calibration_result(
     ui: &mut UserInterface,
@@ -376,7 +376,7 @@ fn draw_calibration_result(
     // black point is unreliable (often wrong), so subtracting it over/undershoots and the preview goes
     // flat/dark. The mean is the true centre of THIS data, so subtracting it puts ~half the pixels - the
     // brighter half (hot pixels, high-noise excursions, exactly what we want to inspect) - above zero,
-    // and the gamma-4 (double sqrt) stretch lifts them into view. One O(n) pass for the mean (median
+    // and the gamma-2 (single sqrt) stretch lifts them into view. One O(n) pass for the mean (median
     // would be a full sort - far too slow over 50MP for a UI render). span auto-scales to the positive
     // spread so the visible noise fills the brightness range regardless of absolute level.
     let npix = iw * ih;
@@ -402,8 +402,9 @@ fn draw_calibration_result(
             let sx = (dx as f32 / scale) as usize;
             let raw = ui.image_buffer[(sy * iw + sx).min(npix - 1)] as f32;
             let v = ((raw - mean) / span).max(0.0); // mean-subtracted, 0..1 over the positive spread
-            // gamma 4 = double sqrt: cheap and strongly brightens the dark-frame noise.
-            let b = (v.sqrt().sqrt() * 255.0).min(255.0) as u8;
+            // gamma 2 = single sqrt (display-standard). Double-sqrt (gamma 4) over-brightened the noise
+            // floor into a grainy mess; single sqrt keeps the dark frame readable without crushing it bright.
+            let b = (v.sqrt() * 255.0).min(255.0) as u8;
             let off = ((off_y + dy) * sw + (off_x + dx)) * 3;
             if off + 2 < pixels.len() {
                 pixels[off] = b;
