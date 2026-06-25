@@ -517,6 +517,27 @@ impl CameraIntegrator {
                 integ_s,
                 eff_iso
             );
+            // Structured EXIF for the EXIF IFD (DNG/JPEG/TIFF). Uses the COMPOSITE/effective exposure
+            // (integ_s, eff_iso) since that's what the saved image physically represents. Focal length,
+            // aperture and active-array diagonal come from the header (lens metadata, 0 = unknown);
+            // focus distance is FOCUS_IDX in DIOPTERS (1/m), converted to metres for SubjectDistance.
+            let focal_mm = f64::from_bits(self.header[FOCAL_LENGTH_MM_IDX]);
+            let aperture_fnum = f64::from_bits(self.header[APERTURE_FNUM_IDX]);
+            let sensor_diag_mm = f64::from_bits(self.header[SENSOR_DIAG_MM_IDX]);
+            let focus_diopters = f64::from_bits(self.header[FOCUS_IDX]);
+            let focus_distance_m = if focus_diopters > 0.0 { 1.0 / focus_diopters } else { 0.0 };
+            // 35mm-equivalent focal = focal * (43.27 / sensor_diagonal_mm) (43.27 = full-frame diagonal).
+            let focal_35mm = if sensor_diag_mm > 0.0 { focal_mm * 43.27 / sensor_diag_mm } else { 0.0 };
+            let capture_dt: DateTime<Local> = DateTime::<Local>::from(self.last_image_timestamp);
+            let exif = crate::image::dng::ExifData {
+                exposure_time_s: integ_s,
+                iso: eff_iso,
+                f_number: aperture_fnum,
+                focal_length_mm: focal_mm,
+                focal_length_35mm: focal_35mm,
+                subject_distance_m: focus_distance_m,
+                datetime_original: capture_dt.format("%Y:%m:%d %H:%M:%S").to_string(),
+            };
             // XYZ matrix for RGB exports, and the magic9inv bytes for the DNG ColorMatrix1. magic_9_dng_xyz lives in zero-initialized shared memory and is only populated by a calibration scan. Pre-calibration it is all zeros, which would multiply every exported pixel to black; fall back to identity so uncalibrated RGB exports show the raw debayered scene (accuracy doesn't matter until calibrated anyway).
             let xyz_matrix = {
                 let m = *self.magic_9_dng_xyz;
@@ -717,6 +738,8 @@ impl CameraIntegrator {
                         preview_dims,
                         description: exposure_desc.clone(),
                         descriptionoffset: 0,
+                        exif: exif.clone(),
+                        exififdpointeroffset: 0,
                     };
                     let mut dng_bytes = make_base_dng(&mut raw_info);
                     let image_bytes = unsafe {

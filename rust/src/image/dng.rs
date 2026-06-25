@@ -1,5 +1,19 @@
 use std::panic;
 
+/// Structured EXIF values for the EXIF sub-IFD (tag 0x8769), shared by the DNG/JPEG/TIFF writers.
+/// All are the COMPOSITE/effective exposure (what the saved image represents). 0 / empty = omit the tag.
+#[derive(Clone, Default)]
+pub struct ExifData {
+    pub exposure_time_s: f64,
+    pub iso: f64,
+    pub f_number: f64,
+    pub focal_length_mm: f64,
+    pub focal_length_35mm: f64,
+    pub subject_distance_m: f64,
+    pub datetime_original: String, // "YYYY:MM:DD HH:MM:SS" (EXIF format), empty = omit
+}
+
+
 pub fn initialize_raw_info() -> RawInfo {
     RawInfo {
         make: "".to_owned(),
@@ -53,6 +67,8 @@ pub fn initialize_raw_info() -> RawInfo {
         preview_dims: (0, 0),
         description: String::new(),
         descriptionoffset: 0,
+        exif: ExifData::default(),
+        exififdpointeroffset: 0,
     }
 }
 pub struct RawInfo {
@@ -97,6 +113,10 @@ pub struct RawInfo {
     /// Empty = tag omitted. Structured exposure fields are deferred to the VSF rollout.
     pub description: String,
     pub descriptionoffset: u32,
+    /// Structured EXIF values written into an EXIF sub-IFD (tag 0x8769). Default/zeros = no EXIF IFD.
+    pub exif: ExifData,
+    /// Patched with the file offset of the EXIF-IFD-pointer tag's value field (where the sub-IFD offset goes).
+    pub exififdpointeroffset: u32,
 }
 
 pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
@@ -195,6 +215,19 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
     basedng.extend([40, 1, 3, 0, 1, 0, 0, 0, 1, 0, 0, 0]); //Resolution unit
     numifd += 1;
 
+    // SubIFDs (0x014A=330, type 4=LONG): points at the embedded-preview sub-IFD (DNG-spec preview
+    // location; exiftool reports it as PreviewImage). Emitted HERE so tag 330 keeps ascending order
+    // (after ResolutionUnit 296, before CFARepeatPatternDim 33421) - it was previously appended at the
+    // end of IFD0, which tripped exiftool's "SubIFD out of sequence" validation warning. Value (the
+    // sub-IFD offset) is patched once that IFD is written. Absent when there's no preview.
+    let mut subifd_ptr_pos = 0usize;
+    if rawinfo.preview_jpeg.is_some() {
+        basedng.extend([74, 1, 4, 0, 1, 0, 0, 0]); //SubIFDs
+        subifd_ptr_pos = basedng.len();
+        basedng.extend([0, 0, 0, 0]); // placeholder offset, patched after the sub-IFD is written
+        numifd += 1;
+    }
+
     // CFARepeatPatternDim (0x828D): the CFA tile size. 2x2 for a standard Bayer, 4x4 for a quad-Bayer (Tetracell) sensor where 2x2 clusters share a colour.
     let (cfa_dim, cfa_w_h): (u16, u8) = match rawinfo.cfa.len() {
         4 => (2, 2),
@@ -216,6 +249,20 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
         basedng.extend([0, 0, 0, 0]); // placeholder offset, patched below
     }
     numifd += 1;
+
+    // EXIF IFD pointer (tag 0x8769 = 34665, type LONG). Value = offset to the EXIF sub-IFD, patched once
+    // that IFD is written. Tag id 34665 sorts after CFAPattern (33422) and before DNG version (50706),
+    // preserving ascending tag order. Only emitted when there's EXIF data to write.
+    let have_exif = rawinfo.exif.exposure_time_s > 0.0
+        || rawinfo.exif.iso > 0.0
+        || rawinfo.exif.focal_length_mm > 0.0
+        || !rawinfo.exif.datetime_original.is_empty();
+    if have_exif {
+        basedng.extend([105, 135, 4, 0, 1, 0, 0, 0]); // 0x8769, LONG, count 1
+        rawinfo.exififdpointeroffset = basedng.len() as u32;
+        basedng.extend([0, 0, 0, 0]); // placeholder offset, patched after the EXIF IFD is written
+        numifd += 1;
+    }
 
     basedng.extend([18, 198, 1, 0, 4, 0, 0, 0, 1, 5, 0, 0]); //DNG version
     numifd += 1;
@@ -256,14 +303,8 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
     basedng.extend([253, 198, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]); //Colour profile embedding permission
     numifd += 1;
 
-    // SubIFDs (0x014A, type 4=LONG): points at the embedded-preview sub-IFD. This is the DNG-spec preview location (raw tools / exiftool report it as PreviewImage). Only emitted when a preview is present; its value is patched once the sub-IFD's file offset is known. Left absent (no tag) when there's no preview.
-    let mut subifd_ptr_pos = 0usize;
-    if rawinfo.preview_jpeg.is_some() {
-        basedng.extend([74, 1, 4, 0, 1, 0, 0, 0]); //SubIFDs
-        subifd_ptr_pos = basedng.len();
-        basedng.extend([0, 0, 0, 0]); // placeholder offset, patched below
-        numifd += 1;
-    }
+    // (SubIFDs tag 0x014A was emitted earlier, in ascending-tag-id position; subifd_ptr_pos holds its
+    // value-field offset for patching once the sub-IFD is written.)
 
     // Next-IFD pointer. 0 = no chained sibling IFD (the preview is a SubIFD child of IFD0, not a chained IFD1).
     basedng.extend([0, 0, 0, 0]);
@@ -427,6 +468,93 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
             basedng.extend(val.to_le_bytes());
         }
         basedng.extend([0, 0, 0, 0]); // sub-IFD next-IFD pointer = 0 (end of chain)
+    }
+
+    // EXIF sub-IFD (pointed to by tag 0x8769). Built like the preview IFD above: word-align, patch the
+    // pointer's value field to here, write count + entries (ascending tag id) + next-IFD=0. RATIONALs
+    // and the ASCII datetime are written out-of-line AFTER the IFD body; their value fields hold offsets
+    // we patch as we go. SHORT values sit inline in the low 2 bytes. The exif metadata is the composite.
+    if rawinfo.exififdpointeroffset != 0 {
+        if basedng.len() % word != 0 {
+            basedng.extend(vec![0u8; word - basedng.len() % word]);
+        }
+        let exif_ifd_pos = (basedng.len() as u32).to_le_bytes();
+        let p = rawinfo.exififdpointeroffset as usize;
+        basedng[p..p + 4].copy_from_slice(&exif_ifd_pos);
+
+        // Build the entry list. For RATIONAL/ASCII we reserve a value slot now and remember (slot_pos,
+        // payload) to append + patch after the IFD body. SHORT values are inline.
+        let e = &rawinfo.exif;
+        // A rational from an f64 with a fixed denominator that preserves small values.
+        let rat = |v: f64| -> (u32, u32) {
+            if v <= 0.0 { (0, 1) } else if v >= 1.0 { ((v * 1000.0).round() as u32, 1000) } else { (1000, (1000.0 / v).round() as u32) } };
+
+        // (tag, type, count, inline_value_or_0, optional out-of-line payload bytes)
+        let mut entries: Vec<(u16, u16, u32, u32, Option<Vec<u8>>)> = Vec::new();
+        // ExposureTime (0x829A) RATIONAL
+        if e.exposure_time_s > 0.0 {
+            let (n, d) = rat(e.exposure_time_s);
+            let mut b = n.to_le_bytes().to_vec(); b.extend(d.to_le_bytes());
+            entries.push((0x829A, 5, 1, 0, Some(b)));
+        }
+        // FNumber (0x829D) RATIONAL
+        if e.f_number > 0.0 {
+            let (n, d) = rat(e.f_number);
+            let mut b = n.to_le_bytes().to_vec(); b.extend(d.to_le_bytes());
+            entries.push((0x829D, 5, 1, 0, Some(b)));
+        }
+        // ISOSpeedRatings (0x8827) SHORT (inline)
+        if e.iso > 0.0 {
+            entries.push((0x8827, 3, 1, (e.iso.round() as u32).min(65535), None));
+        }
+        // ExifVersion (0x9000) UNDEFINED, "0230" (4 bytes, inline)
+        entries.push((0x9000, 7, 4, u32::from_le_bytes(*b"0230"), None));
+        // DateTimeOriginal (0x9003) ASCII (out-of-line, null-terminated)
+        if !e.datetime_original.is_empty() {
+            let mut b = e.datetime_original.clone().into_bytes(); b.push(0);
+            let cnt = b.len() as u32;
+            entries.push((0x9003, 2, cnt, 0, Some(b)));
+        }
+        // SubjectDistance (0x9206) RATIONAL
+        if e.subject_distance_m > 0.0 {
+            let (n, d) = rat(e.subject_distance_m);
+            let mut b = n.to_le_bytes().to_vec(); b.extend(d.to_le_bytes());
+            entries.push((0x9206, 5, 1, 0, Some(b)));
+        }
+        // FocalLength (0x920A) RATIONAL
+        if e.focal_length_mm > 0.0 {
+            let (n, d) = rat(e.focal_length_mm);
+            let mut b = n.to_le_bytes().to_vec(); b.extend(d.to_le_bytes());
+            entries.push((0x920A, 5, 1, 0, Some(b)));
+        }
+        // FocalLengthIn35mmFilm (0xA405) SHORT (inline)
+        if e.focal_length_35mm > 0.0 {
+            entries.push((0xA405, 3, 1, (e.focal_length_35mm.round() as u32).min(65535), None));
+        }
+
+        basedng.extend((entries.len() as u16).to_le_bytes());
+        // Reserve the 12-byte entries; record where each out-of-line value field sits so we can patch it.
+        let mut patches: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (tag, typ, count, inline, payload) in &entries {
+            basedng.extend(tag.to_le_bytes());
+            basedng.extend(typ.to_le_bytes());
+            basedng.extend(count.to_le_bytes());
+            let valpos = basedng.len();
+            basedng.extend(inline.to_le_bytes());
+            if let Some(bytes) = payload {
+                patches.push((valpos, bytes.clone()));
+            }
+        }
+        basedng.extend([0, 0, 0, 0]); // EXIF IFD next-IFD pointer = 0
+        // Append each out-of-line payload (word-aligned) and patch its value field to the offset.
+        for (valpos, bytes) in patches {
+            if basedng.len() % word != 0 {
+                basedng.extend(vec![0u8; word - basedng.len() % word]);
+            }
+            let off = (basedng.len() as u32).to_le_bytes();
+            basedng[valpos..valpos + 4].copy_from_slice(&off);
+            basedng.extend(&bytes);
+        }
     }
 
     let offset = (basedng.len() as u32).to_le_bytes(); //Assign raw data offset
