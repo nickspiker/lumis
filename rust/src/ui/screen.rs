@@ -391,8 +391,11 @@ fn draw_calibration_result(
             let sx = (dx as f32 / scale) as usize;
             let raw = ui.image_buffer[(sy * iw + sx).min(npix - 1)] as f32;
             let v = ((raw - mean) / span).max(0.0); // mean-subtracted, fixed-range normalised
-            // gamma 2 = single sqrt (display-standard).
-            let b = (v.sqrt() * 255.0).min(255.0) as u8;
+            // gamma 4 (double sqrt): a dark frame IS near-black, so lift it hard to make the noise
+            // structure visible. This was never the brightness bug - the bug was stacking it on the
+            // per-frame auto-scale (now removed). On a FIXED range, gamma 4 lifts both bias and dark
+            // for inspection while keeping bias correctly dimmer than dark.
+            let b = (v.sqrt().sqrt() * 255.0).min(255.0) as u8;
             let off = ((off_y + dy) * sw + (off_x + dx)) * 3;
             if off + 2 < pixels.len() {
                 pixels[off] = b;
