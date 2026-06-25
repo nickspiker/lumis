@@ -342,32 +342,9 @@ fn draw_calibration_screen(
         }
     }
 
-    // FINALIZE button - a teal bar near the bottom. Rect kept in sync with the touch hit-test.
-    let (bx0, by0, bx1, by1) = calibration_finalize_rect(w, h);
-    for py in by0..by1 {
-        for px in bx0..bx1 {
-            let off = (py as usize * w as usize + px as usize) * 3;
-            if off + 2 < pixels.len() {
-                pixels[off] = 0x10;
-                pixels[off + 1] = 0x50;
-                pixels[off + 2] = 0x50;
-            }
-        }
-    }
-    ui.text_renderer.draw_text_center(
-        pixels,
-        w,
-        h,
-        "FINALIZE",
-        cx,
-        (by0 + by1) as f32 / 2. - size * 0.5,
-        size,
-        0,
-        0x60,
-        0xFF,
-        0xFF,
-        0,
-    );
+    // FINALIZE button - the menu's rounded teal style. Rect is shared with the touch hit-test.
+    let rect = calibration_finalize_rect(w, h);
+    draw_fancy_button(pixels, w as usize, h, rect, "FINALIZE", false, &mut ui.text_renderer);
 }
 
 // The finalized dark frame, brightened so the noise is visible. Renders the per-pixel mean (in
@@ -416,6 +393,77 @@ fn draw_calibration_result(
             }
         }
     }
+}
+
+// Draw a rounded teal button (same radial-shaded style as the main menu's Back/Calibrate buttons) into
+// `pixels` within the rect [x0,x1) x [y0,y1), with a centred label. Ported from MainMenu::draw_label_button
+// so the calibration FINALIZE button matches the menu's look. `stride` is the buffer row width in pixels.
+fn draw_fancy_button(
+    pixels: &mut [u8],
+    stride: usize,
+    height: u32,
+    rect: (u32, u32, u32, u32),
+    label: &str,
+    pressed: bool,
+    text_renderer: &mut TextRenderer,
+) {
+    let (x0, y0, x1, y1) = (rect.0 as i32, rect.1 as i32, rect.2 as i32, rect.3 as i32);
+    let bh = (y1 - y0) as f32;
+    let button_margin = 3.0 / bh;
+    let highlight: f32 = if pressed { 0.1 } else { 0.0 };
+    let x_center = (x0 + x1) / 2;
+    let y_center = (y0 + y1) / 2;
+    let mut shade = |px: i32, py: i32, xw: f32, yw: f32| {
+        let weight = xw * xw * xw * xw * xw + yw * yw * yw * yw * yw;
+        let mut wc = weight * weight * weight * 8.;
+        wc = wc * wc * wc;
+        wc = 1. - (wc - 0.5).abs() * (1.65 - highlight);
+        let mut wg = weight * weight * weight * 5.;
+        wg = wg * wg * wg;
+        wg = 1. - (wg - 0.5).abs() * (1.8 - highlight);
+        let mut wa = weight * weight * weight * 5.;
+        wa = wa * wa * wa;
+        wa = (wa - 0.04).abs() * (1.75 - highlight);
+        let offset = (py as usize * stride + px as usize) * 3;
+        if offset + 2 >= pixels.len() {
+            return;
+        }
+        // Teal: weak red, strong green+blue.
+        pixels[offset] = (pixels[offset] as f32 * wa.min(1.)) as u8;
+        pixels[offset + 1] = (wg.max(0.) * 0xE0 as f32 + pixels[offset + 1] as f32 * wa.min(1.)) as u8;
+        pixels[offset + 2] = (wc.max(0.) * 0x100 as f32 + pixels[offset + 2] as f32 * wa.min(1.)) as u8;
+    };
+    for py in y0..y_center {
+        for px in x0..x_center {
+            shade(px, py, (1. - (px - x0) as f32 * button_margin).max(0.), (1. - (py - y0) as f32 * button_margin).max(0.));
+        }
+        for px in x_center..x1 {
+            shade(px, py, (1. - (x1 - px - 1) as f32 * button_margin).max(0.), (1. - (py - y0) as f32 * button_margin).max(0.));
+        }
+    }
+    for py in y_center..y1 {
+        for px in x0..x_center {
+            shade(px, py, (1. - (px - x0) as f32 * button_margin).max(0.), (1. - (y1 - py - 1) as f32 * button_margin).max(0.));
+        }
+        for px in x_center..x1 {
+            shade(px, py, (1. - (x1 - px - 1) as f32 * button_margin).max(0.), (1. - (y1 - py - 1) as f32 * button_margin).max(0.));
+        }
+    }
+    let (a, r, g, b) = if pressed { (300u16, 64u8, 255u8, 255u8) } else { (200u16, 0u8, 200u8, 255u8) };
+    text_renderer.draw_text_center(
+        pixels,
+        stride as u32,
+        height,
+        label,
+        (x0 + x1) as f32 / 2.,
+        y0 as f32 + bh / 2.,
+        bh * 0.5,
+        a,
+        r,
+        g,
+        b,
+        0,
+    );
 }
 
 // The on-screen rectangle (x0,y0,x1,y1) of the calibration FINALIZE button, in buffer pixels. Shared
