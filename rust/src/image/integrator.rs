@@ -343,6 +343,20 @@ impl CameraIntegrator {
             }
         }
 
+        // While the finalized calibration result is on screen (CAL_SHOW_RESULT_BIT, set after finalize
+        // until the user taps), freeze: do NOT process incoming frames. The result view displays the
+        // averaged frame in image_buffer slot 0; the normal accumulate path below would overwrite those
+        // slots with each new frame - harmless at 16s darks but at fast BIAS frames it scribbles over the
+        // preview every few ms ("the preview continuously changes") and races the UI's read. Return the
+        // current settings (heartbeat already updated above, so the process stays alive) and skip the rest.
+        if (self.header[FLAGS_IDX] & CAL_SHOW_RESULT_BIT) != 0 {
+            return (
+                f64::from_bits(self.header[ISO_IDX]) as i32,
+                f64::from_bits(self.header[SHUTTER_NS_IDX]) as i64,
+                f64::from_bits(self.header[FOCUS_IDX]) as f32,
+            );
+        }
+
         self.exposure_time_ms = f64::from_bits(self.header[EXPOSURE_TIME_MS_IDX]) as u64;
 
         // Check for Bluetooth shutter signal (force completion)
