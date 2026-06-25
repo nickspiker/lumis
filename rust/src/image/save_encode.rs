@@ -186,14 +186,44 @@ pub fn quad_to_rgb8(
 }
 
 /// Encode RGB8 to JPEG bytes (quality 95), tagged with the Rec.2020 ICC profile (APP2 marker).
-pub fn encode_jpeg(rgb: &[u8], width: u32, height: u32, description: &str) -> Option<Vec<u8>> {
+pub fn encode_jpeg(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    description: &str,
+    exif: &crate::image::dng::ExifData,
+) -> Option<Vec<u8>> {
     use crate::image::icc::{jpeg_with_icc, rec2020_icc};
     let mut out = Cursor::new(Vec::new());
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95);
     enc.encode(rgb, width, height, image::ColorType::Rgb8)
         .ok()?;
     let with_icc = jpeg_with_icc(&out.into_inner(), rec2020_icc());
-    Some(jpeg_with_comment(&with_icc, description))
+    let with_exif = jpeg_with_exif(&with_icc, exif);
+    Some(jpeg_with_comment(&with_exif, description))
+}
+
+/// Insert a JPEG APP1 EXIF segment (marker 0xFFE1, "Exif\0\0" + a standalone TIFF/EXIF block) after SOI,
+/// so viewers show native ExposureTime/FNumber/ISO/FocalLength/DateTime fields. No-op if there's no EXIF.
+fn jpeg_with_exif(jpeg: &[u8], exif: &crate::image::dng::ExifData) -> Vec<u8> {
+    let block = crate::image::dng::build_exif_block(exif);
+    if block.is_empty() || jpeg.len() < 2 {
+        return jpeg.to_vec();
+    }
+    let mut payload = b"Exif\0\0".to_vec();
+    payload.extend_from_slice(&block);
+    // Marker segment length covers the 2 length bytes + payload; APP1 caps at 65535.
+    if payload.len() + 2 > 65535 {
+        return jpeg.to_vec();
+    }
+    let seg_len = (payload.len() + 2) as u16;
+    let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+    out.extend_from_slice(&jpeg[0..2]); // SOI
+    out.extend_from_slice(&[0xFF, 0xE1]); // APP1
+    out.extend_from_slice(&seg_len.to_be_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&jpeg[2..]); // rest of the JPEG
+    out
 }
 
 /// Insert a JPEG COM (comment) marker carrying `text` right after SOI. exiftool/most tools surface this
@@ -220,10 +250,24 @@ fn jpeg_with_comment(jpeg: &[u8], text: &str) -> Vec<u8> {
 /// The `image` crate's TIFF encoder is uncompressed-only, so we use the `tiff` crate directly to get lossless Deflate (≈1.5-2x smaller than raw RGB, still universally readable).
 ///
 /// Big 50MP TIFFs fail to thumbnail in Android file managers/galleries (ExifInterface logs "No image meets the size requirements of a thumbnail image"). The `tiff` crate writes IFD0 with a next-IFD pointer of 0 and does not expose that pointer, so we post-process its output: append a thumbnail JPEG and a chained IFD1 (classic TIFF thumbnail convention - exiftool/galleries read IFD1 of a TIFF as the thumbnail), then patch IFD0's next-IFD u32 to point at IFD1. If thumbnail generation fails we still return the valid TIFF without a thumbnail rather than failing the whole save.
-pub fn encode_tiff(rgb: &[u8], width: u32, height: u32, description: &str) -> Option<Vec<u8>> {
+pub fn encode_tiff(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    description: &str,
+    exif: &crate::image::dng::ExifData,
+) -> Option<Vec<u8>> {
     use crate::image::icc::rec2020_icc;
-    use tiff::encoder::{colortype::RGB8, compression::Deflate, TiffEncoder};
+    use tiff::encoder::{colortype::RGB8, compression::Deflate, Rational, TiffEncoder};
     use tiff::tags::Tag;
+    // EXIF as a RATIONAL (num/den, 1000 denom preserving sub-1.0 values).
+    let rat = |v: f64| -> Rational {
+        if v >= 1.0 {
+            Rational { n: (v * 1000.0).round() as u32, d: 1000 }
+        } else {
+            Rational { n: 1000, d: (1000.0 / v).round() as u32 }
+        }
+    };
     let mut out = Cursor::new(Vec::new());
     {
         let mut enc = TiffEncoder::new(&mut out).ok()?;
@@ -242,6 +286,31 @@ pub fn encode_tiff(rgb: &[u8], width: u32, height: u32, description: &str) -> Op
                 .encoder()
                 .write_tag(Tag::Unknown(270), description)
                 .ok()?;
+        }
+        // EXIF tags written directly into IFD0 (viewers read ExposureTime/FNumber/etc. there too). The
+        // tiff crate's sub-IFD support is awkward, and IFD0 placement is universally understood. Tags in
+        // ascending id order. RATIONAL via the crate's Rational; ISO/35mm-equiv as SHORT.
+        let e = exif;
+        if e.exposure_time_s > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0x829A), rat(e.exposure_time_s)).ok()?;
+        }
+        if e.f_number > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0x829D), rat(e.f_number)).ok()?;
+        }
+        if e.iso > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0x8827), (e.iso.round() as u32).min(65535) as u16).ok()?;
+        }
+        if !e.datetime_original.is_empty() {
+            image.encoder().write_tag(Tag::Unknown(0x9003), e.datetime_original.as_str()).ok()?;
+        }
+        if e.subject_distance_m > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0x9206), rat(e.subject_distance_m)).ok()?;
+        }
+        if e.focal_length_mm > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0x920A), rat(e.focal_length_mm)).ok()?;
+        }
+        if e.focal_length_35mm > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0xA405), (e.focal_length_35mm.round() as u32).min(65535) as u16).ok()?;
         }
         image.write_data(rgb).ok()?;
     }

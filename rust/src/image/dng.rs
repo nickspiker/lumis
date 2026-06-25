@@ -13,6 +13,121 @@ pub struct ExifData {
     pub datetime_original: String, // "YYYY:MM:DD HH:MM:SS" (EXIF format), empty = omit
 }
 
+// One EXIF IFD entry: (tag, type, count, inline_value, optional out-of-line payload). SHORT/UNDEFINED
+// values live inline in the 4-byte value field; RATIONAL/ASCII go out-of-line and the value field holds
+// an offset patched in by the writer.
+type ExifEntry = (u16, u16, u32, u32, Option<Vec<u8>>);
+
+// Build the EXIF tag entries from ExifData (shared by the DNG EXIF sub-IFD and the JPEG/TIFF EXIF blocks).
+// Ascending tag-id order. RATIONALs use a fixed 1000 denominator scheme that preserves sub-1.0 values.
+pub fn build_exif_entries(e: &ExifData) -> Vec<ExifEntry> {
+    let rat = |v: f64| -> (u32, u32) {
+        if v <= 0.0 {
+            (0, 1)
+        } else if v >= 1.0 {
+            ((v * 1000.0).round() as u32, 1000)
+        } else {
+            (1000, (1000.0 / v).round() as u32)
+        }
+    };
+    let ratbytes = |v: f64| -> Vec<u8> {
+        let (n, d) = rat(v);
+        let mut b = n.to_le_bytes().to_vec();
+        b.extend(d.to_le_bytes());
+        b
+    };
+    let mut entries: Vec<ExifEntry> = Vec::new();
+    if e.exposure_time_s > 0.0 {
+        entries.push((0x829A, 5, 1, 0, Some(ratbytes(e.exposure_time_s)))); // ExposureTime
+    }
+    if e.f_number > 0.0 {
+        entries.push((0x829D, 5, 1, 0, Some(ratbytes(e.f_number)))); // FNumber
+    }
+    if e.iso > 0.0 {
+        entries.push((0x8827, 3, 1, (e.iso.round() as u32).min(65535), None)); // ISOSpeedRatings
+    }
+    entries.push((0x9000, 7, 4, u32::from_le_bytes(*b"0230"), None)); // ExifVersion
+    // ComponentsConfiguration (0x9101): required by the JPEG/EXIF spec. UNDEFINED[4] = Y,Cb,Cr,- (1,2,3,0).
+    entries.push((0x9101, 7, 4, u32::from_le_bytes([1, 2, 3, 0]), None));
+    if !e.datetime_original.is_empty() {
+        let mut b = e.datetime_original.clone().into_bytes();
+        b.push(0);
+        let cnt = b.len() as u32;
+        entries.push((0x9003, 2, cnt, 0, Some(b))); // DateTimeOriginal
+    }
+    if e.subject_distance_m > 0.0 {
+        entries.push((0x9206, 5, 1, 0, Some(ratbytes(e.subject_distance_m)))); // SubjectDistance
+    }
+    if e.focal_length_mm > 0.0 {
+        entries.push((0x920A, 5, 1, 0, Some(ratbytes(e.focal_length_mm)))); // FocalLength
+    }
+    // FlashpixVersion (0xA000): required by the JPEG/EXIF spec. UNDEFINED[4] = "0100".
+    entries.push((0xA000, 7, 4, u32::from_le_bytes(*b"0100"), None));
+    if e.focal_length_35mm > 0.0 {
+        entries.push((0xA405, 3, 1, (e.focal_length_35mm.round() as u32).min(65535), None)); // FocalLengthIn35mmFilm
+    }
+    entries
+}
+
+// Write an IFD (count + 12-byte entries + next-IFD pointer) into `out` at the current end, returning the
+// list of (value_field_position, payload) that still need their out-of-line data appended + offset
+// patched. `next_ifd` is the 4-byte next-IFD pointer value (0 = end of chain).
+fn write_ifd(out: &mut Vec<u8>, entries: &[ExifEntry], next_ifd: u32) -> Vec<(usize, Vec<u8>)> {
+    out.extend((entries.len() as u16).to_le_bytes());
+    let mut patches = Vec::new();
+    for (tag, typ, count, inline, payload) in entries {
+        out.extend(tag.to_le_bytes());
+        out.extend(typ.to_le_bytes());
+        out.extend(count.to_le_bytes());
+        let valpos = out.len();
+        out.extend(inline.to_le_bytes());
+        if let Some(bytes) = payload {
+            patches.push((valpos, bytes.clone()));
+        }
+    }
+    out.extend(next_ifd.to_le_bytes());
+    patches
+}
+
+// Append each out-of-line payload (word-aligned) to `out`, patching its IFD value field to the offset.
+// `base` is the offset that file/segment offsets are measured from (0 for a standalone TIFF block).
+fn append_payloads(out: &mut Vec<u8>, patches: Vec<(usize, Vec<u8>)>, base: usize) {
+    for (valpos, bytes) in patches {
+        if (out.len() - base) % 2 != 0 {
+            out.push(0);
+        }
+        let off = ((out.len() - base) as u32).to_le_bytes();
+        out[valpos..valpos + 4].copy_from_slice(&off);
+        out.extend(&bytes);
+    }
+}
+
+/// Build a complete standalone little-endian TIFF/EXIF block: TIFF header -> IFD0 (with an ExifIFD
+/// pointer) -> ExifIFD (the actual tags). Offsets are relative to the start of this block. Used for the
+/// JPEG APP1 "Exif\0\0" segment and TIFF embedding. Returns empty if there's nothing to write.
+pub fn build_exif_block(exif: &ExifData) -> Vec<u8> {
+    let entries = build_exif_entries(exif);
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<u8> = Vec::new();
+    // TIFF header: II, 42, offset to IFD0 (=8).
+    out.extend([0x49, 0x49, 0x2A, 0x00, 8, 0, 0, 0]);
+    // IFD0: a single entry, the ExifIFD pointer (0x8769). Its value (offset to the ExifIFD) is patched
+    // once we know where the ExifIFD lands.
+    out.extend((1u16).to_le_bytes());
+    out.extend([0x69, 0x87, 4, 0, 1, 0, 0, 0]); // 0x8769 ExifIFD pointer, LONG, count 1
+    let exif_ptr_pos = out.len();
+    out.extend([0, 0, 0, 0]); // placeholder offset
+    out.extend([0, 0, 0, 0]); // IFD0 next-IFD pointer = 0
+    // ExifIFD starts here.
+    let exif_ifd_off = (out.len() as u32).to_le_bytes();
+    out[exif_ptr_pos..exif_ptr_pos + 4].copy_from_slice(&exif_ifd_off);
+    let patches = write_ifd(&mut out, &entries, 0);
+    append_payloads(&mut out, patches, 0);
+    out
+}
+
 
 pub fn initialize_raw_info() -> RawInfo {
     RawInfo {
