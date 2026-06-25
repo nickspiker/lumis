@@ -178,6 +178,26 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeSetJxlSupported(
     }
 }
 
+/// Set the GPS fix (from Kotlin's last-known location) into the header for EXIF geotagging. has_fix=0
+/// clears it (no permission / no location), so GPS tags are omitted.
+#[no_mangle]
+pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeSetGps(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    ptr: jlong,
+    has_fix: jboolean,
+    lat: f64,
+    lon: f64,
+    alt: f64,
+) {
+    use crate::shared_memory::*;
+    let integrator = integrator_ptr(ptr);
+    integrator.header[GPS_HAS_FIX_IDX] = if has_fix != 0 { 1 } else { 0 };
+    integrator.header[GPS_LAT_IDX] = lat.to_bits();
+    integrator.header[GPS_LON_IDX] = lon.to_bits();
+    integrator.header[GPS_ALT_IDX] = alt.to_bits();
+}
+
 /// Poll-driven save check (camera process). Runs try_save from the 30Hz settings poll so a manual save
 /// at a long exposure fires within ~33ms (from the already-published image_buffer) instead of waiting up
 /// to a full exposure for the next frame - the data already exists; only the flag check was frame-gated.

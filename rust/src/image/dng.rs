@@ -11,6 +11,10 @@ pub struct ExifData {
     pub focal_length_35mm: f64,
     pub subject_distance_m: f64,
     pub datetime_original: String, // "YYYY:MM:DD HH:MM:SS" (EXIF format), empty = omit
+    pub has_gps: bool,             // false = omit all GPS tags
+    pub gps_lat: f64,              // signed decimal degrees
+    pub gps_lon: f64,              // signed decimal degrees
+    pub gps_alt: f64,              // metres (signed)
 }
 
 // One EXIF IFD entry: (tag, type, count, inline_value, optional out-of-line payload). SHORT/UNDEFINED
@@ -46,26 +50,68 @@ pub fn build_exif_entries(e: &ExifData) -> Vec<ExifEntry> {
     if e.iso > 0.0 {
         entries.push((0x8827, 3, 1, (e.iso.round() as u32).min(65535), None)); // ISOSpeedRatings
     }
+    // STRICT ascending tag-id order from here (exiftool -validate flags any descent in an IFD).
     entries.push((0x9000, 7, 4, u32::from_le_bytes(*b"0230"), None)); // ExifVersion
-    // ComponentsConfiguration (0x9101): required by the JPEG/EXIF spec. UNDEFINED[4] = Y,Cb,Cr,- (1,2,3,0).
-    entries.push((0x9101, 7, 4, u32::from_le_bytes([1, 2, 3, 0]), None));
     if !e.datetime_original.is_empty() {
         let mut b = e.datetime_original.clone().into_bytes();
         b.push(0);
         let cnt = b.len() as u32;
-        entries.push((0x9003, 2, cnt, 0, Some(b))); // DateTimeOriginal
+        entries.push((0x9003, 2, cnt, 0, Some(b))); // DateTimeOriginal (0x9003)
     }
+    // ComponentsConfiguration (0x9101): required by the JPEG/EXIF spec. UNDEFINED[4] = Y,Cb,Cr,- (1,2,3,0).
+    entries.push((0x9101, 7, 4, u32::from_le_bytes([1, 2, 3, 0]), None));
     if e.subject_distance_m > 0.0 {
         entries.push((0x9206, 5, 1, 0, Some(ratbytes(e.subject_distance_m)))); // SubjectDistance
     }
     if e.focal_length_mm > 0.0 {
         entries.push((0x920A, 5, 1, 0, Some(ratbytes(e.focal_length_mm)))); // FocalLength
     }
-    // FlashpixVersion (0xA000): required by the JPEG/EXIF spec. UNDEFINED[4] = "0100".
+    // FlashpixVersion (0xA000) + ColorSpace (0xA001): JPEG/EXIF-spec required. ColorSpace=0xFFFF
+    // (Uncalibrated) since our pixels are Rec.2020 (tagged via the ICC profile), not sRGB.
     entries.push((0xA000, 7, 4, u32::from_le_bytes(*b"0100"), None));
+    entries.push((0xA001, 3, 1, 0xFFFF, None)); // ColorSpace = Uncalibrated
     if e.focal_length_35mm > 0.0 {
         entries.push((0xA405, 3, 1, (e.focal_length_35mm.round() as u32).min(65535), None)); // FocalLengthIn35mmFilm
     }
+    entries
+}
+
+// Build the GPS IFD entries (tag ids are in the GPS namespace, ascending). Lat/lon are 3 RATIONALs
+// (deg, min, sec) with an N/S/E/W ref; altitude is 1 RATIONAL with a 0/1 ref (above/below sea level).
+pub fn build_gps_entries(e: &ExifData) -> Vec<ExifEntry> {
+    let mut entries: Vec<ExifEntry> = Vec::new();
+    if !e.has_gps {
+        return entries;
+    }
+    // deg/min/sec as three RATIONALs (sec scaled by 1000 for sub-second precision).
+    let dms = |v: f64| -> Vec<u8> {
+        let a = v.abs();
+        let deg = a.floor();
+        let min = ((a - deg) * 60.0).floor();
+        let sec = (a - deg - min / 60.0) * 3600.0;
+        let mut b = Vec::new();
+        for (n, d) in [(deg as u32, 1u32), (min as u32, 1), ((sec * 1000.0).round() as u32, 1000)] {
+            b.extend(n.to_le_bytes());
+            b.extend(d.to_le_bytes());
+        }
+        b
+    };
+    // GPSVersionID (0x0000) BYTE[4] = 2,3,0,0 (inline).
+    entries.push((0x0000, 1, 4, u32::from_le_bytes([2, 3, 0, 0]), None));
+    // GPSLatitudeRef (0x0001) ASCII "N"/"S"; GPSLatitude (0x0002) RATIONAL[3].
+    let lat_ref = if e.gps_lat >= 0.0 { b"N\0" } else { b"S\0" };
+    entries.push((0x0001, 2, 2, u32::from_le_bytes([lat_ref[0], lat_ref[1], 0, 0]), None));
+    entries.push((0x0002, 5, 3, 0, Some(dms(e.gps_lat))));
+    // GPSLongitudeRef (0x0003) ASCII "E"/"W"; GPSLongitude (0x0004) RATIONAL[3].
+    let lon_ref = if e.gps_lon >= 0.0 { b"E\0" } else { b"W\0" };
+    entries.push((0x0003, 2, 2, u32::from_le_bytes([lon_ref[0], lon_ref[1], 0, 0]), None));
+    entries.push((0x0004, 5, 3, 0, Some(dms(e.gps_lon))));
+    // GPSAltitudeRef (0x0005) BYTE 0=above/1=below sea level (inline); GPSAltitude (0x0006) RATIONAL.
+    entries.push((0x0005, 1, 1, if e.gps_alt < 0.0 { 1 } else { 0 }, None));
+    let alt = e.gps_alt.abs();
+    let mut altb = ((alt * 1000.0).round() as u32).to_le_bytes().to_vec();
+    altb.extend(1000u32.to_le_bytes());
+    entries.push((0x0006, 5, 1, 0, Some(altb)));
     entries
 }
 
@@ -106,25 +152,48 @@ fn append_payloads(out: &mut Vec<u8>, patches: Vec<(usize, Vec<u8>)>, base: usiz
 /// pointer) -> ExifIFD (the actual tags). Offsets are relative to the start of this block. Used for the
 /// JPEG APP1 "Exif\0\0" segment and TIFF embedding. Returns empty if there's nothing to write.
 pub fn build_exif_block(exif: &ExifData) -> Vec<u8> {
-    let entries = build_exif_entries(exif);
-    if entries.is_empty() {
+    let exif_entries = build_exif_entries(exif);
+    let gps_entries = build_gps_entries(exif);
+    if exif_entries.is_empty() && gps_entries.is_empty() {
         return Vec::new();
     }
     let mut out: Vec<u8> = Vec::new();
     // TIFF header: II, 42, offset to IFD0 (=8).
     out.extend([0x49, 0x49, 0x2A, 0x00, 8, 0, 0, 0]);
-    // IFD0: a single entry, the ExifIFD pointer (0x8769). Its value (offset to the ExifIFD) is patched
-    // once we know where the ExifIFD lands.
-    out.extend((1u16).to_le_bytes());
-    out.extend([0x69, 0x87, 4, 0, 1, 0, 0, 0]); // 0x8769 ExifIFD pointer, LONG, count 1
-    let exif_ptr_pos = out.len();
-    out.extend([0, 0, 0, 0]); // placeholder offset
+    // IFD0: pointer tags to the ExifIFD (0x8769) and/or GPS IFD (0x8825), ascending order. Offsets
+    // patched once those IFDs are written.
+    let mut ifd0_count = 0u16;
+    if !exif_entries.is_empty() { ifd0_count += 1; }
+    if !gps_entries.is_empty() { ifd0_count += 1; }
+    out.extend(ifd0_count.to_le_bytes());
+    let mut exif_ptr_pos = 0usize;
+    let mut gps_ptr_pos = 0usize;
+    if !exif_entries.is_empty() {
+        out.extend([0x69, 0x87, 4, 0, 1, 0, 0, 0]); // 0x8769 ExifIFD pointer, LONG
+        exif_ptr_pos = out.len();
+        out.extend([0, 0, 0, 0]);
+    }
+    if !gps_entries.is_empty() {
+        out.extend([0x25, 0x88, 4, 0, 1, 0, 0, 0]); // 0x8825 GPS IFD pointer, LONG
+        gps_ptr_pos = out.len();
+        out.extend([0, 0, 0, 0]);
+    }
     out.extend([0, 0, 0, 0]); // IFD0 next-IFD pointer = 0
-    // ExifIFD starts here.
-    let exif_ifd_off = (out.len() as u32).to_le_bytes();
-    out[exif_ptr_pos..exif_ptr_pos + 4].copy_from_slice(&exif_ifd_off);
-    let patches = write_ifd(&mut out, &entries, 0);
-    append_payloads(&mut out, patches, 0);
+    // ExifIFD.
+    if !exif_entries.is_empty() {
+        let off = (out.len() as u32).to_le_bytes();
+        out[exif_ptr_pos..exif_ptr_pos + 4].copy_from_slice(&off);
+        let patches = write_ifd(&mut out, &exif_entries, 0);
+        append_payloads(&mut out, patches, 0);
+    }
+    // GPS IFD.
+    if !gps_entries.is_empty() {
+        if out.len() % 2 != 0 { out.push(0); }
+        let off = (out.len() as u32).to_le_bytes();
+        out[gps_ptr_pos..gps_ptr_pos + 4].copy_from_slice(&off);
+        let patches = write_ifd(&mut out, &gps_entries, 0);
+        append_payloads(&mut out, patches, 0);
+    }
     out
 }
 

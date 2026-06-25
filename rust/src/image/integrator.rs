@@ -509,8 +509,17 @@ impl CameraIntegrator {
             let per_frame_iso = f64::from_bits(self.header[ISO_IDX]);
             let integ_s = per_frame_shutter_ns * frame_count as f64 / 1.0e9;
             let eff_iso = per_frame_iso / frame_count as f64;
+            // Capture mode (the integration type) - recorded in the description so the saved file knows
+            // whether it's an average, a frame-to-frame difference, or a motion (diff/avg) image.
+            let mode_name = match current_mode {
+                0 => "average",
+                1 => "difference",
+                2 => "motion",
+                _ => "unknown",
+            };
             let exposure_desc = format!(
-                "Lumis integration: {}x {:.4}s @ ISO {:.0} | effective {:.3}s @ ISO {:.1}",
+                "Lumis {} | integration: {}x {:.4}s @ ISO {:.0} | effective {:.3}s @ ISO {:.1}",
+                mode_name,
                 frame_count,
                 per_frame_shutter_ns / 1.0e9,
                 per_frame_iso,
@@ -537,6 +546,10 @@ impl CameraIntegrator {
                 focal_length_35mm: focal_35mm,
                 subject_distance_m: focus_distance_m,
                 datetime_original: capture_dt.format("%Y:%m:%d %H:%M:%S").to_string(),
+                has_gps: self.header[GPS_HAS_FIX_IDX] != 0,
+                gps_lat: f64::from_bits(self.header[GPS_LAT_IDX]),
+                gps_lon: f64::from_bits(self.header[GPS_LON_IDX]),
+                gps_alt: f64::from_bits(self.header[GPS_ALT_IDX]),
             };
             // XYZ matrix for RGB exports, and the magic9inv bytes for the DNG ColorMatrix1. magic_9_dng_xyz lives in zero-initialized shared memory and is only populated by a calibration scan. Pre-calibration it is all zeros, which would multiply every exported pixel to black; fall back to identity so uncalibrated RGB exports show the raw debayered scene (accuracy doesn't matter until calibrated anyway).
             let xyz_matrix = {

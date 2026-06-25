@@ -51,6 +51,13 @@ pub const FOCAL_LENGTH_MM_IDX: usize = 54; // physical focal length in mm
 pub const APERTURE_FNUM_IDX: usize = 55; // f-number (e.g. 1.8)
 pub const SENSOR_DIAG_MM_IDX: usize = 56; // active-array physical diagonal in mm, for 35mm-equiv focal
 
+// GPS for EXIF, set by Kotlin from last-known location (f64 bits). HAS_GPS=0 means no fix / permission
+// denied -> omit GPS tags. Latitude/longitude in signed decimal degrees; altitude in metres.
+pub const GPS_HAS_FIX_IDX: usize = 57; // 0 = no GPS, 1 = lat/lon/alt valid
+pub const GPS_LAT_IDX: usize = 58; // signed decimal degrees
+pub const GPS_LON_IDX: usize = 59; // signed decimal degrees
+pub const GPS_ALT_IDX: usize = 60; // metres (signed; below sea level allowed)
+
 pub const IMAGE_START: usize = 64;
 
 // Save format values (SAVE_FORMAT_IDX). Numbered to match the tap-cycle order JXL -> JPEG -> DNG -> TIFF, and JXL is 0 so it's the zero-initialized default.

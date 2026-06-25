@@ -26,7 +26,10 @@ class PermissionsRequest : Activity() {
     
     private fun checkAndRequestPermissions() {
         val requiredPermissions = mutableListOf(
-            Manifest.permission.CAMERA
+            Manifest.permission.CAMERA,
+            // Location for geotagging saved photos. Optional - the app launches regardless of the result
+            // (onRequestPermissionsResult always proceeds); captures just go untagged if denied.
+            Manifest.permission.ACCESS_FINE_LOCATION
         )
         
         // Add storage permissions for older Android versions

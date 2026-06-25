@@ -2,6 +2,9 @@ package com.lumis.camera
 
 import android.app.Service
 import android.content.Context
+import android.location.LocationManager
+import android.Manifest
+import android.content.pm.PackageManager
 import android.content.Intent
 import android.graphics.ImageFormat
 import android.hardware.camera2.*
@@ -179,6 +182,10 @@ class CameraInterface : Service() {
        @JvmStatic
        external fun nativeSetJxlSupported(contextPtr: Long, supported: Boolean)
 
+       // Set the last-known GPS fix for EXIF geotagging. hasFix=false omits GPS tags (no permission/fix).
+       @JvmStatic
+       external fun nativeSetGps(contextPtr: Long, hasFix: Boolean, lat: Double, lon: Double, alt: Double)
+
        @JvmStatic
        external fun nativeCameraGetSharedMemoryPtr(contextPtr: Long): Long
        
@@ -225,6 +232,38 @@ class CameraInterface : Service() {
        "tiff", "tif" -> "image/tiff"
        "jxl" -> "image/jxl"
        else -> "image/jpeg"
+   }
+
+   // Fetch the device's last-known location (fast, cached - never blocks) and push it to the integrator
+   // for EXIF geotagging. Tries GPS then network provider. Silently no-ops (clears GPS) if the location
+   // permission isn't granted or there's no cached fix.
+   @SuppressLint("MissingPermission")
+   private fun fetchAndSetLocation() {
+       if (nativeCameraContextPtr == 0L) return
+       val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+           PackageManager.PERMISSION_GRANTED
+       if (!granted) {
+           CameraInterface.nativeSetGps(nativeCameraContextPtr, false, 0.0, 0.0, 0.0)
+           Log.i("CameraInterface", "Location not granted - no geotag")
+           return
+       }
+       try {
+           val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+           // Best cached fix across providers (GPS usually most accurate; network as fallback).
+           val loc = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+               .mapNotNull { p -> try { lm.getLastKnownLocation(p) } catch (e: Exception) { null } }
+               .maxByOrNull { it.time }
+           if (loc != null) {
+               CameraInterface.nativeSetGps(nativeCameraContextPtr, true, loc.latitude, loc.longitude, if (loc.hasAltitude()) loc.altitude else 0.0)
+               Log.i("CameraInterface", "Geotag: ${loc.latitude}, ${loc.longitude} alt=${loc.altitude}")
+           } else {
+               CameraInterface.nativeSetGps(nativeCameraContextPtr, false, 0.0, 0.0, 0.0)
+               Log.i("CameraInterface", "No cached location fix available")
+           }
+       } catch (e: Exception) {
+           CameraInterface.nativeSetGps(nativeCameraContextPtr, false, 0.0, 0.0, 0.0)
+           Log.w("CameraInterface", "Location fetch failed: $e")
+       }
    }
 
    // Probe whether MediaStore.Images accepts an "image/jxl" entry on this device. Some (older) Android
@@ -469,6 +508,8 @@ class CameraInterface : Service() {
        // Probe whether this device's MediaStore accepts image/jxl, and record it so the UI cycle skips
        // JXL / the save path falls back to JPEG on devices (older Android) that reject the mime.
        probeAndRecordJxlSupport()
+       // Fetch the last-known location (if permission granted) for EXIF geotagging.
+       fetchAndSetLocation()
        // Engage calibration mode in the integrator (sets CALIBRATING_BIT + CAL_IS_DARK_BIT) so it
        // accumulates mean+variance without per-exposure reset and publishes progress stats.
        if (calibrationMode >= 0) {
