@@ -15,6 +15,8 @@ pub struct ExifData {
     pub gps_lat: f64,              // signed decimal degrees
     pub gps_lon: f64,              // signed decimal degrees
     pub gps_alt: f64,              // metres (signed)
+    pub image_width: u32,          // for ExifImageWidth/Height (0 = omit)
+    pub image_height: u32,
 }
 
 // One EXIF IFD entry: (tag, type, count, inline_value, optional out-of-line payload). SHORT/UNDEFINED
@@ -70,6 +72,11 @@ pub fn build_exif_entries(e: &ExifData) -> Vec<ExifEntry> {
     // (Uncalibrated) since our pixels are Rec.2020 (tagged via the ICC profile), not sRGB.
     entries.push((0xA000, 7, 4, u32::from_le_bytes(*b"0100"), None));
     entries.push((0xA001, 3, 1, 0xFFFF, None)); // ColorSpace = Uncalibrated
+    // ExifImageWidth/Height (0xA002/0xA003) LONG - JPEG/EXIF-spec required (the pixel dimensions).
+    if e.image_width > 0 {
+        entries.push((0xA002, 4, 1, e.image_width, None));
+        entries.push((0xA003, 4, 1, e.image_height, None));
+    }
     if e.focal_length_35mm > 0.0 {
         entries.push((0xA405, 3, 1, (e.focal_length_35mm.round() as u32).min(65535), None)); // FocalLengthIn35mmFilm
     }
@@ -160,12 +167,24 @@ pub fn build_exif_block(exif: &ExifData) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     // TIFF header: II, 42, offset to IFD0 (=8).
     out.extend([0x49, 0x49, 0x2A, 0x00, 8, 0, 0, 0]);
-    // IFD0: pointer tags to the ExifIFD (0x8769) and/or GPS IFD (0x8825), ascending order. Offsets
-    // patched once those IFDs are written.
-    let mut ifd0_count = 0u16;
+    // IFD0: the JPEG/EXIF-spec required resolution tags (out-of-line RATIONALs / inline SHORTs) plus the
+    // ExifIFD (0x8769) and GPS IFD (0x8825) pointers - all in strict ascending tag-id order. The pointer
+    // value fields are patched once those sub-IFDs are written. 72/1 dpi, inch units, centered YCbCr.
+    let res72 = || -> Vec<u8> { let mut b = 72u32.to_le_bytes().to_vec(); b.extend(1u32.to_le_bytes()); b };
+    // 4 fixed IFD0 tags (XRes, YRes, ResUnit, YCbCrPos) + the ExifIFD/GPS pointers when present.
+    let mut ifd0_count = 4u16;
     if !exif_entries.is_empty() { ifd0_count += 1; }
     if !gps_entries.is_empty() { ifd0_count += 1; }
     out.extend(ifd0_count.to_le_bytes());
+    // XResolution (0x011A) / YResolution (0x011B) RATIONAL (out-of-line, patched).
+    out.extend([0x1A, 0x01, 5, 0, 1, 0, 0, 0]);
+    let xres_pos = out.len(); out.extend([0, 0, 0, 0]);
+    out.extend([0x1B, 0x01, 5, 0, 1, 0, 0, 0]);
+    let yres_pos = out.len(); out.extend([0, 0, 0, 0]);
+    // ResolutionUnit (0x0128) SHORT = 2 (inch), inline.
+    out.extend([0x28, 0x01, 3, 0, 1, 0, 0, 0, 2, 0, 0, 0]);
+    // YCbCrPositioning (0x0213) SHORT = 1 (centered), inline.
+    out.extend([0x13, 0x02, 3, 0, 1, 0, 0, 0, 1, 0, 0, 0]);
     let mut exif_ptr_pos = 0usize;
     let mut gps_ptr_pos = 0usize;
     if !exif_entries.is_empty() {
@@ -179,6 +198,10 @@ pub fn build_exif_block(exif: &ExifData) -> Vec<u8> {
         out.extend([0, 0, 0, 0]);
     }
     out.extend([0, 0, 0, 0]); // IFD0 next-IFD pointer = 0
+    // Append the resolution RATIONALs (word-aligned) and patch their offsets.
+    if out.len() % 2 != 0 { out.push(0); }
+    let xoff = (out.len() as u32).to_le_bytes(); out[xres_pos..xres_pos + 4].copy_from_slice(&xoff); out.extend(res72());
+    let yoff = (out.len() as u32).to_le_bytes(); out[yres_pos..yres_pos + 4].copy_from_slice(&yoff); out.extend(res72());
     // ExifIFD.
     if !exif_entries.is_empty() {
         let off = (out.len() as u32).to_le_bytes();

@@ -550,6 +550,8 @@ impl CameraIntegrator {
                 gps_lat: f64::from_bits(self.header[GPS_LAT_IDX]),
                 gps_lon: f64::from_bits(self.header[GPS_LON_IDX]),
                 gps_alt: f64::from_bits(self.header[GPS_ALT_IDX]),
+                image_width: self.width as u32,
+                image_height: self.height as u32,
             };
             // XYZ matrix for RGB exports, and the magic9inv bytes for the DNG ColorMatrix1. magic_9_dng_xyz lives in zero-initialized shared memory and is only populated by a calibration scan. Pre-calibration it is all zeros, which would multiply every exported pixel to black; fall back to identity so uncalibrated RGB exports show the raw debayered scene (accuracy doesn't matter until calibrated anyway).
             let xyz_matrix = {
