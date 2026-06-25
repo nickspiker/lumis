@@ -117,15 +117,10 @@ impl MainMenu {
         self.button_height = (self.height as f32 - self.y_margin * 2.) / NUM_SLOTS as f32;
 
         // The CalShutter screen is a fixed two-choice picker, not a camera list - build it directly.
-        if let Screen::CalShutter(g) = self.screen {
-            // Calibration is captured at the lens's highest-res (group head) mode.
-            let head_index = self
-                .all_cameras
-                .iter()
-                .filter(|c| c.group_id == g)
-                .map(|c| c.index)
-                .min()
-                .unwrap_or(0);
+        // The i32 is the tapped camera's INDEX (the lens key), not a group_id.
+        if let Screen::CalShutter(key) = self.screen {
+            // Calibration is captured at the lens's highest-res (head) mode.
+            let head_index = self.lens_head_index(key as usize);
             // Two choices + Back + Exit = 4 slots; pad the rest empty so they sit at the bottom.
             let used = 4;
             for _ in 0..(NUM_SLOTS - used) {
@@ -148,11 +143,12 @@ impl MainMenu {
                 .filter(|c| self.is_group_head(c))
                 .map(|c| (c.index, c.clone()))
                 .collect(),
-            Screen::Modes(g) => self
-                .all_cameras
-                .iter()
-                .filter(|c| c.group_id == g)
-                .map(|c| (c.index, c.clone()))
+            // The i32 is the tapped camera's INDEX (lens key). lens_members resolves it to the lens's
+            // modes (all group members, or just that one camera if ungrouped).
+            Screen::Modes(key) => self
+                .lens_members(key as usize)
+                .into_iter()
+                .map(|c| (c.index, c))
                 .collect(),
             Screen::CalShutter(_) => unreachable!(), // handled above
         };
@@ -172,23 +168,54 @@ impl MainMenu {
         if has_back {
             self.buttons.push(Button::Back);
         }
-        let modes_group = if let Screen::Modes(g) = self.screen { Some(g) } else { None };
+        let modes_key = if let Screen::Modes(k) = self.screen { Some(k) } else { None };
         for (index, info) in rows.into_iter().take(rows_to_show) {
             self.buttons.push(Button::Camera { index, info });
         }
         // Calibrate row sits just below the mode list on the Modes screen.
-        if let Some(g) = modes_group {
-            let head_index = self
-                .all_cameras
-                .iter()
-                .filter(|c| c.group_id == g)
-                .map(|c| c.index)
-                .min()
-                .unwrap_or(0);
-            self.buttons.push(Button::Calibrate { index: head_index });
+        if let Some(key) = modes_key {
+            self.buttons.push(Button::Calibrate { index: self.lens_head_index(key as usize) });
         }
         self.buttons.push(Button::Exit);
         self.render_buttons_to_buffers();
+    }
+
+    // The cameras (capture modes) belonging to the lens identified by `key_index` - the index of any
+    // camera in that lens. Grouped lenses (group_id >= 0) return all members sharing the group; an
+    // ungrouped lens (group_id < 0) returns just that one camera. Keying by index (not group_id) is what
+    // lets the Modes/CalShutter screens work for single ungrouped lenses, which all share group_id = -1
+    // and would otherwise be lumped together.
+    fn lens_members(&self, key_index: usize) -> Vec<CameraInfo> {
+        let key_group = self
+            .all_cameras
+            .iter()
+            .find(|c| c.index == key_index)
+            .map(|c| c.group_id);
+        match key_group {
+            Some(g) if g >= 0 => self
+                .all_cameras
+                .iter()
+                .filter(|c| c.group_id == g)
+                .cloned()
+                .collect(),
+            // Ungrouped (or unknown): just the keyed camera itself.
+            _ => self
+                .all_cameras
+                .iter()
+                .filter(|c| c.index == key_index)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    // The head (highest-res, lowest-index) camera of the lens identified by `key_index`. Calibration
+    // captures at this mode.
+    fn lens_head_index(&self, key_index: usize) -> usize {
+        self.lens_members(key_index)
+            .iter()
+            .map(|c| c.index)
+            .min()
+            .unwrap_or(key_index)
     }
 
     // First (highest-res) mode of a group is its head. We mark the head with mode_count = group size and the rest with 1, so head == "mode_count >= 1 and it's the first of its group in all_cameras". Since Kotlin emits the head first, the head is simply the earliest-index member of the group.
@@ -590,7 +617,11 @@ impl MainMenu {
             let right_gap = button_width * 0.03;
             let megapixels = (info.width * info.height) as f32 / 1_000_000.;
             // A lens with several capture modes shows "multiple" instead of a single resolution; tapping it (future) opens a per-mode picker.
-            let mp_text = if on_main && info.mode_count > 1 {
+            let mp_text = if !info.supports_raw {
+                // Non-RAW (LIMITED hardware, e.g. some front cams) - Lumis can't capture from it; label
+                // it clearly as unavailable instead of showing a confusing "0mp / 0x0".
+                "No RAW ".to_string()
+            } else if on_main && info.mode_count > 1 {
                 "multiple ".to_string()
             } else {
                 format!("{}mp ", Self::format_sig_figs(megapixels, 3))
@@ -876,7 +907,12 @@ impl MainMenu {
                 colour_themes[12].0 .2,
                 0,
             );
-            let dimensions_text = format!("{}×{} ", info.width, info.height);
+            // Suppress the "0×0" for non-RAW cameras (the "No RAW" title already conveys it).
+            let dimensions_text = if info.supports_raw {
+                format!("{}×{} ", info.width, info.height)
+            } else {
+                String::new()
+            };
             self.text_renderer.draw_text_right(
                 pixels,
                 self.width,
@@ -1821,12 +1857,16 @@ impl MainMenu {
                                 Button::Camera { index, info } => {
                                     if !info.supports_raw {
                                         None
-                                    } else if self.screen == Screen::Main && info.mode_count > 1 {
-                                        // Multi-mode lens on the main screen: open the mode sub-picker instead of starting the camera.
-                                        navigate = Some(Screen::Modes(info.group_id));
+                                    } else if self.screen == Screen::Main {
+                                        // ALWAYS open the mode sub-screen from Main - even for a single-mode
+                                        // lens - so its Calibrate (bias/dark) entry is reachable. A single-mode
+                                        // lens just shows its one mode plus the Calibrate row. Key the screen
+                                        // by the tapped camera's INDEX (lens_members resolves it to the lens).
+                                        let _ = info;
+                                        navigate = Some(Screen::Modes(*index as i32));
                                         None
                                     } else {
-                                        // Single mode, or already on the sub-screen: start it.
+                                        // Already on the sub-screen: start the selected mode.
                                         Some(MenuAction::StartCamera(*index))
                                     }
                                 }
@@ -1840,14 +1880,9 @@ impl MainMenu {
                                     None
                                 }
                                 Button::Calibrate { index } => {
-                                    // Open the bias/dark shutter picker for this lens (calibration is
-                                    // always at the lens's highest-res mode, so key by its group).
-                                    let g = self
-                                        .all_cameras
-                                        .get(*index)
-                                        .map(|c| c.group_id)
-                                        .unwrap_or(-1);
-                                    navigate = Some(Screen::CalShutter(g));
+                                    // Open the bias/dark shutter picker for this lens, keyed by the head
+                                    // camera's index (lens_members/lens_head_index resolve the lens).
+                                    navigate = Some(Screen::CalShutter(*index as i32));
                                     None
                                 }
                                 Button::CalibrateChoice { index, dark } => {
