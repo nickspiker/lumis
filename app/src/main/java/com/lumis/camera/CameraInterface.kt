@@ -491,6 +491,16 @@ class CameraInterface : Service() {
        return null
    }
    
+   // For a calibration capture, the forced (ISO, shutterNs) to use - max ISO always, plus longest
+   // shutter for dark or shortest for bias. Returns null for a normal capture (use AE warm-up). Lets the
+   // CameraProcessor skip metering and go straight to the known manual exposure.
+   internal fun calibrationForcedSettings(): Pair<Int, Long>? {
+       if (calibrationMode < 0) return null
+       val info = activeCameraInfo ?: return null
+       val shutter = if (calibrationMode == 1) info.maxExposure else info.minExposure
+       return Pair(info.maxIso, shutter)
+   }
+
    // Called from the settings poll when a calibration capture has been finalized (averaged + written
    // to disk). The integrator has cleared CALIBRATING_BIT, so the UI process leaves the stats screen.
    // The post-finalize "show the dark frame, tap to return to menu" view is wired in a later step; for
@@ -1323,6 +1333,27 @@ class CameraProcessor(private val service: CameraInterface) {
    private fun startCapture() {
        val session = captureSession ?: return
        val device = cameraDevice ?: return
+
+       // Calibration capture knows its exposure exactly (forced max ISO + shortest/longest shutter), so
+       // there is nothing to meter - skip AE warm-up entirely and go straight to manual. This avoids the
+       // burst of contaminated short-exposure warm-up frames that otherwise reach the accumulator.
+       val forced = service.calibrationForcedSettings()
+       if (forced != null) {
+           val (calIso, calShutterNs) = forced
+           aeWarmingUp = false
+           currentIso = calIso
+           currentShutterSpeedNs = calShutterNs
+           // Create the integrator (also engages CALIBRATING_BIT), then start the manual request directly.
+           service.initIntegrator(calIso, calShutterNs)
+           try {
+               val builder = buildManualRequest(device)
+               session.setRepeatingRequest(builder.build(), captureCallback, backgroundHandler)
+               Log.i("CameraInterface", "Calibration: skipped AE warm-up, manual capture at ISO=$calIso shutter=${calShutterNs}ns")
+           } catch (e: Exception) {
+               Log.e("CameraInterface", "Failed to start calibration manual capture: $e")
+           }
+           return
+       }
 
        try {
            // Begin with an auto-exposure warm-up so we can meter the scene and pick sensible opening ISO/shutter; captureCallback flips us to manual once AE settles. Focus stays manual (infinity) throughout - we only auto exposure.

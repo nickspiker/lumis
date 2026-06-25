@@ -756,6 +756,12 @@ impl CameraIntegrator {
         if forced_shutter_ns > 0.0 && captured_shutter_ns > 0 {
             let ratio = captured_shutter_ns as f64 / forced_shutter_ns;
             if !(0.9..=1.1).contains(&ratio) {
+                // Log every reject so we can confirm whether skipping AE warm-up (Kotlin side) already
+                // removed these at the source - if this never fires now, the gate is redundant insurance.
+                log::info!(
+                    "Calibration: rejected frame (shutter {}ns vs forced {:.0}ns, ratio {:.3})",
+                    captured_shutter_ns, forced_shutter_ns, ratio
+                );
                 return; // not at the forced exposure yet - skip (don't count, don't init)
             }
         }
