@@ -33,6 +33,9 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCameraInit(
     min_focus: jfloat,
     initial_iso: jint,
     initial_shutter_ns: jlong,
+    focal_length_mm: jfloat,
+    aperture_fnum: jfloat,
+    sensor_diag_mm: jfloat,
 ) -> jlong {
     if crate::DEBUG {
         info!(
@@ -77,9 +80,18 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCameraInit(
         initial_shutter_ns as f64,
     ));
 
+    // Lens metadata for EXIF (written straight to the header; only read at save time). 0 = unknown/omit.
+    let mut integrator = integrator;
+    integrator.header[crate::shared_memory::FOCAL_LENGTH_MM_IDX] = (focal_length_mm as f64).to_bits();
+    integrator.header[crate::shared_memory::APERTURE_FNUM_IDX] = (aperture_fnum as f64).to_bits();
+    integrator.header[crate::shared_memory::SENSOR_DIAG_MM_IDX] = (sensor_diag_mm as f64).to_bits();
+
     let integrator_ptr = Box::into_raw(integrator) as jlong;
     if crate::DEBUG {
-        info!("Camera integrator created at 0x{:x}", integrator_ptr as u64);
+        info!(
+            "Camera integrator created at 0x{:x} (focal={}mm f/{} diag={}mm)",
+            integrator_ptr as u64, focal_length_mm, aperture_fnum, sensor_diag_mm
+        );
     }
     integrator_ptr
 }

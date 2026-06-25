@@ -139,7 +139,10 @@ class CameraInterface : Service() {
            maxExposure: Long,
            minFocus: Float,
            initialIso: Int,
-           initialShutterNs: Long
+           initialShutterNs: Long,
+           focalLengthMm: Float,
+           apertureFnum: Float,
+           sensorDiagMm: Float
        ): Long
        
        @JvmStatic
@@ -457,7 +460,10 @@ class CameraInterface : Service() {
            cameraInfo.maxExposure,
            cameraInfo.minFocusDistance,
            seedIso,
-           seedShutterNs
+           seedShutterNs,
+           cameraInfo.focalLengthMm,
+           cameraInfo.apertureFnum,
+           cameraInfo.sensorDiagMm
        )
        cameraProcessor.setNativeContext(nativeCameraContextPtr)
        // Probe whether this device's MediaStore accepts image/jxl, and record it so the UI cycle skips
@@ -496,12 +502,20 @@ class CameraInterface : Service() {
                val maxIso = cameraArray[i++].toInt()
                val minExposure = cameraArray[i++].toLong()
                val maxExposure = cameraArray[i++].toLong()
-               i++ // Skip sensorWidth (physical mm)
-               i++ // Skip sensorHeight (physical mm)
+               val sensorWidthMm = cameraArray[i++]  // physical mm
+               val sensorHeightMm = cameraArray[i++] // physical mm
                val focalLengthCount = cameraArray[i++].toInt()
-               i += focalLengthCount // Skip focal lengths
+               // Capture the first focal length (shortest = the lens's native focal) for EXIF.
+               val focalLengthMm = if (focalLengthCount > 0) cameraArray[i] else 0f
+               i += focalLengthCount
                val apertureCount = cameraArray[i++].toInt()
-               i += apertureCount // Skip apertures
+               // Capture the first (widest) aperture for EXIF FNumber.
+               val apertureFnum = if (apertureCount > 0) cameraArray[i] else 0f
+               i += apertureCount
+               // Active-array physical diagonal (mm) for the 35mm-equivalent focal length.
+               val sensorDiagMm = if (sensorWidthMm > 0f && sensorHeightMm > 0f) {
+                   kotlin.math.sqrt(sensorWidthMm * sensorWidthMm + sensorHeightMm * sensorHeightMm)
+               } else 0f
                val minFocusDistance = cameraArray[i++]
                i++ // Skip hasOIS
                val hardwareLevel = cameraArray[i++].toInt()
@@ -528,7 +542,10 @@ class CameraInterface : Service() {
                        hardwareLevel,
                        logicalId = logicalIdSb.toString(),
                        physicalId = if (physicalIdSb.isEmpty()) null else physicalIdSb.toString(),
-                       maxRes = maxRes
+                       maxRes = maxRes,
+                       focalLengthMm = focalLengthMm,
+                       apertureFnum = apertureFnum,
+                       sensorDiagMm = sensorDiagMm
                    )
                }
 
@@ -1058,7 +1075,12 @@ data class CameraInfo(
    val hardwareLevel: Int,
    val logicalId: String = "",
    val physicalId: String? = null,
-   val maxRes: Boolean = false
+   val maxRes: Boolean = false,
+   // Lens metadata for EXIF (0 = unknown). focalLengthMm + apertureFnum from CameraCharacteristics;
+   // sensorDiagMm is the active-array physical diagonal, used for the 35mm-equivalent focal length.
+   val focalLengthMm: Float = 0f,
+   val apertureFnum: Float = 0f,
+   val sensorDiagMm: Float = 0f
 )
 
 // Camera processor - handles Camera2 API

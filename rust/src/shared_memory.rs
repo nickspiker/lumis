@@ -46,6 +46,11 @@ pub const CAL_NOISE_IDX: usize = 52; // f64 bits: residual per-pixel noise std (
 // and the default falls back to JPEG). Numbered so the zero-init default doesn't accidentally disable JXL.
 pub const JXL_SUPPORTED_IDX: usize = 53;
 
+// Lens metadata for EXIF, set at camera init from CameraCharacteristics (f64 bits). 0 = unknown/omit.
+pub const FOCAL_LENGTH_MM_IDX: usize = 54; // physical focal length in mm
+pub const APERTURE_FNUM_IDX: usize = 55; // f-number (e.g. 1.8)
+pub const SENSOR_DIAG_MM_IDX: usize = 56; // active-array physical diagonal in mm, for 35mm-equiv focal
+
 pub const IMAGE_START: usize = 64;
 
 // Save format values (SAVE_FORMAT_IDX). Numbered to match the tap-cycle order JXL -> JPEG -> DNG -> TIFF, and JXL is 0 so it's the zero-initialized default.
