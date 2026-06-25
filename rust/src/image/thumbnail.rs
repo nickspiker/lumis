@@ -56,8 +56,19 @@ pub fn build_preview_jpeg(
     for (i, px) in lin.iter().enumerate() {
         for c in 0..3 {
             // clamp to [0,1] is REQUIRED here: a real colour matrix has negative coefficients, so a post-matrix channel can be < 0 for out-of-gamut colours, and f32::powf(negative, fractional) returns NaN. Clamping the base to [0,1] before powf prevents that NaN (which would otherwise corrupt the pixel). The upper 1.0 bound keeps over-white values in range so the *255 cast lands in 0..=255.
-            let v = (px[c] * inv_white).clamp(0.0, 1.0).powf(inv_gamma);
-            rgb8[i * 3 + c] = (v * 255.0 + 0.5) as u8;
+            let v = (px[c] * inv_white).clamp(0.0, 1.0).powf(inv_gamma) * 255.0;
+            // Stochastic dither: floor, then carry the remainder up probabilistically (out = floor + 1
+            // with probability = frac(v)). This trades 8-bit banding on smooth gradients for a touch of
+            // noise, which the eye strongly prefers - it's what removes the contouring seen on thumbnails.
+            // The "random" threshold is a cheap per-(pixel,channel) hash (no RNG dep, deterministic so a
+            // re-save is byte-identical, and decorrelated enough to look like noise, not a pattern).
+            let floor = v.floor();
+            let frac = v - floor;
+            let h = (i as u32).wrapping_mul(2654435761).wrapping_add((c as u32).wrapping_mul(40503));
+            let h = h ^ (h >> 15);
+            let threshold = (h & 0xFFFF) as f32 / 65536.0; // uniform in [0,1)
+            let dithered = floor + if frac > threshold { 1.0 } else { 0.0 };
+            rgb8[i * 3 + c] = dithered.min(255.0) as u8;
         }
     }
 
