@@ -166,6 +166,11 @@ class CameraInterface : Service() {
        @JvmStatic
        external fun nativeCheckFinalizeCalibration(contextPtr: Long): Boolean
 
+       // Poll-driven save check (camera process). Runs try_save from the settings poll so a manual save at
+       // a long exposure fires immediately from the already-integrated data, not on the next frame.
+       @JvmStatic
+       external fun nativeCheckSave(contextPtr: Long)
+
        @JvmStatic
        external fun nativeCameraGetSharedMemoryPtr(contextPtr: Long): Long
        
@@ -1037,6 +1042,9 @@ class CameraProcessor(private val service: CameraInterface) {
                        Log.i("CameraInterface", "Calibration finalized - notifying UI to show result")
                        service.onCalibrationFinalized()
                    }
+                   // Also poll the save flag so a manual save at a long exposure fires immediately from
+                   // the already-integrated frame instead of waiting for the next (up to 16s) frame.
+                   CameraInterface.nativeCheckSave(ptr)
                    val s = CameraInterface.nativeGetCurrentSettings(ptr)
                    updateCameraSettings(s.iso, s.shutterNs, s.focusDistance)
                } catch (e: Exception) {

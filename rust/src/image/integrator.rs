@@ -431,7 +431,29 @@ impl CameraIntegrator {
             }
         }
 
-        // Check for save requests and spawn saving thread if needed
+        // Check for save requests; the heavy save runs in try_save (also reachable from the
+        // settings poll so a save fires immediately, not only when the next 16s frame arrives).
+        self.try_save();
+        // Send Kotlin user settings from header
+        let current_iso = f64::from_bits(self.header[ISO_IDX]);
+        let current_shutter_ns = f64::from_bits(self.header[SHUTTER_NS_IDX]);
+        let current_focus = f64::from_bits(self.header[FOCUS_IDX]);
+        (
+            current_iso as i32,
+            current_shutter_ns as i64,
+            current_focus as f32,
+        )
+    }
+
+
+    /// Check the save flags and, if a manual/continuous save is pending and not already saving,
+    /// spawn the encode+write from the ALREADY-PUBLISHED image_buffer slot. Callable from
+    /// process_frame and from the 30Hz settings poll (nativeCheckSave) so a save at a long
+    /// exposure fires within ~33ms instead of waiting for the next frame - the data already
+    /// exists in image_buffer; only the flag check was frame-gated.
+    pub fn try_save(&mut self) {
+        // Quad-Bayer-ness comes from the header here (process_frame's raw10 param isn't in scope).
+        let raw10 = self.header[QUAD_BAYER_IDX] != 0;
         let flags = self.header[FLAGS_IDX];
         let manual_save = (flags & MANUAL_SAVE_BIT) != 0;
         let continuous_save = (flags & CONTINUOUS_SAVE_BIT) != 0;
@@ -728,15 +750,6 @@ impl CameraIntegrator {
                 // CURRENTLY_SAVING is cleared by Kotlin after the file is written.
             });
         }
-        // Send Kotlin user settings from header
-        let current_iso = f64::from_bits(self.header[ISO_IDX]);
-        let current_shutter_ns = f64::from_bits(self.header[SHUTTER_NS_IDX]);
-        let current_focus = f64::from_bits(self.header[FOCUS_IDX]);
-        (
-            current_iso as i32,
-            current_shutter_ns as i64,
-            current_focus as f32,
-        )
     }
 
     /// One frame of a dark-frame calibration capture. Accumulates per-pixel mean (`accumulated`) and

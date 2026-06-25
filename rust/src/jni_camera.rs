@@ -145,6 +145,18 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCheckFinalizeCalib
     }
 }
 
+/// Poll-driven save check (camera process). Runs try_save from the 30Hz settings poll so a manual save
+/// at a long exposure fires within ~33ms (from the already-published image_buffer) instead of waiting up
+/// to a full exposure for the next frame - the data already exists; only the flag check was frame-gated.
+#[no_mangle]
+pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCheckSave(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    ptr: jlong,
+) {
+    integrator_ptr(ptr).try_save();
+}
+
 #[no_mangle]
 pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCameraGetSharedMemoryFd(
     _env: JNIEnv<'_>,
