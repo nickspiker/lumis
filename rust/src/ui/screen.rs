@@ -372,38 +372,26 @@ fn draw_calibration_result(
     let dh = (ih as f32 * scale) as usize;
     let off_x = (sw - dw) / 2;
     let off_y = (sh - dh) / 2;
-    // Subtract the frame's OWN mean rather than the metadata black level: at extreme ISO the reported
-    // black point is unreliable (often wrong), so subtracting it over/undershoots and the preview goes
-    // flat/dark. The mean is the true centre of THIS data, so subtracting it puts ~half the pixels - the
-    // brighter half (hot pixels, high-noise excursions, exactly what we want to inspect) - above zero,
-    // and the gamma-2 (single sqrt) stretch lifts them into view. One O(n) pass for the mean (median
-    // would be a full sort - far too slow over 50MP for a UI render). span auto-scales to the positive
-    // spread so the visible noise fills the brightness range regardless of absolute level.
+    // Simple, honest display: subtract the mean, scale by the FIXED white-black range (NOT the data's
+    // own spread), gamma 2. No per-frame auto-scaling - that was the bug: dividing by each frame's own
+    // max excursion cranked the gain on a low-signal BIAS frame so it looked brighter than a 16s DARK,
+    // and stacked with gamma 4 it turned a genuinely near-black frame almost white. With a fixed range a
+    // near-black frame correctly LOOKS near-black, and bias is dimmer than dark, as physics demands.
     let npix = iw * ih;
     let mut sum = 0.0f64;
     for i in 0..npix {
         sum += ui.image_buffer[i] as f64;
     }
     let mean = (sum / npix as f64) as f32;
-    // Auto-scale: max positive excursion above the mean (sampled cheaply by stepping) sets full white.
-    let mut max_above = 1.0f32;
-    let mut i = 0usize;
-    while i < npix {
-        let d = ui.image_buffer[i] as f32 - mean;
-        if d > max_above {
-            max_above = d;
-        }
-        i += 37; // sparse sample - enough to find the bright tail without a second full pass
-    }
-    let span = max_above.max(1.0);
+    // Fixed display range: white - black (frame-independent), so brightness is comparable across captures.
+    let span = (65535.0 - ui.raw_black_level as f32).max(1.0);
     for dy in 0..dh {
         let sy = (dy as f32 / scale) as usize;
         for dx in 0..dw {
             let sx = (dx as f32 / scale) as usize;
             let raw = ui.image_buffer[(sy * iw + sx).min(npix - 1)] as f32;
-            let v = ((raw - mean) / span).max(0.0); // mean-subtracted, 0..1 over the positive spread
-            // gamma 2 = single sqrt (display-standard). Double-sqrt (gamma 4) over-brightened the noise
-            // floor into a grainy mess; single sqrt keeps the dark frame readable without crushing it bright.
+            let v = ((raw - mean) / span).max(0.0); // mean-subtracted, fixed-range normalised
+            // gamma 2 = single sqrt (display-standard).
             let b = (v.sqrt() * 255.0).min(255.0) as u8;
             let off = ((off_y + dy) * sw + (off_x + dx)) * 3;
             if off + 2 < pixels.len() {
