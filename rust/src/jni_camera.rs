@@ -3,7 +3,7 @@ use crate::shared_memory::*;
 extern crate libc;
 use jni::{
     objects::{JByteBuffer, JClass, JObject},
-    sys::{jboolean, jfloat, jint, jlong, jobject},
+    sys::{jboolean, jdouble, jfloat, jint, jlong, jobject},
     JNIEnv,
 };
 use log::*;
@@ -48,6 +48,120 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeVerifyCalVsf<'loca
         error!("Calibration VSF read-back verification FAILED");
         0
     }
+}
+
+/// Apply a dark-frame calibration to an already-saved DNG and write the corrected DNG to an output fd.
+/// Called by Kotlin AFTER the normal (uncorrected) DNG is written, so the camera process never holds the
+/// big cal maps resident (holding two 50MP maps for the whole session got the process OS-killed). Here the
+/// maps are read, used, and freed within one call.
+///
+/// fds (all dup'd from Kotlin, read/written in native memory): `dng_fd` = the just-saved uncorrected DNG;
+/// `bias_fd` / `dark_fd` = the cal .vsf pair; `out_fd` = where to write the corrected DNG. `iso_light` /
+/// `t_light_ns` = the light's effective ISO + integration time; `white_level` = sensor white (cal->light
+/// scale = 65535/white). Returns 1 on success, 0 on any failure (Kotlin then just keeps the uncorrected one).
+#[no_mangle]
+pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeApplyCalToDng<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    dng_fd: jint,
+    bias_fd: jint,
+    dark_fd: jint,
+    out_fd: jint,
+    iso_light: jdouble,
+    t_light_ns: jdouble,
+    white_level: jint,
+) -> jboolean {
+    use crate::image::calibration::{CalFile, LoadedCalibration};
+    if dng_fd < 0 || bias_fd < 0 || dark_fd < 0 || out_fd < 0 {
+        return 0;
+    }
+    // 1) Read the uncorrected DNG and decode the cal pair (each in native memory, freed as we go).
+    let dng = match read_fd_to_vec(dng_fd) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("ApplyCal: read dng fd failed: {}", e);
+            return 0;
+        }
+    };
+    let bias_bytes = match read_fd_to_vec(bias_fd) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("ApplyCal: read bias fd failed: {}", e);
+            return 0;
+        }
+    };
+    let bias_file = match CalFile::decode(&bias_bytes, false) {
+        Some(c) => c,
+        None => {
+            error!("ApplyCal: bias decode failed");
+            return 0;
+        }
+    };
+    drop(bias_bytes);
+    let dark_bytes = match read_fd_to_vec(dark_fd) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("ApplyCal: read dark fd failed: {}", e);
+            return 0;
+        }
+    };
+    let dark_file = match CalFile::decode(&dark_bytes, true) {
+        Some(c) => c,
+        None => {
+            error!("ApplyCal: dark decode failed");
+            return 0;
+        }
+    };
+    drop(dark_bytes);
+    let cal = match LoadedCalibration::from_pair(bias_file, dark_file) {
+        Some(c) => c,
+        None => {
+            error!("ApplyCal: bias/dark dim mismatch");
+            return 0;
+        }
+    };
+
+    // 2) The raw strip is the FINAL width*height*2 bytes of our DNG (the encoder appends raw after the
+    //    header). Apply the correction to those pixels in place, then write header + corrected raw to out_fd.
+    let n = cal.width * cal.height;
+    let raw_bytes = n * 2;
+    if dng.len() < raw_bytes {
+        error!("ApplyCal: dng too small ({} < {})", dng.len(), raw_bytes);
+        return 0;
+    }
+    let header_len = dng.len() - raw_bytes;
+    let light: Vec<u16> = (0..n)
+        .map(|i| u16::from_le_bytes([dng[header_len + i * 2], dng[header_len + i * 2 + 1]]))
+        .collect();
+    let cal_scale = 65535.0 / (white_level.max(1) as f64);
+    let corrected = cal.apply(&light, iso_light, t_light_ns, cal_scale);
+
+    // 3) Write the corrected DNG: original header bytes, then the corrected raw (LE u16).
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    let out_dup = unsafe { libc::dup(out_fd) };
+    if out_dup < 0 {
+        error!("ApplyCal: dup out_fd failed");
+        return 0;
+    }
+    let mut out = unsafe { std::fs::File::from_raw_fd(out_dup) };
+    if out.write_all(&dng[0..header_len]).is_err() {
+        error!("ApplyCal: write header failed");
+        return 0;
+    }
+    let corr_raw = unsafe {
+        std::slice::from_raw_parts(corrected.as_ptr() as *const u8, corrected.len() * 2)
+    };
+    if out.write_all(corr_raw).is_err() {
+        error!("ApplyCal: write raw failed");
+        return 0;
+    }
+    let _ = out.flush();
+    info!(
+        "ApplyCal: corrected DNG written ({}x{}, iso_cal={:.0} exp={:.0} g/te applied)",
+        cal.width, cal.height, cal.iso_cal, cal.exposure_ns
+    );
+    1
 }
 
 /// Read an entire file referenced by a raw fd into a Vec, in native memory. dup()s the fd so our File

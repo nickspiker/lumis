@@ -5,17 +5,19 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{thread, u32};
 
-// Global storage for pending save data (now just DNG bytes and filename)
-static PENDING_SAVE_DATA: Mutex<Option<(Vec<u8>, String)>> = Mutex::new(None);
+// Global QUEUE of pending save data (bytes + filename). A queue (not a single slot) so one capture can emit
+// multiple files - e.g. an uncorrected DNG plus a calibration-corrected DNG. Kotlin drains one per poll.
+static PENDING_SAVE_DATA: Mutex<std::collections::VecDeque<(Vec<u8>, String)>> =
+    Mutex::new(std::collections::VecDeque::new());
 
-/// Get pending save data for JNI save operations
+/// Pop the next pending save (FIFO) for JNI save operations. None when the queue is empty.
 pub fn get_pending_save_data() -> Option<(Vec<u8>, String)> {
-    PENDING_SAVE_DATA.lock().unwrap().take()
+    PENDING_SAVE_DATA.lock().unwrap().pop_front()
 }
 
-/// Set pending save data for JNI save operations  
+/// Enqueue one pending save (FIFO).
 pub fn set_pending_save_data(dng_data: Vec<u8>, filename: String) {
-    *PENDING_SAVE_DATA.lock().unwrap() = Some((dng_data, filename));
+    PENDING_SAVE_DATA.lock().unwrap().push_back((dng_data, filename));
 }
 
 pub struct CameraSettings {
@@ -166,6 +168,12 @@ struct CalibrationState {
     sample_idx: Vec<usize>, // fixed random pixel indices used for the correlation sample
     even_sum: Vec<u64>,     // per-sample sum over even-numbered frames
     odd_sum: Vec<u64>,      // per-sample sum over odd-numbered frames
+    // The ISO and shutter the HAL ACTUALLY applied on accepted frames (last accepted wins - post-settle and
+    // stable). Stored in the cal VSF so apply-time knows the gain/exposure this cal was shot at, WITHOUT
+    // re-querying the sensor's max ISO (a firmware/HAL update can move the ISO range, which would corrupt
+    // the gain ratio if we trusted "current max" instead of the concrete value the cal was captured at).
+    captured_iso: f64,
+    captured_shutter_ns: f64,
 }
 
 impl CameraIntegrator {
@@ -383,7 +391,7 @@ impl CameraIntegrator {
         // throttled progress stats, and finalize-to-disk on request. Handled entirely here so the
         // verified normal exposure path below is never touched while calibrating.
         if (self.header[FLAGS_IDX] & CALIBRATING_BIT) != 0 {
-            self.process_calibration_frame(frame_data, _captured_shutter_ns);
+            self.process_calibration_frame(frame_data, _captured_iso, _captured_shutter_ns);
             // Return the header's current (forced) settings so Kotlin keeps pushing them to the HAL,
             // same as the normal path's tail return.
             return (
@@ -878,7 +886,7 @@ impl CameraIntegrator {
         }
     }
 
-    fn process_calibration_frame(&mut self, frame_data: &[u8], _captured_shutter_ns: i64) {
+    fn process_calibration_frame(&mut self, frame_data: &[u8], captured_iso: i32, captured_shutter_ns: i64) {
         let pixel_count = self.width * self.height;
 
         // Arrival gate (wall-clock, HAL-metadata-independent). The HAL delivers an early frame before the
@@ -944,6 +952,8 @@ impl CameraIntegrator {
                 sample_idx,
                 even_sum: vec![0u64; n],
                 odd_sum: vec![0u64; n],
+                captured_iso: 0.0,
+                captured_shutter_ns: 0.0,
             });
             // NOTE: the unix start (EXPOSURE_START_*) that the UI diffs for its live elapsed counter is
             // stamped in mark_calibration_start() at engage time, NOT here - stamping it on the first frame
@@ -975,6 +985,14 @@ impl CameraIntegrator {
             }
             cal.frame_count += 1;
             cal.last_accept = now; // wall-clock arrival of this accepted frame; gates the next dark frame
+            // Record the HAL's actually-applied ISO/shutter (last accepted frame wins - stable post-settle).
+            // Stored in the cal VSF so apply-time scales by the gain/exposure this cal was really shot at.
+            if captured_iso > 0 {
+                cal.captured_iso = captured_iso as f64;
+            }
+            if captured_shutter_ns > 0 {
+                cal.captured_shutter_ns = captured_shutter_ns as f64;
+            }
         }
 
         // Throttled stats snapshot (~1.5s gate). For 16s darks every frame passes; fast bias throttles.
@@ -1071,6 +1089,22 @@ impl CameraIntegrator {
         };
         let mean_z = deflate(&mean_samples);
         let var_z = deflate(&var_samples);
+        // ISO + shutter this cal was actually shot at (HAL-reported; fall back to the forced max/extreme if
+        // the HAL never populated them). Stored so apply-time scales by the real gain/exposure and never has
+        // to re-query the sensor's max ISO (firmware updates can move the ISO range -> wrong gain ratio).
+        let iso_cal = if cal.captured_iso > 0.0 {
+            cal.captured_iso
+        } else {
+            f64::from_bits(self.header[MAX_ISO_IDX])
+        };
+        let exposure_ns = if cal.captured_shutter_ns > 0.0 {
+            cal.captured_shutter_ns
+        } else if is_dark {
+            f64::from_bits(self.header[LONGEST_SHUTTER_NS_IDX])
+        } else {
+            f64::from_bits(self.header[SHORTEST_SHUTTER_NS_IDX])
+        };
+        log::info!("Calibration {kind}: iso_cal={:.0} exposure_ns={:.0}", iso_cal, exposure_ns);
         let vsf_bytes = vsf::vsf_builder::VsfBuilder::new()
             .add_section(
                 "calibration",
@@ -1079,6 +1113,10 @@ impl CameraIntegrator {
                     ("width".to_string(), vsf::types::VsfType::u6(self.width as u64)),
                     ("height".to_string(), vsf::types::VsfType::u6(self.height as u64)),
                     ("frame_count".to_string(), vsf::types::VsfType::u6(cal.frame_count)),
+                    // iso/exposure as integers (round; ISO and ns are whole-number domains).
+                    ("iso_cal".to_string(), vsf::types::VsfType::u6(iso_cal.round() as u64)),
+                    ("exposure_ns".to_string(), vsf::types::VsfType::u6(exposure_ns.round() as u64)),
+                    ("black_level".to_string(), vsf::types::VsfType::u6(self.black_level as u64)),
                     ("mean".to_string(), vsf::types::VsfType::v(b'z', mean_z)),
                     ("variance".to_string(), vsf::types::VsfType::v(b'z', var_z)),
                 ],

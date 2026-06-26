@@ -1,3 +1,4 @@
+pub mod calibration;
 pub mod dng;
 pub mod icc;
 pub mod integrator;
