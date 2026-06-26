@@ -382,7 +382,7 @@ impl CameraIntegrator {
         // throttled progress stats, and finalize-to-disk on request. Handled entirely here so the
         // verified normal exposure path below is never touched while calibrating.
         if (self.header[FLAGS_IDX] & CALIBRATING_BIT) != 0 {
-            self.process_calibration_frame(frame_data);
+            self.process_calibration_frame(frame_data, _captured_shutter_ns);
             // Return the header's current (forced) settings so Kotlin keeps pushing them to the HAL,
             // same as the normal path's tail return.
             return (
@@ -863,15 +863,28 @@ impl CameraIntegrator {
     /// sample-only even/odd half-sum for the live split-half convergence correlation, writes throttled
     /// progress stats to shared memory (gated at ~1.5s so 16s darks snapshot every frame while fast bias
     /// frames throttle), and finalizes to disk + stops when the UI sets CAL_FINALIZE_BIT.
-    fn process_calibration_frame(&mut self, frame_data: &[u8]) {
+    fn process_calibration_frame(&mut self, frame_data: &[u8], captured_shutter_ns: i64) {
         let pixel_count = self.width * self.height;
 
-        // No exposure gate needed: calibration skips AE warm-up and goes straight to the forced manual
-        // exposure (CameraProcessor.startCapture), so every delivered frame is already at the calibration
-        // shutter - there are no contaminated transitional frames to reject. (Confirmed on-device: zero
-        // rejects with the warm-up skip in place.)
+        // Exposure gate: REJECT any frame whose actual shutter isn't ~the forced calibration shutter. On
+        // this device the HAL delivers an early, short-exposure frame before the 16s manual exposure takes
+        // effect (the tell: the frame counter jumps to 1 almost immediately, then holds 16s for frame 2 -
+        // that fast first frame is NOT a real dark and would contaminate the average). Accept only frames
+        // within 10% of the forced shutter; skip (no count, no accumulate, no init) otherwise.
+        let forced_shutter_ns = f64::from_bits(self.header[SHUTTER_NS_IDX]);
+        if forced_shutter_ns > 0.0 && captured_shutter_ns > 0 {
+            let ratio = captured_shutter_ns as f64 / forced_shutter_ns;
+            if !(0.9..=1.1).contains(&ratio) {
+                log::info!(
+                    "Calibration: rejecting frame at {:.3}s (need {:.3}s)",
+                    captured_shutter_ns as f64 / 1.0e9,
+                    forced_shutter_ns / 1.0e9
+                );
+                return;
+            }
+        }
 
-        // First calibration frame: (re)initialise the accumulators and the correlation sample.
+        // First (matching) calibration frame: (re)initialise the accumulators and the correlation sample.
         if self.cal.is_none() {
             for i in 0..pixel_count {
                 self.integration_buffer.accumulated[i] = 0;
