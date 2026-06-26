@@ -892,6 +892,13 @@ impl CameraIntegrator {
                 even_sum: vec![0u64; n],
                 odd_sum: vec![0u64; n],
             });
+            // Stamp the calibration start time (unix) ONCE so the UI can show a LIVE elapsed counter -
+            // the per-frame stats only publish every ~16s (one dark frame), so reading CAL_ELAPSED_MS made
+            // the timer tick once per frame. The UI diffs this against its heartbeat clock each render.
+            if let Ok(t) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                self.header[EXPOSURE_START_SECS_IDX] = t.as_secs();
+                self.header[EXPOSURE_START_NANOS_IDX] = t.subsec_nanos() as u64;
+            }
         }
 
         // Accumulate this frame. Borrow split: read cal sample/index, write integration buffers.
@@ -994,11 +1001,8 @@ impl CameraIntegrator {
 
         // Store as a self-verifying VSF: both maps as 16-bit BitPackedTensors plus labeled metadata
         // (kind, dimensions, frame count). VSF's built-in checksum means a corrupt cal map is detected on
-        // read rather than silently poisoning every corrected shot. Written to the public Pictures/Lumis
-        // dir so it's pullable via ADB from a release build.
-        let dir = "/sdcard/Pictures/Lumis";
-        let _ = std::fs::create_dir_all(dir);
-        let vsf_path = format!("{dir}/cal_{kind}_{}x{}.vsf", self.width, self.height);
+        // read rather than silently poisoning every corrected shot. Routed through the SAME pending-save
+        // -> MediaStore pipe the DNGs use (a direct std::fs::write to /sdcard fails under scoped storage).
         let mean_tensor =
             vsf::types::BitPackedTensor::pack_u16(16, vec![self.width, self.height], &mean_samples);
         let var_tensor =
@@ -1016,16 +1020,14 @@ impl CameraIntegrator {
                 ],
             )
             .build();
-        let r1: std::io::Result<()> = match vsf_bytes {
-            Ok(bytes) => std::fs::write(&vsf_path, &bytes),
-            Err(e) => {
-                log::error!("VSF build failed: {}", e);
-                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+        match vsf_bytes {
+            Ok(bytes) => {
+                let filename = format!("cal_{kind}_{}x{}.vsf", self.width, self.height);
+                log::info!("Calibration VSF built ({} bytes) -> {}", bytes.len(), filename);
+                set_pending_save_data(bytes, filename);
             }
-        };
-        let r2: std::io::Result<()> = Ok(());
-        let mean_path = vsf_path.clone();
-        let var_path = vsf_path;
+            Err(e) => log::error!("VSF build failed: {}", e),
+        }
 
         // Publish the averaged dark frame into the display image_buffer so the UI can show it (gamma 4)
         // after finalize. Write the per-pixel mean (u16) into slot 0's avg region and point the image
@@ -1040,10 +1042,7 @@ impl CameraIntegrator {
         }
 
         if crate::DEBUG {
-            log::info!(
-                "Calibration finalized: {} frames, {} -> {} ({:?}), {} ({:?})",
-                cal.frame_count, kind, mean_path, r1.is_ok(), var_path, r2.is_ok()
-            );
+            log::info!("Calibration finalized: {} frames, kind={}", cal.frame_count, kind);
         }
     }
 

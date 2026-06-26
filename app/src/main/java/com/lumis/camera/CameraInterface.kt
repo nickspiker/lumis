@@ -296,6 +296,35 @@ class CameraInterface : Service() {
        nativeSetJxlSupported(nativeCameraContextPtr, supported)
    }
 
+   // Save a calibration .vsf to MediaStore.Downloads (Download/Lumis). Downloads accepts arbitrary file
+   // types/mime, unlike Images. Overwrites a same-named existing entry (cal maps are versionless per
+   // sensor/mode). Returns true on success.
+   fun saveCalToDownloads(data: ByteArray, filename: String): Boolean {
+       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+           return false // pre-scoped-storage path not needed (those devices can direct-write)
+       }
+       return try {
+           val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+           // Delete any prior copy so we don't accumulate " (1)" duplicates.
+           contentResolver.delete(collection, "${MediaStore.Downloads.DISPLAY_NAME} = ?", arrayOf(filename))
+           val values = ContentValues().apply {
+               put(MediaStore.Downloads.DISPLAY_NAME, filename)
+               put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+               put(MediaStore.Downloads.RELATIVE_PATH, "Download/Lumis")
+               put(MediaStore.Downloads.IS_PENDING, 1)
+           }
+           val uri = contentResolver.insert(collection, values) ?: return false
+           contentResolver.openOutputStream(uri)?.use { it.write(data); it.flush() }
+           values.clear()
+           values.put(MediaStore.Downloads.IS_PENDING, 0)
+           contentResolver.update(uri, values, null, null)
+           true
+       } catch (e: Exception) {
+           Log.e("CameraInterface", "saveCalToDownloads failed: ${e.javaClass.simpleName}: ${e.message}")
+           false
+       }
+   }
+
    // Called from JNI to save image data using MediaStore
    // Returns a save status: SAVE_WRITTEN (a new file was written), SAVE_DUPLICATE (filename already on
    // disk - skipped, still a "success" for the green indicator but NOT a new save), or SAVE_FAILED.
@@ -1175,6 +1204,14 @@ class CameraProcessor(private val service: CameraInterface) {
    // first drains it; nativeGetSavedDngData returns null when there's nothing pending.
    private fun drainPendingSave() {
        service.nativeGetSavedDngData()?.let { savedData: SaveDng ->
+           // Calibration .vsf isn't an image, so MediaStore.Images rejects it - route it to Downloads,
+           // which accepts arbitrary file types. Lands in Download/Lumis, pullable via ADB.
+           if (savedData.filename.endsWith(".vsf")) {
+               val ok = service.saveCalToDownloads(savedData.dngData, savedData.filename)
+               Log.i("CameraInterface", "Calibration VSF -> Downloads: $ok (${savedData.filename})")
+               service.nativeClearSaveInProgress(service.nativeCameraContextPtr, false) // not a photo; don't bump counter
+               return@let
+           }
            val mimeType = service.mimeForFilename(savedData.filename)
            Log.i("CameraInterface", "Processing saved image: ${savedData.dngData.size} bytes, filename: ${savedData.filename}, mime: $mimeType")
            val status = service.saveImageToMediaStoreImpl(savedData.dngData, savedData.filename, mimeType)

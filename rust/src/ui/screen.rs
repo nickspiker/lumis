@@ -244,7 +244,17 @@ fn draw_calibration_screen(
     // Read the published progress stats.
     let is_dark = (ui.header[FLAGS_IDX] & CAL_IS_DARK_BIT) != 0;
     let frames = ui.header[CAL_FRAME_COUNT_IDX];
-    let elapsed_ms = ui.header[CAL_ELAPSED_MS_IDX];
+    // Elapsed is computed LIVE (now - cal start), not read from CAL_ELAPSED_MS_IDX which only updates per
+    // frame (~16s for darks). The integrator stamps EXPOSURE_START_SECS/NANOS once at calibration start.
+    let elapsed_ms = {
+        let start_s = ui.header[EXPOSURE_START_SECS_IDX];
+        let start_ns = ui.header[EXPOSURE_START_NANOS_IDX];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let start = std::time::Duration::new(start_s, start_ns as u32);
+        now.checked_sub(start).map(|d| d.as_millis() as u64).unwrap_or(0)
+    };
     let correlation = f64::from_bits(ui.header[CAL_CORRELATION_IDX]);
     let mean = f64::from_bits(ui.header[CAL_MEAN_IDX]);
     let noise = f64::from_bits(ui.header[CAL_NOISE_IDX]);
