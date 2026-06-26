@@ -244,9 +244,13 @@ fn draw_calibration_screen(
     // Read the published progress stats.
     let is_dark = (ui.header[FLAGS_IDX] & CAL_IS_DARK_BIT) != 0;
     let frames = ui.header[CAL_FRAME_COUNT_IDX];
-    // Elapsed is computed LIVE (now - cal start), not read from CAL_ELAPSED_MS_IDX which only updates per
-    // frame (~16s for darks). The integrator stamps EXPOSURE_START_SECS/NANOS once at calibration start.
-    let elapsed_ms = {
+    // Once FINALIZE is pressed, the capture is done and the ~20s compress/write/verify runs - show the
+    // FROZEN total (stamped by the touch handler) so the timer doesn't keep ticking or look hung.
+    // Otherwise compute elapsed LIVE (now - cal start); CAL_ELAPSED_MS_IDX only updates per 16s frame.
+    let finalizing = (ui.header[FLAGS_IDX] & CAL_FINALIZE_BIT) != 0;
+    let elapsed_ms = if finalizing {
+        ui.header[CAL_ELAPSED_MS_IDX]
+    } else {
         let start_s = ui.header[EXPOSURE_START_SECS_IDX];
         let start_ns = ui.header[EXPOSURE_START_NANOS_IDX];
         let now = std::time::SystemTime::now()
@@ -283,16 +287,23 @@ fn draw_calibration_screen(
     let cr = 255 - cg;
     let secs = elapsed_ms / 1000;
 
+    // Title: while finalizing, replace the "DARK/BIAS CALIBRATION" header with a bright "ENCODING..."
+    // banner (amber) so the user knows the ~20s compress/save/verify is underway and the app isn't hung.
+    // It's "encoding", not "processing" - the maps are losslessly compressed and written, never modified.
+    let title = if finalizing {
+        ("ENCODING - SAVING...".to_string(), 0xFFu8, 0xC0u8, 0x00u8)
+    } else if is_dark {
+        ("DARK CALIBRATION".to_string(), 0xFFu8, 0xC0u8, 0x40u8)
+    } else {
+        ("BIAS CALIBRATION".to_string(), 0xFFu8, 0xC0u8, 0x40u8)
+    };
+    // After FINALIZE the elapsed is the frozen TOTAL; live before that.
+    let time_label = if finalizing { "total" } else { "elapsed" };
     // (text, r, g, b) per line; the title gets a half-line gap after it (index 0).
     let lines: [(String, u8, u8, u8); 6] = [
-        (
-            if is_dark { "DARK CALIBRATION".into() } else { "BIAS CALIBRATION".into() },
-            0xFF,
-            0xC0,
-            0x40,
-        ),
+        title,
         (format!("frames: {}", frames), 0xE0, 0xE0, 0xE0),
-        (format!("elapsed: {}m {}s", secs / 60, secs % 60), 0xE0, 0xE0, 0xE0),
+        (format!("{}: {}m {}s", time_label, secs / 60, secs % 60), 0xE0, 0xE0, 0xE0),
         (format!("convergence: {:.3}", correlation), cr, cg, 0x40),
         (format!("mean: {:.0}", mean), 0xE0, 0xE0, 0xE0),
         (format!("noise: {:.0}", noise), 0xE0, 0xE0, 0xE0),
@@ -352,9 +363,15 @@ fn draw_calibration_screen(
         }
     }
 
-    // FINALIZE button - the menu's rounded teal style. Rect is shared with the touch hit-test.
-    let rect = calibration_finalize_rect(w, h);
-    draw_fancy_button(pixels, w as usize, h, rect, "FINALIZE", false, &mut ui.text_renderer);
+    // FINALIZE + CANCEL button row - the menu's rounded teal style. Rects are shared with the touch
+    // hit-test. Once finalizing (the ~20s compress/write/verify is underway) the capture is done and both
+    // buttons are gone - there's nothing to finalize or cancel anymore, just the processing banner up top.
+    if !finalizing {
+        let frect = calibration_finalize_rect(w, h);
+        draw_fancy_button(pixels, w as usize, h, frect, "FINALIZE", false, &mut ui.text_renderer);
+        let crect = calibration_cancel_rect(w, h);
+        draw_fancy_button(pixels, w as usize, h, crect, "CANCEL", false, &mut ui.text_renderer);
+    }
 }
 
 // The finalized dark frame, brightened so the noise is visible: fit-to-screen, mean-subtracted (so the
@@ -516,10 +533,23 @@ fn draw_fancy_button(
 // The on-screen rectangle (x0,y0,x1,y1) of the calibration FINALIZE button, in buffer pixels. Shared
 // by the renderer and the touch hit-test so they can't drift apart.
 pub fn calibration_finalize_rect(w: u32, h: u32) -> (u32, u32, u32, u32) {
-    let bw = (w as f32 * 0.6) as u32;
+    // Left half of a two-button row: FINALIZE (left) + CANCEL (right).
+    let margin = (w as f32 * 0.06) as u32;
+    let gap = (w as f32 * 0.04) as u32;
     let bh = (h as f32 * 0.08) as u32;
-    let x0 = (w - bw) / 2;
     let y0 = (h as f32 * 0.78) as u32;
+    let bw = (w - margin * 2 - gap) / 2;
+    (margin, y0, margin + bw, y0 + bh)
+}
+
+// Right half of the calibration button row: CANCEL. Tapping it instantly nukes the app (no save).
+pub fn calibration_cancel_rect(w: u32, h: u32) -> (u32, u32, u32, u32) {
+    let margin = (w as f32 * 0.06) as u32;
+    let gap = (w as f32 * 0.04) as u32;
+    let bh = (h as f32 * 0.08) as u32;
+    let y0 = (h as f32 * 0.78) as u32;
+    let bw = (w - margin * 2 - gap) / 2;
+    let x0 = margin + bw + gap;
     (x0, y0, x0 + bw, y0 + bh)
 }
 

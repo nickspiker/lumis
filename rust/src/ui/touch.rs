@@ -50,13 +50,43 @@ pub fn handle_touch(
     // everything else on this screen is inert. Handled before all normal camera-touch logic.
     if (ui.header[crate::shared_memory::FLAGS_IDX] & crate::shared_memory::CALIBRATING_BIT) != 0 {
         if let TouchAction::Down = action {
+            // Once finalizing, the buttons are gone and the screen is just the processing banner - ignore
+            // all taps so a stray press can't kill the app mid-save.
+            if (ui.header[crate::shared_memory::FLAGS_IDX] & crate::shared_memory::CAL_FINALIZE_BIT) != 0 {
+                return true;
+            }
+            // CANCEL: abandon the calibration with no save. Same nuke as the result-screen exit path - stale
+            // the heartbeat so the camera process auto-nukes, then exit. Relaunch boots to the camera menu.
+            let (cx0, cy0, cx1, cy1) = crate::ui::screen::calibration_cancel_rect(
+                ui.screen_run as u32,
+                ui.screen_rise as u32,
+            );
+            if x >= cx0 as f32 && x < cx1 as f32 && y >= cy0 as f32 && y < cy1 as f32 {
+                ui.header[crate::shared_memory::HEARTBEAT_SECS_IDX] -= 256;
+                unsafe {
+                    libc::exit(0);
+                }
+            }
             let (bx0, by0, bx1, by1) = crate::ui::screen::calibration_finalize_rect(
                 ui.screen_run as u32,
                 ui.screen_rise as u32,
             );
             if x >= bx0 as f32 && x < bx1 as f32 && y >= by0 as f32 && y < by1 as f32 {
-                ui.header[crate::shared_memory::FLAGS_IDX] |=
-                    crate::shared_memory::CAL_FINALIZE_BIT;
+                use crate::shared_memory::*;
+                // Freeze the elapsed TOTAL at the moment FINALIZE is pressed (the capture is done now), so
+                // the screen can show the final duration instead of a live-ticking or stale value while the
+                // ~20s compress/write/verify runs. Stamp it into CAL_ELAPSED_MS_IDX, which the screen reads
+                // once CAL_FINALIZE_BIT is set.
+                let start = std::time::Duration::new(
+                    ui.header[EXPOSURE_START_SECS_IDX],
+                    ui.header[EXPOSURE_START_NANOS_IDX] as u32,
+                );
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let total_ms = now.checked_sub(start).map(|d| d.as_millis() as u64).unwrap_or(0);
+                ui.header[CAL_ELAPSED_MS_IDX] = total_ms;
+                ui.header[FLAGS_IDX] |= CAL_FINALIZE_BIT;
             }
         }
         return true; // keep the stats screen repainting; consume all touches
