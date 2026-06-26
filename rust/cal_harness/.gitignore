@@ -1,0 +1,4 @@
+# Pulled calibration .vsf maps and any test inputs/outputs - large binaries, not source.
+data/
+target/
+*.png
