@@ -63,6 +63,11 @@ pub const GPS_ALT_IDX: usize = 60; // metres (signed; below sea level allowed)
 // 0/unset is treated as 1.0 (no gain).
 pub const DISPLAY_GAIN_IDX: usize = 61;
 
+// Live device rotation in degrees (0/90/180/270) from the UI's gravity sensor - the same value that
+// orients the on-screen controls. The save path reads it for the EXIF/DNG Orientation tag (and to rotate
+// baked RGB exports), so saved files are oriented the way the phone was held. Sensor pixels stay native.
+pub const DEVICE_ROTATION_IDX: usize = 62;
+
 pub const IMAGE_START: usize = 64;
 
 // Save format values (SAVE_FORMAT_IDX). Numbered to match the tap-cycle order JXL -> JPEG -> DNG -> TIFF, and JXL is 0 so it's the zero-initialized default.

@@ -955,6 +955,9 @@ impl UserInterface {
             self.device_rotation = new_rotation;
             draw = true;
         }
+        // Publish the live device rotation so the save path can orient the EXIF/DNG tag + baked exports
+        // to match how the phone is held (written every tick - cheap, and covers the initial value too).
+        self.header[DEVICE_ROTATION_IDX] = new_rotation as u64;
         let current_touch_valid = !touch_x.is_nan();
 
         // A fresh touch while the full-screen calibration scan is held dismisses it (and

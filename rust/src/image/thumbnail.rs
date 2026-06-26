@@ -75,6 +75,11 @@ pub fn build_preview_jpeg(
         }
     }
 
+    // The preview is left in NATIVE sensor orientation (not rotated). The DNG's IFD0 Orientation tag
+    // applies to BOTH the raw and this SubIFD preview, so rotating the preview here too would make
+    // tag-honouring viewers rotate it twice (the crop/black-extension bug). Native preview + the correct
+    // Orientation tag = consistent for every viewer (upright if it honours the tag, sideways if not, but
+    // never doubled). The raw can't be rotated anyway (breaks the CFA), so the tag is the only mechanism.
     // --- 6. JPEG encode ---
     let mut out = Cursor::new(Vec::new());
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);

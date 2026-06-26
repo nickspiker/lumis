@@ -486,7 +486,16 @@ impl CameraIntegrator {
             let sensor_black_level = self.header[BLACK_LEVEL_IDX] as u16;
             let sensor_white_level = self.header[WHITE_LEVEL_IDX] as u16;
             let bayer_pattern = self.header[SENSOR_BAYER_PATTERN_IDX] as u32;
-            let device_orientation = self.header[SENSOR_ORIENTATION_IDX] as u16;
+            // Correct display rotation = SENSOR MOUNT angle + how the phone is HELD, both in degrees.
+            // The sensor reads out in its mounted orientation (typically 90deg = sideways), so even a
+            // "normal" portrait shot needs the mount angle to look upright; device_rotation (gravity) then
+            // accounts for how it's held. Summing mod 360 is the standard Camera2 orientation formula.
+            // (The old code used only the mount angle AND mis-read its degrees as a 0/1/2/3 index -> nothing
+            // ever rotated; then I briefly used only device_rotation -> dropped the mount term, so portrait
+            // came out sideways. Both terms are needed.)
+            let sensor_mount = self.header[SENSOR_ORIENTATION_IDX] as u16;
+            let device_held = self.header[DEVICE_ROTATION_IDX] as u16;
+            let device_orientation = (sensor_mount + device_held) % 360;
             let pixel_count = self.width * self.height;
             // JXL fallback: if the format is JXL but this device's MediaStore can't accept it (flag = 2),
             // save as JPEG instead. Belt-and-suspenders for the zero-init default (JXL=0); the UI cycle
@@ -689,10 +698,12 @@ impl CameraIntegrator {
                 use crate::image::save_encode::*;
                 use crate::shared_memory::*;
 
+                // device rotation degrees passed straight through (the RGB encoders rotate the pixels by
+                // this, baking upright orientation into JPEG/TIFF/JXL).
                 let orient_deg = match display_orientation {
-                    1 => 90u16,
-                    2 => 180,
-                    3 => 270,
+                    90 => 90u16,
+                    180 => 180,
+                    270 => 270,
                     _ => 0,
                 };
 
@@ -739,11 +750,12 @@ impl CameraIntegrator {
                         blackcount: 0,
                         blacktype: 0,
                         white: 65535.,
+                        // device rotation (degrees) -> EXIF Orientation tag. 0=1(normal), 90=6(rotate 90 CW),
+                        // 180=3, 270=8(rotate 270 CW). Viewers rotate the native-orientation raw to match.
                         orientation: match display_orientation {
-                            0 => 1,
-                            1 => 8,
-                            2 => 3,
-                            3 => 6,
+                            90 => 6,
+                            180 => 3,
+                            270 => 8,
                             _ => 1,
                         },
                         compression: false,
