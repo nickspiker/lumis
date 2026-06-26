@@ -1022,7 +1022,14 @@ impl CameraIntegrator {
             .build();
         match vsf_bytes {
             Ok(bytes) => {
-                let filename = format!("cal_{kind}_{}x{}.vsf", self.width, self.height);
+                // Include focal length in the name so different LENSES at the same resolution don't
+                // collide (a cal is sensor-specific; same-res main vs ultrawide would otherwise overwrite
+                // each other). Same lens + kind + res deliberately reuses the name (overwrites the old cal).
+                let focal_mm = f64::from_bits(self.header[FOCAL_LENGTH_MM_IDX]);
+                let filename = format!(
+                    "cal_{kind}_{:.1}mm_{}x{}.vsf",
+                    focal_mm, self.width, self.height
+                );
                 log::info!("Calibration VSF built ({} bytes) -> {}", bytes.len(), filename);
                 set_pending_save_data(bytes, filename);
             }

@@ -92,6 +92,11 @@ pub const CAL_FINALIZE_BIT: u64 = 1 << 6;
 // Set by the integrator after finalize: the averaged dark frame is in the display image_buffer slot and
 // the UI should show it (bright, gamma ~4) until tapped. Tapping clears this and returns to the menu.
 pub const CAL_SHOW_RESULT_BIT: u64 = 1 << 7;
+// Read-back verification of the saved calibration VSF: Kotlin re-reads the written file and has Rust
+// decode it (checksum + tensor integrity). OK or FAIL is shown on the result preview screen. Neither set
+// = verify not done yet (e.g. still writing).
+pub const CAL_VERIFY_OK_BIT: u64 = 1 << 8;
+pub const CAL_VERIFY_FAIL_BIT: u64 = 1 << 9;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum RawMode {

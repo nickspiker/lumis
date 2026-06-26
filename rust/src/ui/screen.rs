@@ -414,6 +414,32 @@ fn draw_calibration_result(
             }
         }
     }
+
+    // Read-back verification status (set after the cal VSF is written + re-decoded). Shown over the dark
+    // frame so the user knows the calibration actually saved + verified before leaving the screen.
+    let flags = ui.header[FLAGS_IDX];
+    let (msg, r, g, b) = if (flags & CAL_VERIFY_OK_BIT) != 0 {
+        ("Calibration saved & verified", 0x40u8, 0xFFu8, 0x60u8)
+    } else if (flags & CAL_VERIFY_FAIL_BIT) != 0 {
+        ("Calibration SAVE FAILED", 0xFFu8, 0x40u8, 0x40u8)
+    } else {
+        ("Saving calibration...", 0xC0u8, 0xC0u8, 0xC0u8)
+    };
+    let tsize = sh as f32 * 0.035;
+    ui.text_renderer.draw_text_center(
+        pixels,
+        sw as u32,
+        sh as u32,
+        msg,
+        sw as f32 / 2.0,
+        sh as f32 * 0.06,
+        tsize,
+        0,
+        r,
+        g,
+        b,
+        0,
+    );
 }
 
 // Draw a rounded teal button (same radial-shaded style as the main menu's Back/Calibrate buttons) into

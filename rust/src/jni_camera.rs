@@ -15,6 +15,76 @@ fn integrator_ptr(ptr: jlong) -> &'static mut CameraIntegrator {
     unsafe { &mut *(ptr as *mut CameraIntegrator) }
 }
 
+/// Read-back verify a just-written calibration VSF: Kotlin re-reads the saved file and passes the bytes
+/// here. We VSF-decode (which validates the checksum) and confirm the mean/variance tensors unpack to the
+/// expected pixel count, then set CAL_VERIFY_OK_BIT or CAL_VERIFY_FAIL_BIT so the result screen can show
+/// success/failure. Returns true if verified OK.
+#[no_mangle]
+pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeVerifyCalVsf<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    ptr: jlong,
+    data: JObject<'local>,
+) -> jboolean {
+    let integrator = integrator_ptr(ptr);
+    let bytes = match env.convert_byte_array(unsafe { jni::objects::JByteArray::from_raw(data.as_raw()) }) {
+        Ok(b) => b,
+        Err(_) => {
+            integrator.header[FLAGS_IDX] |= CAL_VERIFY_FAIL_BIT;
+            return 0;
+        }
+    };
+    let ok = verify_cal_vsf(&bytes);
+    integrator.header[FLAGS_IDX] &= !(CAL_VERIFY_OK_BIT | CAL_VERIFY_FAIL_BIT);
+    if ok {
+        integrator.header[FLAGS_IDX] |= CAL_VERIFY_OK_BIT;
+        info!("Calibration VSF read-back verified OK");
+        1
+    } else {
+        integrator.header[FLAGS_IDX] |= CAL_VERIFY_FAIL_BIT;
+        error!("Calibration VSF read-back verification FAILED");
+        0
+    }
+}
+
+/// Decode a calibration VSF and confirm the checksum + that the mean and variance tensors are present and
+/// unpack to width*height samples (read from the section's own width/height fields).
+fn verify_cal_vsf(bytes: &[u8]) -> bool {
+    use vsf::file_format::{VsfHeader, VsfSection};
+    use vsf::types::VsfType;
+    let header = match VsfHeader::decode(bytes) {
+        Ok((h, _)) => h,
+        Err(_) => return false, // checksum / structure invalid
+    };
+    let field = match header.fields.iter().find(|f| f.name == "calibration") {
+        Some(f) => f,
+        None => return false,
+    };
+    let mut ptr = field.offset_bytes;
+    let section = match VsfSection::parse(bytes, &mut ptr) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let get_u64 = |name: &str| -> Option<u64> {
+        match section.get_field(name).and_then(|f| f.values.first()) {
+            Some(VsfType::u6(v)) => Some(*v),
+            _ => None,
+        }
+    };
+    let (w, h) = match (get_u64("width"), get_u64("height")) {
+        (Some(w), Some(h)) => (w as usize, h as usize),
+        _ => return false,
+    };
+    let expected = w * h;
+    let tensor_ok = |name: &str| -> bool {
+        match section.get_field(name).and_then(|f| f.values.first()) {
+            Some(VsfType::p(t)) => t.unpack_u16().len() == expected,
+            _ => false,
+        }
+    };
+    tensor_ok("mean") && tensor_ok("variance")
+}
+
 #[no_mangle]
 pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCameraInit(
     _env: JNIEnv<'_>,
