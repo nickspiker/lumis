@@ -28,3 +28,4 @@ local.properties
 
 # quad demosaic harness build output (source committed, build dir not)
 /rust/quad_harness/target/
+/rust/cal_harness/target/

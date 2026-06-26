@@ -1,0 +1,19 @@
+# Standalone host harness for the dark-frame calibration alpha/beta solver.
+# Loads a bias cal map + a dark cal map + a light raw frame, then solves
+# corrected = raw - (alpha*bias + beta*dark) by minimising the fixed-pattern residual
+# (corrected vs a median/smoothed version of itself). Outputs before/after PNGs + metrics.
+# Source committed (survives wipes); target/ gitignored.
+[package]
+name = "cal_harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+png = "0.17.16"
+
+[[bin]]
+name = "cal_harness"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

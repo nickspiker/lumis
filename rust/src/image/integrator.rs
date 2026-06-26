@@ -993,7 +993,11 @@ impl CameraIntegrator {
             mean_map[i * 2..i * 2 + 2].copy_from_slice(&mean.to_le_bytes());
             var_map[i * 2..i * 2 + 2].copy_from_slice(&var.to_le_bytes());
         }
-        let dir = "/data/data/com.lumis.camera/files";
+        // Write to the public Pictures/Lumis dir (not the app-private files dir) so the cal maps can be
+        // pulled with ADB for host-side analysis even from a release (non-debuggable) build. The Rust
+        // process has direct filesystem access here. (VSF storage + a proper app-managed location is a
+        // later step; raw .bin is the interim format the host α/β solver harness reads.)
+        let dir = "/sdcard/Pictures/Lumis";
         let _ = std::fs::create_dir_all(dir);
         let mean_path = format!("{dir}/cal_{kind}_mean_{}x{}.bin", self.width, self.height);
         let var_path = format!("{dir}/cal_{kind}_var_{}x{}.bin", self.width, self.height);
