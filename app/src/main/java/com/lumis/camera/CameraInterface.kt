@@ -189,7 +189,7 @@ class CameraInterface : Service() {
        // Read-back verify a saved calibration VSF (decode + checksum). Sets the verify OK/FAIL flag the
        // result screen reads. Returns true if verified.
        @JvmStatic
-       external fun nativeVerifyCalVsf(contextPtr: Long, data: ByteArray): Boolean
+       external fun nativeVerifyCalVsf(contextPtr: Long, fd: Int): Boolean
 
        @JvmStatic
        external fun nativeCameraGetSharedMemoryPtr(contextPtr: Long): Long
@@ -323,13 +323,15 @@ class CameraInterface : Service() {
            values.clear()
            values.put(MediaStore.Downloads.IS_PENDING, 0)
            contentResolver.update(uri, values, null, null)
-           // Read-back verify: re-read what we just wrote and have Rust VSF-decode it (checksum + tensor
-           // integrity), setting the OK/FAIL flag the result screen shows. Confirms the cal is intact on
-           // disk before the user walks away.
-           val readBack = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-           if (readBack != null && nativeCameraContextPtr != 0L) {
-               val verified = CameraInterface.nativeVerifyCalVsf(nativeCameraContextPtr, readBack)
-               Log.i("CameraInterface", "Calibration read-back verify: $verified (${readBack.size} bytes)")
+           // Read-back verify: have Rust re-read the saved file (via its file descriptor) and VSF-decode it
+           // (checksum + tensor integrity), setting the OK/FAIL flag the result screen shows. We pass the FD
+           // rather than the bytes because at max-res the file is ~94MB and slurping it into a Java ByteArray
+           // OOMs the camera process's 268MB heap (it still holds the cal maps). Rust reads it in native mem.
+           if (nativeCameraContextPtr != 0L) {
+               contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                   val verified = CameraInterface.nativeVerifyCalVsf(nativeCameraContextPtr, pfd.fd)
+                   Log.i("CameraInterface", "Calibration read-back verify: $verified")
+               }
            }
            true
        } catch (e: Exception) {

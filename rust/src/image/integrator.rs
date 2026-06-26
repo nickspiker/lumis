@@ -162,6 +162,7 @@ struct CalibrationState {
     frame_count: u64,
     start_time: Instant,
     last_snapshot: Instant,
+    last_accept: Instant,   // arrival of the last ACCEPTED dark frame; gates the next on inter-frame time
     sample_idx: Vec<usize>, // fixed random pixel indices used for the correlation sample
     even_sum: Vec<u64>,     // per-sample sum over even-numbered frames
     odd_sum: Vec<u64>,      // per-sample sum over odd-numbered frames
@@ -863,22 +864,60 @@ impl CameraIntegrator {
     /// sample-only even/odd half-sum for the live split-half convergence correlation, writes throttled
     /// progress stats to shared memory (gated at ~1.5s so 16s darks snapshot every frame while fast bias
     /// frames throttle), and finalizes to disk + stops when the UI sets CAL_FINALIZE_BIT.
-    fn process_calibration_frame(&mut self, frame_data: &[u8], captured_shutter_ns: i64) {
+    // Reset the calibration timing anchor to now. Called when CALIBRATING_BIT is engaged so the arrival
+    // gate measures from the real cal start, and clear any prior cal state so the first frame re-inits.
+    // Also stamps the unix start (EXPOSURE_START_*) the UI diffs for its LIVE elapsed counter - stamped
+    // HERE (once, at engage) rather than on the first frame, so the timer doesn't reset ~16s in when the
+    // first dark frame finally arrives and inits the cal state.
+    pub fn mark_calibration_start(&mut self) {
+        self.exposure_start_time = Instant::now();
+        self.cal = None;
+        if let Ok(t) = SystemTime::now().duration_since(UNIX_EPOCH) {
+            self.header[EXPOSURE_START_SECS_IDX] = t.as_secs();
+            self.header[EXPOSURE_START_NANOS_IDX] = t.subsec_nanos() as u64;
+        }
+    }
+
+    fn process_calibration_frame(&mut self, frame_data: &[u8], _captured_shutter_ns: i64) {
         let pixel_count = self.width * self.height;
 
-        // Exposure gate: REJECT any frame whose actual shutter isn't ~the forced calibration shutter. On
-        // this device the HAL delivers an early, short-exposure frame before the 16s manual exposure takes
-        // effect (the tell: the frame counter jumps to 1 almost immediately, then holds 16s for frame 2 -
-        // that fast first frame is NOT a real dark and would contaminate the average). Accept only frames
-        // within 10% of the forced shutter; skip (no count, no accumulate, no init) otherwise.
+        // Arrival gate (wall-clock, HAL-metadata-independent). The HAL delivers an early frame before the
+        // forced manual exposure takes effect - the tell is the frame counter jumping to 1 within ~0.5s of
+        // starting a 16s dark. That fast first frame is NOT a real dark and would contaminate the average.
+        // The per-frame SENSOR_EXPOSURE_TIME can't be trusted on that early frame (it often echoes the
+        // requested value), so gate on inter-frame time instead, which the HAL can't fake:
+        //   DARK: a real dark frame physically cannot arrive faster than its exposure. Require at least HALF
+        //         the forced shutter to have elapsed since cal start (first frame) or the last accepted
+        //         frame (16s -> reject anything under 8s; a 9s frame passes). Reject otherwise.
+        //   BIAS: the forced shutter is the SHORTEST the sensor allows, so frames are legitimately fast and
+        //         a timing gate can't distinguish the early frame. Instead just ignore the first second of
+        //         spin-up, then sum everything (a short frame is exactly what a bias wants anyway).
         let forced_shutter_ns = f64::from_bits(self.header[SHUTTER_NS_IDX]);
-        if forced_shutter_ns > 0.0 && captured_shutter_ns > 0 {
-            let ratio = captured_shutter_ns as f64 / forced_shutter_ns;
-            if !(0.9..=1.1).contains(&ratio) {
+        let is_dark = (self.header[FLAGS_IDX] & CAL_IS_DARK_BIT) != 0;
+        let now = Instant::now();
+        if is_dark {
+            // Reference = last accepted frame if we have one, else cal start (exposure_start_time, stamped
+            // when the integrator was constructed just before calibration began).
+            let since = match self.cal.as_ref() {
+                Some(c) => now.duration_since(c.last_accept).as_secs_f64(),
+                None => now.duration_since(self.exposure_start_time).as_secs_f64(),
+            };
+            let min_gap_s = (forced_shutter_ns / 1.0e9) * 0.5;
+            if since < min_gap_s {
                 log::info!(
-                    "Calibration: rejecting frame at {:.3}s (need {:.3}s)",
-                    captured_shutter_ns as f64 / 1.0e9,
-                    forced_shutter_ns / 1.0e9
+                    "Calibration(dark): rejecting frame {:.2}s after the last (need >= {:.2}s)",
+                    since,
+                    min_gap_s
+                );
+                return;
+            }
+        } else {
+            // BIAS spin-up: drop everything in the first second after cal start.
+            let since_start = now.duration_since(self.exposure_start_time).as_secs_f64();
+            if since_start < 1.0 {
+                log::info!(
+                    "Calibration(bias): skipping spin-up frame at {:.2}s (< 1.0s)",
+                    since_start
                 );
                 return;
             }
@@ -901,17 +940,14 @@ impl CameraIntegrator {
                 frame_count: 0,
                 start_time: Instant::now(),
                 last_snapshot: Instant::now() - std::time::Duration::from_secs(10), // force a snapshot on frame 1
+                last_accept: Instant::now(),
                 sample_idx,
                 even_sum: vec![0u64; n],
                 odd_sum: vec![0u64; n],
             });
-            // Stamp the calibration start time (unix) ONCE so the UI can show a LIVE elapsed counter -
-            // the per-frame stats only publish every ~16s (one dark frame), so reading CAL_ELAPSED_MS made
-            // the timer tick once per frame. The UI diffs this against its heartbeat clock each render.
-            if let Ok(t) = SystemTime::now().duration_since(UNIX_EPOCH) {
-                self.header[EXPOSURE_START_SECS_IDX] = t.as_secs();
-                self.header[EXPOSURE_START_NANOS_IDX] = t.subsec_nanos() as u64;
-            }
+            // NOTE: the unix start (EXPOSURE_START_*) that the UI diffs for its live elapsed counter is
+            // stamped in mark_calibration_start() at engage time, NOT here - stamping it on the first frame
+            // reset the timer ~16s in (when the first dark frame finally arrived and ran this init).
         }
 
         // Accumulate this frame. Borrow split: read cal sample/index, write integration buffers.
@@ -938,6 +974,7 @@ impl CameraIntegrator {
                 }
             }
             cal.frame_count += 1;
+            cal.last_accept = now; // wall-clock arrival of this accepted frame; gates the next dark frame
         }
 
         // Throttled stats snapshot (~1.5s gate). For 16s darks every frame passes; fast bias throttles.

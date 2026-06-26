@@ -304,9 +304,9 @@ fn draw_calibration_screen(
         title,
         (format!("frames: {}", frames), 0xE0, 0xE0, 0xE0),
         (format!("{}: {}m {}s", time_label, secs / 60, secs % 60), 0xE0, 0xE0, 0xE0),
-        (format!("convergence: {:.3}", correlation), cr, cg, 0x40),
-        (format!("mean: {:.0}", mean), 0xE0, 0xE0, 0xE0),
-        (format!("noise: {:.0}", noise), 0xE0, 0xE0, 0xE0),
+        (format!("convergence: {:.5}", correlation), cr, cg, 0x40),
+        (format!("mean: {:.4}", mean), 0xE0, 0xE0, 0xE0),
+        (format!("noise: {:.5}", noise), 0xE0, 0xE0, 0xE0),
     ];
     for (i, (text, r, g, b)) in lines.iter().enumerate() {
         // Extra half-line gap below the title.
@@ -368,9 +368,9 @@ fn draw_calibration_screen(
     // buttons are gone - there's nothing to finalize or cancel anymore, just the processing banner up top.
     if !finalizing {
         let frect = calibration_finalize_rect(w, h);
-        draw_fancy_button(pixels, w as usize, h, frect, "FINALIZE", false, &mut ui.text_renderer);
+        draw_fancy_button(pixels, w as usize, h, frect, "FINALIZE", false, false, &mut ui.text_renderer);
         let crect = calibration_cancel_rect(w, h);
-        draw_fancy_button(pixels, w as usize, h, crect, "CANCEL", false, &mut ui.text_renderer);
+        draw_fancy_button(pixels, w as usize, h, crect, "CANCEL", false, true, &mut ui.text_renderer);
     }
 }
 
@@ -469,6 +469,7 @@ fn draw_fancy_button(
     rect: (u32, u32, u32, u32),
     label: &str,
     pressed: bool,
+    red: bool, // true = red fill (destructive action, e.g. CANCEL); false = the default teal
     text_renderer: &mut TextRenderer,
 ) {
     let (x0, y0, x1, y1) = (rect.0 as i32, rect.1 as i32, rect.2 as i32, rect.3 as i32);
@@ -492,10 +493,17 @@ fn draw_fancy_button(
         if offset + 2 >= pixels.len() {
             return;
         }
-        // Teal: weak red, strong green+blue.
-        pixels[offset] = (pixels[offset] as f32 * wa.min(1.)) as u8;
-        pixels[offset + 1] = (wg.max(0.) * 0xE0 as f32 + pixels[offset + 1] as f32 * wa.min(1.)) as u8;
-        pixels[offset + 2] = (wc.max(0.) * 0x100 as f32 + pixels[offset + 2] as f32 * wa.min(1.)) as u8;
+        if red {
+            // Red (destructive): strong red, weak green+blue - the bright wc/wg ramps move to red.
+            pixels[offset] = (wc.max(0.) * 0x100 as f32 + pixels[offset] as f32 * wa.min(1.)) as u8;
+            pixels[offset + 1] = (pixels[offset + 1] as f32 * wa.min(1.)) as u8;
+            pixels[offset + 2] = (pixels[offset + 2] as f32 * wa.min(1.)) as u8;
+        } else {
+            // Teal: weak red, strong green+blue.
+            pixels[offset] = (pixels[offset] as f32 * wa.min(1.)) as u8;
+            pixels[offset + 1] = (wg.max(0.) * 0xE0 as f32 + pixels[offset + 1] as f32 * wa.min(1.)) as u8;
+            pixels[offset + 2] = (wc.max(0.) * 0x100 as f32 + pixels[offset + 2] as f32 * wa.min(1.)) as u8;
+        }
     };
     for py in y0..y_center {
         for px in x0..x_center {
@@ -513,7 +521,13 @@ fn draw_fancy_button(
             shade(px, py, (1. - (x1 - px - 1) as f32 * button_margin).max(0.), (1. - (y1 - py - 1) as f32 * button_margin).max(0.));
         }
     }
-    let (a, r, g, b) = if pressed { (300u16, 64u8, 255u8, 255u8) } else { (200u16, 0u8, 200u8, 255u8) };
+    let (a, r, g, b) = if red {
+        if pressed { (300u16, 255u8, 200u8, 200u8) } else { (200u16, 255u8, 80u8, 80u8) }
+    } else if pressed {
+        (300u16, 64u8, 255u8, 255u8)
+    } else {
+        (200u16, 0u8, 200u8, 255u8)
+    };
     text_renderer.draw_text_center(
         pixels,
         stride as u32,

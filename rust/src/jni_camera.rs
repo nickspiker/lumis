@@ -15,21 +15,24 @@ fn integrator_ptr(ptr: jlong) -> &'static mut CameraIntegrator {
     unsafe { &mut *(ptr as *mut CameraIntegrator) }
 }
 
-/// Read-back verify a just-written calibration VSF: Kotlin re-reads the saved file and passes the bytes
-/// here. We VSF-decode (which validates the checksum) and confirm the mean/variance tensors unpack to the
-/// expected pixel count, then set CAL_VERIFY_OK_BIT or CAL_VERIFY_FAIL_BIT so the result screen can show
-/// success/failure. Returns true if verified OK.
+/// Read-back verify a just-written calibration VSF. Kotlin passes the open file's descriptor (dup'd from
+/// the MediaStore content URI) - we read the file in NATIVE memory here rather than slurping it into a
+/// Java ByteArray, which at max-res is ~94MB and OOMs the camera process's 268MB Java heap (it already
+/// holds the cal maps). We VSF-decode (validates the checksum) and confirm the mean/variance tensors
+/// unpack to the expected pixel count, then set CAL_VERIFY_OK_BIT/CAL_VERIFY_FAIL_BIT for the result
+/// screen. Returns true if verified OK. The fd is owned by Kotlin (it closes its stream); we only read.
 #[no_mangle]
 pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeVerifyCalVsf<'local>(
-    mut env: JNIEnv<'local>,
+    _env: JNIEnv<'local>,
     _class: JClass<'local>,
     ptr: jlong,
-    data: JObject<'local>,
+    fd: jint,
 ) -> jboolean {
     let integrator = integrator_ptr(ptr);
-    let bytes = match env.convert_byte_array(unsafe { jni::objects::JByteArray::from_raw(data.as_raw()) }) {
+    let bytes = match read_fd_to_vec(fd) {
         Ok(b) => b,
-        Err(_) => {
+        Err(e) => {
+            error!("Calibration verify: failed to read fd {}: {}", fd, e);
             integrator.header[FLAGS_IDX] |= CAL_VERIFY_FAIL_BIT;
             return 0;
         }
@@ -45,6 +48,23 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeVerifyCalVsf<'loca
         error!("Calibration VSF read-back verification FAILED");
         0
     }
+}
+
+/// Read an entire file referenced by a raw fd into a Vec, in native memory. dup()s the fd so our File
+/// owns its own descriptor and Kotlin remains free to close the stream it passed; reading starts from the
+/// current offset (Kotlin rewinds / passes a fresh stream). Used by the cal verify to avoid a 94MB Java
+/// ByteArray that OOMs the camera heap.
+fn read_fd_to_vec(fd: jint) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let dup = unsafe { libc::dup(fd) };
+    if dup < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(dup) };
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?; // File drop closes `dup`, not the caller's fd
+    Ok(buf)
 }
 
 /// Decode a calibration VSF and confirm the checksum + that the mean and variance tensors are present and
@@ -210,6 +230,10 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeSetCalibrationMode
     } else {
         integrator.header[FLAGS_IDX] &= !CAL_IS_DARK_BIT;
     }
+    // Anchor the arrival gate to the moment calibration engages (not integrator construction, which can be
+    // seconds earlier due to AE warm-up). The dark gate measures the first frame against this; the bias
+    // spin-up window (first 1s ignored) is measured against it too.
+    integrator.mark_calibration_start();
     info!(
         "Calibration mode engaged: {}",
         if dark != 0 { "DARK" } else { "BIAS" }
