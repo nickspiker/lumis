@@ -710,6 +710,7 @@ impl CameraIntegrator {
                             raw10,
                             &display_matrix,
                             1024,
+                            display_gain as f32,
                         ) {
                             Some((bytes, pw, ph)) => (Some(bytes), (pw, ph)),
                             None => (None, (0, 0)),

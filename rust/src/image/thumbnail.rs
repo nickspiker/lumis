@@ -18,6 +18,7 @@ pub fn build_preview_jpeg(
     quad: bool,
     matrix: &[f32; 9],
     target: usize,
+    gain: f32,
 ) -> Option<(Vec<u8>, u32, u32)> {
     // --- 1. Bin to half-res linear RGB (no demosaic) ---
     // Quad: one RGB pixel per 4x4 tile (R/B = one cluster, G = mean of the two G clusters).
@@ -50,7 +51,9 @@ pub fn build_preview_jpeg(
         // This max() FINDS the brightest channel (the white point) - it is the algorithm, not a value-constraining clamp. Negative matrix outputs (out-of-gamut) never win a max against the positive seed/values, so they don't affect the result.
         max_ch = max_ch.max(lr).max(lg).max(lb);
     }
-    let inv_white = 1.0 / max_ch;
+    // Apply the user display gain AFTER the auto-white scale, so the embedded preview tracks the on-screen
+    // brightness (matching the gained RGB exports) instead of always normalising to its own brightest pixel.
+    let inv_white = gain / max_ch;
     let inv_gamma = 1.0 / 2.4;
     let mut rgb8 = vec![0u8; tw * th * 3];
     for (i, px) in lin.iter().enumerate() {
