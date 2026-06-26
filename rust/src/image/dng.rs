@@ -122,6 +122,14 @@ pub fn build_gps_entries(e: &ExifData) -> Vec<ExifEntry> {
     entries
 }
 
+/// Write a complete GPS IFD (count + entries + next-IFD=0 + out-of-line payloads) into `out` at its
+/// current end, with absolute file offsets. Used by the TIFF GPS post-process. The GPS IFD must start at
+/// the current `out.len()` (the caller patches the pointer to that position).
+pub fn write_gps_ifd_into(out: &mut Vec<u8>, gps_entries: &[ExifEntry]) {
+    let patches = write_ifd(out, gps_entries, 0);
+    append_payloads(out, patches, 0);
+}
+
 // Write an IFD (count + 12-byte entries + next-IFD pointer) into `out` at the current end, returning the
 // list of (value_field_position, payload) that still need their out-of-line data appended + offset
 // patched. `next_ifd` is the 4-byte next-IFD pointer value (0 = end of chain).
@@ -276,6 +284,7 @@ pub fn initialize_raw_info() -> RawInfo {
         descriptionoffset: 0,
         exif: ExifData::default(),
         exififdpointeroffset: 0,
+        gpsifdpointeroffset: 0,
     }
 }
 pub struct RawInfo {
@@ -324,6 +333,8 @@ pub struct RawInfo {
     pub exif: ExifData,
     /// Patched with the file offset of the EXIF-IFD-pointer tag's value field (where the sub-IFD offset goes).
     pub exififdpointeroffset: u32,
+    /// Same, for the GPS-IFD-pointer tag (0x8825). 0 = no GPS IFD.
+    pub gpsifdpointeroffset: u32,
 }
 
 pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
@@ -468,6 +479,14 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
         basedng.extend([105, 135, 4, 0, 1, 0, 0, 0]); // 0x8769, LONG, count 1
         rawinfo.exififdpointeroffset = basedng.len() as u32;
         basedng.extend([0, 0, 0, 0]); // placeholder offset, patched after the EXIF IFD is written
+        numifd += 1;
+    }
+    // GPS IFD pointer (tag 0x8825 = 34853, type LONG). Sorts after the EXIF pointer (34665) and before
+    // DNG version (50706). Patched once the GPS IFD is written.
+    if rawinfo.exif.has_gps {
+        basedng.extend([37, 136, 4, 0, 1, 0, 0, 0]); // 0x8825, LONG, count 1
+        rawinfo.gpsifdpointeroffset = basedng.len() as u32;
+        basedng.extend([0, 0, 0, 0]);
         numifd += 1;
     }
 
@@ -761,6 +780,22 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
             let off = (basedng.len() as u32).to_le_bytes();
             basedng[valpos..valpos + 4].copy_from_slice(&off);
             basedng.extend(&bytes);
+        }
+    }
+
+    // GPS IFD (pointed to by tag 0x8825). Same out-of-line scheme; offsets are absolute file offsets, so
+    // the shared write_ifd/append_payloads (base 0) work directly here.
+    if rawinfo.gpsifdpointeroffset != 0 {
+        let gps_entries = build_gps_entries(&rawinfo.exif);
+        if !gps_entries.is_empty() {
+            if basedng.len() % word != 0 {
+                basedng.extend(vec![0u8; word - basedng.len() % word]);
+            }
+            let gps_ifd_pos = (basedng.len() as u32).to_le_bytes();
+            let p = rawinfo.gpsifdpointeroffset as usize;
+            basedng[p..p + 4].copy_from_slice(&gps_ifd_pos);
+            let patches = write_ifd(&mut basedng, &gps_entries, 0);
+            append_payloads(&mut basedng, patches, 0);
         }
     }
 

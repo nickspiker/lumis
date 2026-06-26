@@ -755,6 +755,7 @@ impl CameraIntegrator {
                         descriptionoffset: 0,
                         exif: exif.clone(),
                         exififdpointeroffset: 0,
+                        gpsifdpointeroffset: 0,
                     };
                     let mut dng_bytes = make_base_dng(&mut raw_info);
                     let image_bytes = unsafe {
@@ -814,7 +815,7 @@ impl CameraIntegrator {
                         SAVE_FORMAT_TIFF => {
                             encode_tiff(&rgb, ow as u32, oh as u32, &exposure_desc, &exif).map(|b| (b, "tiff"))
                         }
-                        SAVE_FORMAT_JPEGXL => encode_jpegxl(&rgb, ow, oh).map(|b| (b, "jxl")),
+                        SAVE_FORMAT_JPEGXL => encode_jpegxl(&rgb, ow, oh, &exif).map(|b| (b, "jxl")),
                         _ => encode_jpeg(&rgb, ow as u32, oh as u32, &exposure_desc, &exif).map(|b| (b, "jpg")),
                     };
                     match encoded {

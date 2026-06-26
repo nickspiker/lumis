@@ -312,14 +312,69 @@ pub fn encode_tiff(
         if e.focal_length_35mm > 0.0 {
             image.encoder().write_tag(Tag::Unknown(0xA405), (e.focal_length_35mm.round() as u32).min(65535) as u16).ok()?;
         }
+        // GPS IFD pointer (0x8825) as a placeholder 0 - the GPS sub-IFD is appended + the offset patched in
+        // post-process (the tiff crate can't write a sub-IFD itself). Only when there's a fix.
+        if e.has_gps {
+            image.encoder().write_tag(Tag::Unknown(0x8825), 0u32).ok()?;
+        }
         image.write_data(rgb).ok()?;
     }
-    let tiff = out.into_inner();
+    let mut tiff = out.into_inner();
+    // Embed the GPS sub-IFD (the crate wrote a placeholder 0x8825 pointer = 0; we append the IFD and patch
+    // it). Do this BEFORE the thumbnail (which chains IFD1 via the next-IFD pointer); GPS only appends data
+    // + patches a value field, so order is independent, but keep GPS first for clarity. On any failure,
+    // continue with the un-GPS'd TIFF.
+    if exif.has_gps {
+        if let Some(with_gps) = embed_tiff_gps(tiff.clone(), exif) {
+            tiff = with_gps;
+        }
+    }
     // Try to embed a thumbnail; on any failure fall back to the plain (still valid) TIFF.
     match embed_tiff_thumbnail(tiff.clone(), rgb, width, height) {
         Some(with_thumb) => Some(with_thumb),
         None => Some(tiff),
     }
+}
+
+/// Post-process a TIFF the `tiff` crate produced (with a placeholder GPS-pointer tag 0x8825 = 0 in IFD0):
+/// append the GPS sub-IFD at the file end and patch the pointer's value field to it. No byte insertion, so
+/// existing absolute offsets (ICC, strips) stay valid. Returns None (caller keeps the original) on any
+/// parse surprise.
+fn embed_tiff_gps(mut tiff: Vec<u8>, exif: &crate::image::dng::ExifData) -> Option<Vec<u8>> {
+    if tiff.len() < 8 || &tiff[0..2] != b"II" || u16::from_le_bytes([tiff[2], tiff[3]]) != 0x2A {
+        return None;
+    }
+    let ifd0 = u32::from_le_bytes([tiff[4], tiff[5], tiff[6], tiff[7]]) as usize;
+    if ifd0 + 2 > tiff.len() {
+        return None;
+    }
+    let count = u16::from_le_bytes([tiff[ifd0], tiff[ifd0 + 1]]) as usize;
+    // Find the 0x8825 entry and the position of its 4-byte value field.
+    let mut gps_val_pos = None;
+    for i in 0..count {
+        let ep = ifd0 + 2 + i * 12;
+        if ep + 12 > tiff.len() {
+            return None;
+        }
+        if u16::from_le_bytes([tiff[ep], tiff[ep + 1]]) == 0x8825 {
+            gps_val_pos = Some(ep + 8);
+            break;
+        }
+    }
+    let gps_val_pos = gps_val_pos?;
+    // Build the GPS IFD bytes (count + entries + next-IFD=0 + out-of-line payloads) as a standalone block,
+    // then place it at the current file end (absolute offsets, base = the append position).
+    let gps_entries = crate::image::dng::build_gps_entries(exif);
+    if gps_entries.is_empty() {
+        return None;
+    }
+    if tiff.len() % 2 != 0 {
+        tiff.push(0);
+    }
+    let gps_ifd_off = tiff.len() as u32;
+    crate::image::dng::write_gps_ifd_into(&mut tiff, &gps_entries);
+    tiff[gps_val_pos..gps_val_pos + 4].copy_from_slice(&gps_ifd_off.to_le_bytes());
+    Some(tiff)
 }
 
 /// Downscale a u8 RGB image so the longest side is <= `target`, preserving aspect, and JPEG-encode it (quality 85). Returns (JPEG bytes, thumb_width, thumb_height) or None on failure.
@@ -454,7 +509,12 @@ fn embed_tiff_thumbnail(
 }
 
 /// Encode RGB8 to JPEG XL bytes (lossless, via zune-jpegxl).
-pub fn encode_jpegxl(rgb: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
+pub fn encode_jpegxl(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    exif: &crate::image::dng::ExifData,
+) -> Option<Vec<u8>> {
     use zune_core::bit_depth::BitDepth;
     use zune_core::colorspace::ColorSpace;
     use zune_core::options::EncoderOptions;
@@ -463,7 +523,31 @@ pub fn encode_jpegxl(rgb: &[u8], width: usize, height: usize) -> Option<Vec<u8>>
     let opts = EncoderOptions::new(width, height, ColorSpace::RGB, BitDepth::Eight);
     // Lumis fork of zune-jpegxl: signal Rec.2020 in the codestream's ColourEncoding so the wide-gamut output is interpreted correctly (upstream hardcodes sRGB).
     let encoder = JxlSimpleEncoder::new(rgb, opts).set_rec2020(true);
+    let mut codestream: Vec<u8> = Vec::new();
+    encoder.encode(&mut codestream).ok()?;
+
+    // The encoder emits a RAW JXL codestream (starts FF 0A), which can't hold metadata. To embed EXIF we
+    // wrap it in the ISOBMFF box container. If there's no EXIF, return the raw codestream unchanged.
+    let exif_block = crate::image::dng::build_exif_block(exif);
+    if exif_block.is_empty() {
+        return Some(codestream);
+    }
     let mut out: Vec<u8> = Vec::new();
-    encoder.encode(&mut out).ok()?;
+    // Append one ISOBMFF box: 4-byte big-endian size (incl header) + 4-byte type + payload.
+    let mut push_box = |out: &mut Vec<u8>, btype: &[u8; 4], payload: &[u8]| {
+        let size = (8 + payload.len()) as u32;
+        out.extend(size.to_be_bytes());
+        out.extend_from_slice(btype);
+        out.extend_from_slice(payload);
+    };
+    // JXL signature box (special 12-byte form) + ftyp.
+    out.extend([0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A]);
+    push_box(&mut out, b"ftyp", &[b'j', b'x', b'l', b' ', 0, 0, 0, 0, b'j', b'x', b'l', b' ']);
+    // Exif box: 4-byte big-endian TIFF-header offset (0 = TIFF follows immediately) + the EXIF/TIFF block.
+    let mut exif_payload = vec![0u8, 0, 0, 0];
+    exif_payload.extend_from_slice(&exif_block);
+    push_box(&mut out, b"Exif", &exif_payload);
+    // jxlc box: the raw codestream verbatim.
+    push_box(&mut out, b"jxlc", &codestream);
     Some(out)
 }
