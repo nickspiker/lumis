@@ -176,12 +176,22 @@ fn load_vsf_field(path: &str, field: &str, n: usize) -> Vec<u16> {
         .and_then(|fld| fld.values.first())
         .unwrap_or_else(|| panic!("{path}: no '{field}' field"));
     match v {
+        // Maps are deflate-compressed u16 LE blobs (VsfType::v(b'z', ...)). Inflate then unpack.
+        VsfType::v(b'z', compressed) => {
+            use flate2::read::ZlibDecoder;
+            use std::io::Read;
+            let mut dec = ZlibDecoder::new(&compressed[..]);
+            let mut raw = Vec::new();
+            dec.read_to_end(&mut raw).expect("inflate cal map");
+            assert_eq!(raw.len(), n * 2, "{path} {field}: {} bytes, expected {}", raw.len(), n * 2);
+            (0..n).map(|i| u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]])).collect()
+        }
         VsfType::p(tensor) => {
             let u = tensor.unpack_u16();
             assert_eq!(u.len(), n, "{path} {field}: {} px, expected {}", u.len(), n);
             u
         }
-        _ => panic!("{path}: '{field}' is not a tensor"),
+        _ => panic!("{path}: '{field}' is not a compressed map or tensor"),
     }
 }
 

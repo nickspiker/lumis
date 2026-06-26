@@ -39,6 +39,9 @@ tiff = "0.7.2"
 # Versatile Storage Format - self-verifying (checksummed) container for calibration maps. default-features
 # = false skips the optional crypto/signing deps, keeping the Android cross-compile clean.
 vsf = { path = "../../vsf", default-features = false }
+# Deflate for compressing the near-black calibration maps before storing in VSF (a 50MP 16-bit dark frame
+# is ~200MB raw but compresses massively since it's almost all small values).
+flate2 = "1"
 async-trait = "0.1.53"
 blake3 = "1.3.1"
 binary_macros = "1.0.0"

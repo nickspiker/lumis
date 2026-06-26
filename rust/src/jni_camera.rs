@@ -75,14 +75,21 @@ fn verify_cal_vsf(bytes: &[u8]) -> bool {
         (Some(w), Some(h)) => (w as usize, h as usize),
         _ => return false,
     };
-    let expected = w * h;
-    let tensor_ok = |name: &str| -> bool {
+    let expected_bytes = w * h * 2; // u16 LE
+    // Maps are deflate-compressed blobs (VsfType::v(b'z', ...)). Verify each inflates to width*height*2.
+    let blob_ok = |name: &str| -> bool {
         match section.get_field(name).and_then(|f| f.values.first()) {
-            Some(VsfType::p(t)) => t.unpack_u16().len() == expected,
+            Some(VsfType::v(b'z', compressed)) => {
+                use flate2::read::ZlibDecoder;
+                use std::io::Read;
+                let mut dec = ZlibDecoder::new(&compressed[..]);
+                let mut out = Vec::new();
+                dec.read_to_end(&mut out).is_ok() && out.len() == expected_bytes
+            }
             _ => false,
         }
     };
-    tensor_ok("mean") && tensor_ok("variance")
+    blob_ok("mean") && blob_ok("variance")
 }
 
 #[no_mangle]

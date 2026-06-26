@@ -1016,10 +1016,24 @@ impl CameraIntegrator {
         // (kind, dimensions, frame count). VSF's built-in checksum means a corrupt cal map is detected on
         // read rather than silently poisoning every corrected shot. Routed through the SAME pending-save
         // -> MediaStore pipe the DNGs use (a direct std::fs::write to /sdcard fails under scoped storage).
-        let mean_tensor =
-            vsf::types::BitPackedTensor::pack_u16(16, vec![self.width, self.height], &mean_samples);
-        let var_tensor =
-            vsf::types::BitPackedTensor::pack_u16(16, vec![self.width, self.height], &var_samples);
+        // Deflate the raw u16 LE bytes of each map. A 50MP 16-bit dark frame is ~200MB uncompressed -
+        // far too big to read back into a Java array (OOMs the verify), and wasteful since the data is
+        // near-black (mostly tiny values), so it compresses ~20-50x. Stored as VsfType::v(b'z', ...); the
+        // VSF provenance checksum still covers the compressed bytes. The harness inflates on read.
+        let deflate = |samples: &[u16]| -> Vec<u8> {
+            use flate2::write::ZlibEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let mut raw = Vec::with_capacity(samples.len() * 2);
+            for &s in samples {
+                raw.extend_from_slice(&s.to_le_bytes());
+            }
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            let _ = enc.write_all(&raw);
+            enc.finish().unwrap_or_default()
+        };
+        let mean_z = deflate(&mean_samples);
+        let var_z = deflate(&var_samples);
         let vsf_bytes = vsf::vsf_builder::VsfBuilder::new()
             .add_section(
                 "calibration",
@@ -1028,8 +1042,8 @@ impl CameraIntegrator {
                     ("width".to_string(), vsf::types::VsfType::u6(self.width as u64)),
                     ("height".to_string(), vsf::types::VsfType::u6(self.height as u64)),
                     ("frame_count".to_string(), vsf::types::VsfType::u6(cal.frame_count)),
-                    ("mean".to_string(), vsf::types::VsfType::p(mean_tensor)),
-                    ("variance".to_string(), vsf::types::VsfType::p(var_tensor)),
+                    ("mean".to_string(), vsf::types::VsfType::v(b'z', mean_z)),
+                    ("variance".to_string(), vsf::types::VsfType::v(b'z', var_z)),
                 ],
             )
             .build();

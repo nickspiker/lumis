@@ -1922,6 +1922,7 @@ dependencies = [
  "cosmic-text",
  "dirs",
  "ed25519-dalek",
+ "flate2",
  "fontdue",
  "image 0.24.9",
  "imageproc",

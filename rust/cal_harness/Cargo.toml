@@ -10,6 +10,7 @@ edition = "2021"
 
 [dependencies]
 png = "0.17.16"
+flate2 = "1"
 # Read the self-verifying calibration .vsf (mean/variance tensors + metadata). Same crate the app writes,
 # but with std on (host tool) so std float math isn't shadowed by the no_std num-traits path.
 vsf = { path = "../../../vsf", default-features = false, features = ["std"] }
