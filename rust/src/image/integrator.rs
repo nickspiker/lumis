@@ -984,25 +984,48 @@ impl CameraIntegrator {
         let is_dark = (self.header[FLAGS_IDX] & CAL_IS_DARK_BIT) != 0;
         let kind = if is_dark { "dark" } else { "bias" };
 
-        // Mean map (per-pixel average) and variance map (per-pixel mean abs frame-to-frame diff), u16.
-        let mut mean_map = vec![0u8; pixel_count * 2];
-        let mut var_map = vec![0u8; pixel_count * 2];
+        // Per-pixel mean (average) and variance (mean abs frame-to-frame diff), u16.
+        let mut mean_samples = vec![0u16; pixel_count];
+        let mut var_samples = vec![0u16; pixel_count];
         for i in 0..pixel_count {
-            let mean = (self.integration_buffer.accumulated[i] / n).min(65535) as u16;
-            let var = (self.integration_buffer.difference[i] / n).min(65535) as u16;
-            mean_map[i * 2..i * 2 + 2].copy_from_slice(&mean.to_le_bytes());
-            var_map[i * 2..i * 2 + 2].copy_from_slice(&var.to_le_bytes());
+            mean_samples[i] = (self.integration_buffer.accumulated[i] / n).min(65535) as u16;
+            var_samples[i] = (self.integration_buffer.difference[i] / n).min(65535) as u16;
         }
-        // Write to the public Pictures/Lumis dir (not the app-private files dir) so the cal maps can be
-        // pulled with ADB for host-side analysis even from a release (non-debuggable) build. The Rust
-        // process has direct filesystem access here. (VSF storage + a proper app-managed location is a
-        // later step; raw .bin is the interim format the host α/β solver harness reads.)
+
+        // Store as a self-verifying VSF: both maps as 16-bit BitPackedTensors plus labeled metadata
+        // (kind, dimensions, frame count). VSF's built-in checksum means a corrupt cal map is detected on
+        // read rather than silently poisoning every corrected shot. Written to the public Pictures/Lumis
+        // dir so it's pullable via ADB from a release build.
         let dir = "/sdcard/Pictures/Lumis";
         let _ = std::fs::create_dir_all(dir);
-        let mean_path = format!("{dir}/cal_{kind}_mean_{}x{}.bin", self.width, self.height);
-        let var_path = format!("{dir}/cal_{kind}_var_{}x{}.bin", self.width, self.height);
-        let r1 = std::fs::write(&mean_path, &mean_map);
-        let r2 = std::fs::write(&var_path, &var_map);
+        let vsf_path = format!("{dir}/cal_{kind}_{}x{}.vsf", self.width, self.height);
+        let mean_tensor =
+            vsf::types::BitPackedTensor::pack_u16(16, vec![self.width, self.height], &mean_samples);
+        let var_tensor =
+            vsf::types::BitPackedTensor::pack_u16(16, vec![self.width, self.height], &var_samples);
+        let vsf_bytes = vsf::vsf_builder::VsfBuilder::new()
+            .add_section(
+                "calibration",
+                vec![
+                    ("kind".to_string(), vsf::types::VsfType::a(kind.to_string())),
+                    ("width".to_string(), vsf::types::VsfType::u6(self.width as u64)),
+                    ("height".to_string(), vsf::types::VsfType::u6(self.height as u64)),
+                    ("frame_count".to_string(), vsf::types::VsfType::u6(cal.frame_count)),
+                    ("mean".to_string(), vsf::types::VsfType::p(mean_tensor)),
+                    ("variance".to_string(), vsf::types::VsfType::p(var_tensor)),
+                ],
+            )
+            .build();
+        let r1: std::io::Result<()> = match vsf_bytes {
+            Ok(bytes) => std::fs::write(&vsf_path, &bytes),
+            Err(e) => {
+                log::error!("VSF build failed: {}", e);
+                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+            }
+        };
+        let r2: std::io::Result<()> = Ok(());
+        let mean_path = vsf_path.clone();
+        let var_path = vsf_path;
 
         // Publish the averaged dark frame into the display image_buffer so the UI can show it (gamma 4)
         // after finalize. Write the per-pixel mean (u16) into slot 0's avg region and point the image

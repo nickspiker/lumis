@@ -30,8 +30,10 @@ fn main() {
     let h: usize = args[5].parse().unwrap();
     let n = w * h;
 
-    let bias = load_u16(&args[1], n);
-    let dark = load_u16(&args[2], n);
+    // bias/dark are calibration .vsf files (mean tensor inside the "calibration" section); light is a
+    // raw .bin or DNG strip.
+    let bias = load_vsf_field(&args[1], "mean", n);
+    let dark = load_vsf_field(&args[2], "mean", n);
     let light = load_light(&args[3], n);
     println!("loaded {}x{} = {} px", w, h, n);
     stats("bias", &bias);
@@ -153,6 +155,34 @@ fn render_preview(light: &[u16], bias: &[u16], dark: &[u16], w: usize, h: usize,
         out[i * 3 + 2] = g;
     }
     out
+}
+
+// Load a named u16 tensor field from a calibration .vsf (e.g. "mean" or "variance"). VsfHeader::decode
+// verifies the checksum, so a corrupt cal map fails here rather than poisoning the solve.
+fn load_vsf_field(path: &str, field: &str, n: usize) -> Vec<u16> {
+    use vsf::file_format::{VsfHeader, VsfSection};
+    use vsf::types::VsfType;
+    let data = fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let (header, _) = VsfHeader::decode(&data).unwrap_or_else(|e| panic!("{path} VSF decode/verify: {e}"));
+    let f = header
+        .fields
+        .iter()
+        .find(|f| f.name == "calibration")
+        .unwrap_or_else(|| panic!("{path}: no 'calibration' section"));
+    let mut ptr = f.offset_bytes;
+    let section = VsfSection::parse(&data, &mut ptr).unwrap_or_else(|e| panic!("{path} section parse: {e}"));
+    let v = section
+        .get_field(field)
+        .and_then(|fld| fld.values.first())
+        .unwrap_or_else(|| panic!("{path}: no '{field}' field"));
+    match v {
+        VsfType::p(tensor) => {
+            let u = tensor.unpack_u16();
+            assert_eq!(u.len(), n, "{path} {field}: {} px, expected {}", u.len(), n);
+            u
+        }
+        _ => panic!("{path}: '{field}' is not a tensor"),
+    }
 }
 
 fn load_u16(path: &str, n: usize) -> Vec<u16> {

@@ -1952,6 +1952,7 @@ dependencies = [
  "tiff 0.7.4",
  "tokio",
  "viuer",
+ "vsf",
  "winapi",
  "winres",
  "zune-core",
