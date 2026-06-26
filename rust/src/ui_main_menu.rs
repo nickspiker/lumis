@@ -120,7 +120,7 @@ impl MainMenu {
         // The i32 is the tapped camera's INDEX (the lens key), not a group_id.
         if let Screen::CalShutter(key) = self.screen {
             // Calibration is captured at the lens's highest-res (head) mode.
-            let head_index = self.lens_head_index(key as usize);
+            let head_index = self.lens_calibration_index(key as usize);
             // Two choices + Back + Exit = 4 slots; pad the rest empty so they sit at the bottom.
             let used = 4;
             for _ in 0..(NUM_SLOTS - used) {
@@ -174,7 +174,7 @@ impl MainMenu {
         }
         // Calibrate row sits just below the mode list on the Modes screen.
         if let Some(key) = modes_key {
-            self.buttons.push(Button::Calibrate { index: self.lens_head_index(key as usize) });
+            self.buttons.push(Button::Calibrate { index: self.lens_calibration_index(key as usize) });
         }
         self.buttons.push(Button::Exit);
         self.render_buttons_to_buffers();
@@ -208,14 +208,27 @@ impl MainMenu {
         }
     }
 
-    // The head (highest-res, lowest-index) camera of the lens identified by `key_index`. Calibration
-    // captures at this mode.
+    // The head (highest-res, lowest-index) camera of the lens identified by `key_index`.
     fn lens_head_index(&self, key_index: usize) -> usize {
         self.lens_members(key_index)
             .iter()
             .map(|c| c.index)
             .min()
             .unwrap_or(key_index)
+    }
+
+    // The MASTER calibration mode for a lens: its max-res, full-FOV (non-cropped) member. We always
+    // calibrate at full sensor resolution so ONE cal per sensor serves every mode - the binned cal is
+    // derived by binning the master 2x2, and cropped-FOV cals by cropping it. Falls back to the head if
+    // no max-res member exists (e.g. a lens with only a binned mode).
+    fn lens_calibration_index(&self, key_index: usize) -> usize {
+        let members = self.lens_members(key_index);
+        members
+            .iter()
+            .filter(|c| c.max_res && !c.is_cropped)
+            .map(|c| c.index)
+            .min()
+            .unwrap_or_else(|| self.lens_head_index(key_index))
     }
 
     // First (highest-res) mode of a group is its head. We mark the head with mode_count = group size and the rest with 1, so head == "mode_count >= 1 and it's the first of its group in all_cameras". Since Kotlin emits the head first, the head is simply the earliest-index member of the group.
