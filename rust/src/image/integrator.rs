@@ -509,6 +509,13 @@ impl CameraIntegrator {
             let per_frame_iso = f64::from_bits(self.header[ISO_IDX]);
             let integ_s = per_frame_shutter_ns * frame_count as f64 / 1.0e9;
             let eff_iso = per_frame_iso / frame_count as f64;
+            // User display gain (0/unset -> 1.0). Baked into RGB exports and written as DNG
+            // BaselineExposure (log2(gain) stops) so the saved file matches the on-screen brightness.
+            let display_gain = {
+                let g = f64::from_bits(self.header[DISPLAY_GAIN_IDX]);
+                if g > 0.0 { g } else { 1.0 }
+            };
+            let baseline_exposure_stops = display_gain.log2();
             // Capture mode (the integration type) - recorded in the description so the saved file knows
             // whether it's an average, a frame-to-frame difference, or a motion (diff/avg) image.
             let mode_name = match current_mode {
@@ -756,6 +763,7 @@ impl CameraIntegrator {
                         exif: exif.clone(),
                         exififdpointeroffset: 0,
                         gpsifdpointeroffset: 0,
+                        baseline_exposure_stops,
                     };
                     let mut dng_bytes = make_base_dng(&mut raw_info);
                     let image_bytes = unsafe {
@@ -799,6 +807,7 @@ impl CameraIntegrator {
                             bayer_pattern,
                             &display_matrix,
                             orient_deg,
+                            display_gain as f32,
                         )
                     } else {
                         rcd_to_rgb8(
@@ -809,6 +818,7 @@ impl CameraIntegrator {
                             bayer_pattern,
                             &display_matrix,
                             orient_deg,
+                            display_gain as f32,
                         )
                     };
                     let encoded = match save_format {

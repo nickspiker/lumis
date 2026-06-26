@@ -285,6 +285,7 @@ pub fn initialize_raw_info() -> RawInfo {
         exif: ExifData::default(),
         exififdpointeroffset: 0,
         gpsifdpointeroffset: 0,
+        baseline_exposure_stops: 0.0,
     }
 }
 pub struct RawInfo {
@@ -335,6 +336,9 @@ pub struct RawInfo {
     pub exififdpointeroffset: u32,
     /// Same, for the GPS-IFD-pointer tag (0x8825). 0 = no GPS IFD.
     pub gpsifdpointeroffset: u32,
+    /// DNG BaselineExposure in stops (log2 of the user's display gain). Applied by raw converters on
+    /// open, non-destructively. 0 = neutral.
+    pub baseline_exposure_stops: f64,
 }
 
 pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
@@ -509,6 +513,17 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
     rawinfo.magicoffset = (basedng.len() - 4) as u32;
     numifd += 1;
 
+    // BaselineExposure (tag 50730 = 0xC62A, SRATIONAL) = the user's display gain in stops. Raw converters
+    // apply it on open (non-destructive), so the DNG renders at the on-screen brightness without baking
+    // it into the raw pixels. Tag 50730 sorts after Magic9Inverse (50721) and before Illuminant (50778).
+    let mut baseline_exposure_offset = 0usize;
+    if rawinfo.baseline_exposure_stops != 0.0 {
+        basedng.extend([42, 198, 10, 0, 1, 0, 0, 0]); // 0xC62A, SRATIONAL, count 1
+        baseline_exposure_offset = basedng.len();
+        basedng.extend([0, 0, 0, 0]); // placeholder offset, patched below
+        numifd += 1;
+    }
+
     // basedng.extend([40, 198, 11, 0, 3, 0, 0, 0, 0, 0, 0, 0]); //Asshatneutral
     // let asshatoffset = basedng.len() - 4;
     // numifd += 1;
@@ -637,6 +652,18 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
     basedng[rawinfo.curveoffset as usize + 2] = offset[2];
     basedng[rawinfo.curveoffset as usize + 3] = offset[3];
     basedng.extend([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 63, 0, 0, 128, 63]);
+
+    // Append the BaselineExposure SRATIONAL (signed num/den i32) and patch its offset. Stops * 1000 / 1000.
+    if baseline_exposure_offset != 0 {
+        if basedng.len() % word != 0 {
+            basedng.extend(vec![0u8; word - basedng.len() % word]);
+        }
+        let off = (basedng.len() as u32).to_le_bytes();
+        basedng[baseline_exposure_offset..baseline_exposure_offset + 4].copy_from_slice(&off);
+        let num = (rawinfo.baseline_exposure_stops * 1000.0).round() as i32;
+        basedng.extend(num.to_le_bytes());
+        basedng.extend(1000i32.to_le_bytes());
+    }
 
     basedng.extend([0, 0, 0, 0]);
     if basedng.len() % word != 0 {

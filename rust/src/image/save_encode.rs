@@ -81,10 +81,12 @@ pub fn rcd_to_rgb8(
     bayer_pattern: u32,
     matrix: &[f32; 9],
     orientation: u16,
+    gain: f32,
 ) -> (usize, usize, Vec<u8>) {
     use crate::debayer::region::rcd_region;
 
-    let scale = 65536. / (65536. - black_level as f32);
+    // gain bakes the user's display-gain slider into the exported pixels so the file matches the preview.
+    let scale = gain * 65536. / (65536. - black_level as f32);
     // Demosaic the whole frame in one shot (crop == full frame). RCD returns black-subtracted + gained linear-ish RGB per sensor pixel.
     let demosaiced = rcd_region(
         raw,
@@ -139,18 +141,20 @@ pub fn quad_to_rgb8(
     bayer_pattern: u32,
     matrix: &[f32; 9],
     orientation: u16,
+    gain: f32,
 ) -> (usize, usize, Vec<u8>) {
     use crate::debayer::quad::quad_demosaic;
 
     // Match rcd_to_rgb8's scale: it feeds the colour matrix values in 0..~65535 via
-    // (v-black) * 65536/(65536-black). We get the identical scale with white=65536 and gain=65536.
+    // (v-black) * 65536/(65536-black). We get the identical scale with white=65536 and gain=65536, times
+    // the user's display-gain slider so the export matches the on-screen brightness.
     let demosaiced = quad_demosaic(
         raw,
         width,
         height,
         black_level,
         65535,
-        65536.0,
+        65536.0 * gain,
         bayer_pattern,
     );
 

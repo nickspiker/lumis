@@ -58,6 +58,11 @@ pub const GPS_LAT_IDX: usize = 58; // signed decimal degrees
 pub const GPS_LON_IDX: usize = 59; // signed decimal degrees
 pub const GPS_ALT_IDX: usize = 60; // metres (signed; below sea level allowed)
 
+// User display-gain multiplier (f64 bits), written by the UI so the save path can apply it: baked into
+// RGB exports (JPEG/TIFF/JXL) and written as DNG BaselineExposure (log2(gain) stops, non-destructive).
+// 0/unset is treated as 1.0 (no gain).
+pub const DISPLAY_GAIN_IDX: usize = 61;
+
 pub const IMAGE_START: usize = 64;
 
 // Save format values (SAVE_FORMAT_IDX). Numbered to match the tap-cycle order JXL -> JPEG -> DNG -> TIFF, and JXL is 0 so it's the zero-initialized default.

@@ -670,9 +670,13 @@ fn update_shared_memory_for_track(ui: &mut UserInterface, track: usize) {
                 );
             }
         }
+        0 => {
+            // Gain: publish the display-gain multiplier so the save path can apply it (baked into RGB
+            // exports, written as DNG BaselineExposure). Previously UI-only (preview brightness).
+            ui.header[DISPLAY_GAIN_IDX] = ui.display_gain.to_bits();
+        }
         _ => {
-            // Track 0 (gain) doesn't write to shared memory, others invalid
-            if crate::DEBUG && track != 0 {
+            if crate::DEBUG {
                 warn!("Invalid track {} for shared memory update", track);
             }
         }
