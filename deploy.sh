@@ -90,7 +90,11 @@ fi
 
 # Use fixed alias and same password for key
 KEYSTORE_PASSWORD="$LUMIS_KEYSTORE_PASSWORD"
-KEY_ALIAS="lumis"
+# Canonical TOKEN signing key — ALL of Nick's Android apps sign with this one alias so they
+# share a deterministic per-device ANDROID_ID (TOKEN auth across the whole app family). The old
+# per-app aliases (lumis, photon) were renamed to *.old in the keystore on 2026-06-27. Do NOT
+# revert to a per-app alias: a different cert means a different ANDROID_ID and breaks shared auth.
+KEY_ALIAS="token"
 KEY_PASSWORD="$LUMIS_KEYSTORE_PASSWORD"
 
 echo "Building unsigned APK..."
