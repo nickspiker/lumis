@@ -33,69 +33,19 @@ fi
 
 echo "Building signed release APK..."
 
-# Find MEGA folder dynamically
-if [ -z "$MEGA" ]; then
-    MEGA=$(find /home /mnt -maxdepth 3 -name "MEGA" -type d 2>/dev/null | head -1)
-    
-    if [ -z "$MEGA" ]; then
-        echo "Error: Could not find MEGA folder"
-        echo "Please set MEGA environment variable: export MEGA=/path/to/mega"
-        exit 1
-    fi
-    
-    echo "Found MEGA folder at: $MEGA"
-fi
-
-# Set keystore path - check multiple locations
-KEYSTORE_LOCATIONS=(
-    "$MEGA/code/keys/nicks-apps.keystore"
-    "/mnt/Chiton/MEGA/Code/keys/nicks-apps.keystore"
-)
-
-KEYSTORE_PATH=""
-for path in "${KEYSTORE_LOCATIONS[@]}"; do
-    if [ -f "$path" ]; then
-        KEYSTORE_PATH="$path"
-        echo "Found keystore at: $KEYSTORE_PATH"
-        break
-    fi
-done
-
-if [ -z "$KEYSTORE_PATH" ]; then
-    echo "Error: Keystore not found at any of these locations:"
-    for path in "${KEYSTORE_LOCATIONS[@]}"; do
-        echo "  - $path"
-    done
+# Resolve the canonical TOKEN signing key via the ONE shared keystore lib (in photon's repo) that every one of Nick's Android apps uses — so they all sign with the same key (alias 'token' in TOKEN.p12) and share a deterministic per-device ANDROID_ID (TOKEN auth across the app family).
+# It exports TOKEN_KEYSTORE_PATH / TOKEN_KEYSTORE_PASSWORD / TOKEN_KEY_ALIAS (password from the GNOME keyring under `service token`).
+# Do NOT reintroduce a lumis-specific keystore/alias — a different cert means a different ANDROID_ID and breaks shared auth.
+KEYSTORE_LIB="/mnt/Octopus/Code/photon/scripts/lib/keystore.sh"
+if [ ! -f "$KEYSTORE_LIB" ]; then
+    echo "Error: shared keystore lib not found at $KEYSTORE_LIB"
     exit 1
 fi
-
-echo "Using keystore: $KEYSTORE_PATH"
+source "$KEYSTORE_LIB" || { echo "Error: keystore resolution failed"; exit 1; }
+echo "Using keystore: $TOKEN_KEYSTORE_PATH (alias $TOKEN_KEY_ALIAS)"
 
 # Cache file for storing the last known IP
 CACHE_FILE="$HOME/.fairphone_ip_cache"
-
-
-# Get password from GNOME Keyring (or prompt if not stored)
-if [ -z "$LUMIS_KEYSTORE_PASSWORD" ]; then
-    LUMIS_KEYSTORE_PASSWORD=$(secret-tool lookup service photon key keystore_password 2>/dev/null)
-    if [ -z "$LUMIS_KEYSTORE_PASSWORD" ]; then
-        echo "Password not in keyring. Run this once to store it:"
-        echo "  secret-tool store --label='Photon Keystore' service photon key keystore_password"
-        echo ""
-        echo "Enter keystore password:"
-        read -s LUMIS_KEYSTORE_PASSWORD
-    fi
-    export LUMIS_KEYSTORE_PASSWORD
-fi
-
-# Use fixed alias and same password for key
-KEYSTORE_PASSWORD="$LUMIS_KEYSTORE_PASSWORD"
-# Canonical TOKEN signing key — ALL of Nick's Android apps sign with this one alias so they
-# share a deterministic per-device ANDROID_ID (TOKEN auth across the whole app family). The old
-# per-app aliases (lumis, photon) were renamed to *.old in the keystore on 2026-06-27. Do NOT
-# revert to a per-app alias: a different cert means a different ANDROID_ID and breaks shared auth.
-KEY_ALIAS="token"
-KEY_PASSWORD="$LUMIS_KEYSTORE_PASSWORD"
 
 echo "Building unsigned APK..."
 ./build.sh
@@ -104,10 +54,10 @@ if [ $? -eq 0 ]; then
     echo "Signing APK..."
     # Sign the APK using apksigner
     "$APKSIGNER" sign \
-        --ks "$KEYSTORE_PATH" \
-        --ks-pass pass:$KEYSTORE_PASSWORD \
-        --ks-key-alias $KEY_ALIAS \
-        --key-pass pass:$KEY_PASSWORD \
+        --ks "$TOKEN_KEYSTORE_PATH" \
+        --ks-pass pass:$TOKEN_KEYSTORE_PASSWORD \
+        --ks-key-alias $TOKEN_KEY_ALIAS \
+        --key-pass pass:$TOKEN_KEYSTORE_PASSWORD \
         --min-sdk-version 21 \
         --out app/build/outputs/apk/release/app-release-signed.apk \
         app/build/outputs/apk/release/app-release-unsigned.apk
