@@ -422,7 +422,120 @@ pub fn draw_controls(
                 }
             }
         }
+        // Level indicator: three circles, center-top of the screen (only while controls are visible).
+        draw_level_indicator(ui, pixels, screen_buffer.stride as usize, screen_buffer.height as u32);
     } // End of controls_visible block
+}
+
+// Three-circle level / horizon indicator, centred horizontally at the top of the screen.
+// Geometry: a rigid horizontal triad (outer - center - outer). ROLL spins the whole triad about its centre, counter-spun x4 (the triad is symmetric so 4 visual turns per one phone turn; the fast counter-rotation makes small roll errors obvious). PITCH offsets the centre circle along the triad's perpendicular (up toward sky, down toward ground) and pushes the two outer circles the opposite way.
+// Colour: the CENTRE circle reports PITCH - green when level, ramping through yellow to red as it tilts. The two OUTER circles report ROLL - green on a 45deg cardinal, yellow halfway, red at the 22.5deg midpoints.
+// Rational ease, one knob: f(t) = t*(1+k)/(1 + k*t), t in 0..1. Finite slope (1+k) at 0 - steep near the target, easing flat toward t=1 - with exact endpoints f(0)=0, f(1)=1. Unlike cbrt/sqrt (infinite slope at 0, twitchy at the sweet spot) the slope is bounded and tunable: bigger k = more sensitivity near aligned (tinier green sliver). Hard limit k > -1 (at k <= -1 the denominator can hit zero and blow up); k >= 0 is the useful range.
+const ROLL_EASE_K: f32 = 4.0; // roll: drives both the colour ramp AND the spin snap
+const PITCH_EASE_K: f32 = 16.0; // pitch: colour only (tighter green sliver than roll)
+const SPACING_SPREAD: f32 = 6.0; // extra centre-to-outer spacing (in radii) added as the centre dot goes red; 0 = always tangent
+fn level_ease(t: f32, k: f32) -> f32 {
+    t * (1.0 + k) / (1.0 + k * t)
+}
+
+fn draw_level_indicator(ui: &mut UserInterface, pixels: &mut [u8], stride: usize, height: u32) {
+    let short = ui.screen_run.min(ui.screen_rise) as f32;
+
+    // Layout sizes scaled to the screen's short edge so it looks right on any device/orientation (half the original size).
+    let radius = short * 0.006; // circle radius
+    let pitch_gain = short * 0.03; // how far a full tilt pushes the circles vertically
+    // Anchor at top-centre of the HELD orientation (not the physical screen): user_to_screen maps user-space (0.5 horizontal, near top) through the same device_rotation flip/swap the controls use, so the indicator follows the phone from portrait to landscape and stays at the user's top-centre.
+    let (cx, cy) = user_to_screen(ui, 0.5, 0.04);
+
+    // ROLL drives the triad's orientation (counter-spun x4) PLUS the held-orientation offset so the triad's base frame matches the rotated UI (otherwise landscape reads 90deg off). device_rotation is degrees (0/90/180/270); add it in radians so portrait and landscape share the same "level" reference.
+    let ui_offset = (ui.device_rotation as f32).to_radians();
+    // Ease the roll toward the nearest 45deg cardinal so the triad SNAPS into alignment (and stays near it longer): split roll into nearest-cardinal + signed remainder, ease the remainder's magnitude (steeper near the cardinal), recombine. Same rational ease as the colour, so spin and colour accelerate together.
+    let card = 45.0f32.to_radians();
+    let nearest = (ui.roll / card).round() * card;
+    let rem = ui.roll - nearest; // signed, within +/- 22.5deg
+    let eased_roll = nearest + rem.signum() * level_ease(rem.abs() / (card * 0.5), ROLL_EASE_K) * (card * 0.5);
+    let spin = -eased_roll * 4.0 + ui_offset;
+    let (s, c) = (spin.sin(), spin.cos());
+
+    // PITCH folds to 90deg cardinals (green at 0, +90, -90), just like roll folds to 45deg. pitch_rem is the signed distance to the nearest 90deg multiple (+/- 45deg) - the alignment error that drives BOTH the dot position and its colour, so the dot returns to centre + green at every cardinal and is maximally offset + red at the +/-45deg midpoints.
+    let pcard = 90.0f32.to_radians();
+    let pitch_rem = ui.pitch - (ui.pitch / pcard).round() * pcard; // +/- 45deg, signed
+    // Eased pitch error magnitude (0 at a cardinal = green, 1 at the +/-45deg worst = red). Same value drives the centre dot's COLOUR and the triad SPACING - so the outer dots kiss the centre (tangent) when green and spread out as it reds.
+    let pitch_t = level_ease(pitch_rem.abs() / (pcard * 0.5), PITCH_EASE_K);
+    // Spacing: 2*radius (tangent, no gap) at green, opening up by SPACING_SPREAD*radius more as the centre dot goes red.
+    let spacing = radius * (2.0 + pitch_t * SPACING_SPREAD);
+    // Position offset: the SAME eased magnitude as the colour/gap (pitch_t), signed by which way we're off the cardinal, so the vertical motion snaps near level exactly like the colour does. Positive remainder = tilted past the cardinal toward the sky -> centre moves UP. Direction is handled entirely by `perp` (which carries ui_offset, so it already rotates correctly per held orientation) - no extra orientation flip here (an earlier one double-flipped 180/270).
+    let pitch_off = pitch_rem.signum() * pitch_t * pitch_gain;
+
+    // The triad's base line direction is horizontal (1,0) rotated by `spin`; outer circles sit at +/-spacing along it. The line carries the roll spin so it tilts as you roll.
+    let line = (c, s); // unit vector along the triad
+
+    // The PITCH axis must always be the user's true screen-up, regardless of held orientation - derived directly from user_to_screen (the vector from a lower point to the anchor), NOT from the spun perpendicular (which mixed in the roll spin and orientation and flipped wrong at 180/270). Normalise it; pitch then pushes the centre along +up and the outers along -up.
+    let (bx, by) = user_to_screen(ui, 0.5, 0.08);
+    let (ux, uy) = (cx - bx, cy - by);
+    let ulen = (ux * ux + uy * uy).sqrt().max(1e-6);
+    let up = (ux / ulen, uy / ulen); // unit "toward the user's top of screen"
+
+    // Centre circle: shifted toward the sky by pitch (UP * pitch_off).
+    let center = (cx + up.0 * pitch_off, cy + up.1 * pitch_off);
+    // Outer circles: along the spun line at +/-spacing, shifted the OPPOSITE way in pitch.
+    let left = (cx - line.0 * spacing - up.0 * pitch_off, cy - line.1 * spacing - up.1 * pitch_off);
+    let right = (cx + line.0 * spacing - up.0 * pitch_off, cy + line.1 * spacing - up.1 * pitch_off);
+
+    // green -> yellow -> red ramp over t in 0..1 (0 = on target = green, 1 = worst = red). Both channels overshoot to 510 and the f32->u8 saturating cast clamps to 255: red = t*510 (0 -> 255 by the midpoint), green = (1-t)*510 (255 until the midpoint -> 0). At t=0.5 both read 255 = bright yellow.
+    let ramp = |t: f32| -> (u8, u8, u8) { ((t * 510.0) as u8, ((1.0 - t) * 510.0) as u8, 0u8) };
+
+    // Centre = PITCH: green at the 0/+90/-90 cardinals, red at the +/-45deg midpoints. Reuses pitch_t (the same eased error that drives the spacing) so colour and spread stay locked together.
+    let center_col = ramp(pitch_t);
+    // Outer = ROLL: colour falls straight out of the SAME rotation math as the spin - `rem` is the signed alignment error (how far the triad is from its nearest cardinal, +/- 22.5deg). Normalise to 0..1 and ease: 0 = aligned = green, 1 = worst (22.5deg) = red. One source of truth for spin and colour.
+    let outer_col = ramp(level_ease(rem.abs() / (card * 0.5), ROLL_EASE_K));
+
+    fill_circle(pixels, stride, left.0, left.1, radius, outer_col);
+    fill_circle(pixels, stride, right.0, right.1, radius, outer_col);
+    fill_circle(pixels, stride, center.0, center.1, radius, center_col);
+
+    // Numeric readouts flanking the dots: ROLL on the left, PITCH on the right. Both show the signed error from the nearest cardinal (the same `rem`/`pitch_rem` that drive colour) in degrees - how far off level, which is what the user is correcting. Each in its axis's own colour so the number matches its dot.
+    let roll_deg = rem.to_degrees();
+    let pitch_deg = pitch_rem.to_degrees();
+    let text_size = radius * 4.5;
+    let rot = ui.device_rotation as u16;
+    // Place the text in USER space (left/right of the anchor) via user_to_screen, so the held-orientation flip/swap keeps it horizontal beside the dots - offsetting raw screen-x put it top/bottom in portrait. gap_frac is a fraction of the content width, clear of the triad's widest spread.
+    let gap_frac = 0.10;
+    let (rx, ry) = user_to_screen(ui, 0.5 - gap_frac, 0.04);
+    let (px, py) = user_to_screen(ui, 0.5 + gap_frac, 0.04);
+    ui.text_renderer.draw_text_right(pixels, stride as u32, height, &format!("{:+.2}", roll_deg), rx, ry, text_size, 400, outer_col.0, outer_col.1, outer_col.2, rot);
+    ui.text_renderer.draw_text_left(pixels, stride as u32, height, &format!("{:+.2}", pitch_deg), px, py, text_size, 400, center_col.0, center_col.1, center_col.2, rot);
+}
+
+// Anti-aliased filled circle in screen pixel space, alpha-blended over the live preview. No sqrt: like photon's draw_filled_circle, we compare SQUARED distances - full inside r_inner2, zero outside r_outer2, linear AA across the one-pixel edge band between them (coverage = (r_outer2 - dist2) / (r_outer2 - r_inner2)).
+fn fill_circle(pixels: &mut [u8], stride: usize, cx: f32, cy: f32, radius: f32, color: (u8, u8, u8)) {
+    // No bounds checks: the indicator lives at screen top-centre with a tiny radius, so its bounding box is always well inside the buffer - the pixels are mathematically in-bounds.
+    let r_out = radius + 0.5;
+    let r_in = radius - 0.5;
+    let r_out2 = r_out * r_out;
+    let r_in2 = r_in * r_in;
+    let edge = (r_out2 - r_in2).max(1.0); // edge-band width in squared-distance units; >=1 avoids a /0 at radius<=0.5 (math constant for the AA divide, not a value guard)
+    let x0 = (cx - r_out).floor() as usize;
+    let x1 = (cx + r_out).ceil() as usize;
+    let y0 = (cy - r_out).floor() as usize;
+    let y1 = (cy + r_out).ceil() as usize;
+    for y in y0..=y1 {
+        let dy = y as f32 + 0.5 - cy;
+        let dy2 = dy * dy;
+        for x in x0..=x1 {
+            let dx = x as f32 + 0.5 - cx;
+            let dist2 = dx * dx + dy2;
+            if dist2 > r_out2 {
+                continue; // outside the disc - not this pixel's geometry
+            }
+            // AA coverage weight in 0..1 (blend weight, not a value/bounds guard): 1 inside r_in2, ramping to 0 at r_out2.
+            let cov = if dist2 <= r_in2 { 1.0 } else { (r_out2 - dist2) / edge };
+            let idx = (y * stride + x) * 3;
+            pixels[idx] = (color.0 as f32 * cov + pixels[idx] as f32 * (1.0 - cov)) as u8;
+            pixels[idx + 1] = (color.1 as f32 * cov + pixels[idx + 1] as f32 * (1.0 - cov)) as u8;
+            pixels[idx + 2] = (color.2 as f32 * cov + pixels[idx + 2] as f32 * (1.0 - cov)) as u8;
+        }
+    }
 }
 
 pub fn save_label_areas(

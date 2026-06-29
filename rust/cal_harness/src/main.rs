@@ -41,9 +41,33 @@ fn main() {
 
     // --- Load raw maps (full-res mosaic, u16) ---
     let bias_raw = load_vsf_field(&args[1], "mean", n);
+    let bias_var_raw = load_vsf_field(&args[1], "variance", n);
     let dark_raw = load_vsf_field(&args[2], "mean", n);
     let dark_var = load_vsf_field(&args[2], "variance", n); // frame-to-frame diff, flags unstable pixels
     let light_raw = load_light(&args[3], n);
+
+    // --- DUMP the calibration maps to 16-bit TIFFs (full mosaic, raw stored values) so we can eyeball the
+    // actual fixed pattern and make sure we're not chasing ghosts. Each is the raw u16 from the VSF, plus a
+    // dark-current map (dark - bias, clamped >=0). Written next to the light. Always on; cheap relative to
+    // the rest. ---
+    {
+        let base = Path::new(&args[3]);
+        let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("cal");
+        let dir = |suffix: &str| base.with_file_name(format!("{stem}_{suffix}.tiff"));
+        write_tiff16(&dir("cal_bias_mean"), w, h, &bias_raw);
+        write_tiff16(&dir("cal_bias_var"), w, h, &bias_var_raw);
+        write_tiff16(&dir("cal_dark_mean"), w, h, &dark_raw);
+        write_tiff16(&dir("cal_dark_var"), w, h, &dark_var);
+        // dark current = dark - bias (the signal we'd actually subtract per-second-of-exposure), clamp >=0.
+        let darkcur: Vec<u16> = (0..n)
+            .map(|i| (dark_raw[i] as i32 - bias_raw[i] as i32).max(0).min(65535) as u16)
+            .collect();
+        write_tiff16(&dir("cal_dark_current"), w, h, &darkcur);
+        println!(
+            "dumped cal TIFFs: {}_{{cal_bias_mean,cal_bias_var,cal_dark_mean,cal_dark_var,cal_dark_current}}.tiff",
+            stem
+        );
+    }
 
     // Cal maps are raw 10-bit DN; the light DNG is the same data shifted to 16-bit (<<6 = x64). Bring the
     // cal into the light's scale so a binned cal pixel matches a binned light pixel.
@@ -64,76 +88,74 @@ fn main() {
         cal_scale, hot_level, hot_diff, n_bad, 100.0 * n_bad as f64 / n as f64
     );
 
-    // --- Strict 4x4 quad-Bayer bin -> linear RGB (dead-pixel-aware) ---
+    // --- THE CORRECTION: per-pixel, on the FULL MOSAIC, BEFORE binning ---
+    // The fixed-pattern / popcorn noise is PER-PIXEL. Binning first averages 4 pixels per cluster and smears
+    // it away before we can subtract it; that's why the earlier bin-then-subtract did nothing. So we subtract
+    // on the raw mosaic, then bin only for display.
+    //   bias[i]       = read-noise/offset floor (16s shortest-shutter is ~0s; the bias capture)
+    //   darkcurrent[i]= dark[i] - bias[i]  = dark CURRENT alone (per pixel), as captured at the cal exposure
+    //   corrected[i]  = light[i] - bias[i] - r * darkcurrent[i]
+    // where r scales the dark current from the CAL exposure to the LIGHT's exposure (dark current grows with
+    // time). The light's exposure isn't in its metadata (stripped), so assume EXPOSURE_S (default 600s = the
+    // ~10 min shot); the dark cal was DARK_CAL_S (default 16s, the forced max shutter). r = EXPOSURE_S/DARK_CAL_S.
+    let exposure_s = getenv_f64("EXPOSURE_S", 600.0);
+    let dark_cal_s = getenv_f64("DARK_CAL_S", 16.0);
+    let r = exposure_s / dark_cal_s;
+    println!("exposure assume: light {exposure_s}s / dark-cal {dark_cal_s}s -> dark-current scale r={r:.2}");
+
+    // Reconstruct bad pixels in each map from good same-CFA-phase (stride-4) neighbours so a hot pixel
+    // neither subtracts garbage nor poisons its bin.
+    let recon = |src: &[f64]| -> Vec<f64> { reconstruct_bad(src, &bad, w, h, 4) };
+    let bias_r = recon(&bias_s);
+    let dark_r = recon(&dark_s);
+    let light_f: Vec<f64> = light_raw.iter().map(|&x| x as f64).collect();
+    let light_r = recon(&light_f);
+
+    // corrected mosaic = light - bias - r*(dark - bias)
+    let mut corrected = vec![0.0f64; n];
+    for i in 0..n {
+        let darkcurrent = dark_r[i] - bias_r[i];
+        corrected[i] = light_r[i] - bias_r[i] - r * darkcurrent;
+    }
+
+    // --- Bin BOTH (light = before, corrected = after) to RGB for viewing ---
     let bayer = getenv_usize("BAYER", 2) as u32; // light CFA GGBB/GGBB/RRGG/RRGG => GBRG = 2
     let black = getenv_f64("BLACK", 4100.0);
     let tw = w / 4;
     let th = h / 4;
-    let light_rgb = bin_quad_rgb_f64(&light_raw.iter().map(|&x| x as f64).collect::<Vec<_>>(), &bad, w, h, bayer, black);
-    // The cal maps already have their own offset baked in; bin them with black=0 (we high-pass them next,
-    // which removes any DC anyway). Same dead-pixel mask.
-    let bias_rgb = bin_quad_rgb_f64(&bias_s, &bad, w, h, bayer, 0.0);
-    let dark_rgb = bin_quad_rgb_f64(&dark_s, &bad, w, h, bayer, 0.0);
+    // No-bad mask for binning now (already reconstructed); subtract black so both share the same zero.
+    let nobad = vec![false; n];
+    let before = bin_quad_rgb_f64(&light_r, &nobad, w, h, bayer, black);
+    let after = bin_quad_rgb_f64(&corrected, &nobad, w, h, bayer, black);
     println!("binned to {tw}x{th} RGB ({} px/channel)", tw * th);
 
-    // --- High-pass each binned channel (3x3 box on the BINNED image; colour-safe now) ---
-    // *_fp = binned - box3x3(binned). Removes lens-shading / smooth gradients, leaving per-pixel structure.
-    let bias_fp = highpass_rgb(&bias_rgb, tw, th);
-    let dark_fp = highpass_rgb(&dark_rgb, tw, th);
-    let light_fp = highpass_rgb(&light_rgb, tw, th);
-
-    // Dark-region mask on the binned light: only fit where the scene is near black (FPN dominates there;
-    // bright scene edges would swamp it). floor is in the binned cluster-sum scale (4 px summed per cluster).
-    let floor = getenv_f64("CAL_FLOOR", 2000.0);
-
-    // --- Per-channel least-squares regression: light_fp ~ alpha*bias_fp + beta*dark_fp ---
-    let chan_name = ["R", "G", "B"];
-    let mut alpha = [0.0f64; 3];
-    let mut beta = [0.0f64; 3];
-    for ch in 0..3 {
-        let (mut sbb, mut sbd, mut sdd, mut sbl, mut sdl, mut sll) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        let mut nfit = 0u64;
-        for i in 0..tw * th {
-            // skip bright scene (use the binned light's channel level vs floor) and tiles that came out as
-            // exact zero (all-dead cluster -> no data).
-            if light_rgb[i][ch] > floor {
-                continue;
-            }
-            let b = bias_fp[i][ch];
-            let d = dark_fp[i][ch];
-            let l = light_fp[i][ch];
-            sbb += b * b;
-            sbd += b * d;
-            sdd += d * d;
-            sbl += b * l;
-            sdl += d * l;
-            sll += l * l;
-            nfit += 1;
-        }
-        let det = sbb * sdd - sbd * sbd;
-        let (a, bt) = if det.abs() > 1e-9 {
-            ((sbl * sdd - sdl * sbd) / det, (sbb * sdl - sbd * sbl) / det)
-        } else {
-            (0.0, 0.0)
-        };
-        alpha[ch] = a;
-        beta[ch] = bt;
-        let corr_bias = sbl / (sbb.sqrt() * sll.sqrt()).max(1e-9);
-        let corr_dark = sdl / (sdd.sqrt() * sll.sqrt()).max(1e-9);
-        let explained = (a * sbl + bt * sdl) / sll.max(1e-9);
-        println!(
-            "  [{}] over {:>8} dark px:  corr bias={:+.4} dark={:+.4}  ->  alpha={:+.4} beta={:+.4}  (R^2={:.4}, {:.1}%)",
-            chan_name[ch], nfit, corr_bias, corr_dark, a, bt, explained, 100.0 * explained
-        );
-    }
-
-    // --- Apply + write before/after PNGs (8-bit, auto-scaled per image for eyeballing) ---
     let stem = Path::new(&args[3]).file_stem().and_then(|s| s.to_str()).unwrap_or("light");
-    let before = render_rgb(&light_rgb, &bias_fp, &dark_fp, tw, th, &[0.0; 3], &[0.0; 3]);
-    let after = render_rgb(&light_rgb, &bias_fp, &dark_fp, tw, th, &alpha, &beta);
-    write_png(&Path::new(&args[3]).with_file_name(format!("{stem}_binned_before.png")), tw, th, &before);
-    write_png(&Path::new(&args[3]).with_file_name(format!("{stem}_binned_after.png")), tw, th, &after);
-    println!("\nwrote {stem}_binned_before.png / {stem}_binned_after.png ({tw}x{th})");
+    // Shared per-channel min/max over both images.
+    let mut lo = [f64::MAX; 3];
+    let mut hi = [f64::MIN; 3];
+    for img in [&before, &after] {
+        for px in img.iter() {
+            for ch in 0..3 {
+                lo[ch] = lo[ch].min(px[ch]);
+                hi[ch] = hi[ch].max(px[ch]);
+            }
+        }
+    }
+    let to16 = |img: &[[f64; 3]]| -> Vec<u16> {
+        let mut out = vec![0u16; img.len() * 3];
+        for (i, px) in img.iter().enumerate() {
+            for ch in 0..3 {
+                let span = (hi[ch] - lo[ch]).max(1e-6);
+                out[i * 3 + ch] = (((px[ch] - lo[ch]) / span).clamp(0.0, 1.0) * 65535.0).round() as u16;
+            }
+        }
+        out
+    };
+    let before_path = Path::new(&args[3]).with_file_name(format!("{stem}_binned_before_16.png"));
+    let after_path = Path::new(&args[3]).with_file_name(format!("{stem}_binned_after_16.png"));
+    write_png16(&before_path, tw, th, &to16(&before));
+    write_png16(&after_path, tw, th, &to16(&after));
+    println!("\nwrote {} and {} ({}x{}, 16-bit linear, shared scale)", before_path.display(), after_path.display(), tw, th);
 }
 
 // Base 2x2 cluster colours (0=R,1=G,2=B) for the Android base bayer pattern, same mapping the device uses.
@@ -197,58 +219,35 @@ fn bin_quad_rgb_f64(raw: &[f64], bad: &[bool], width: usize, height: usize, baye
     out
 }
 
-// High-pass each channel of a binned RGB image: value minus its 3x3 box mean. Colour-safe because the
-// image is already de-mosaiced (one RGB per pixel). Leaves per-pixel structure (FPN + random noise).
-fn highpass_rgb(img: &[[f64; 3]], w: usize, h: usize) -> Vec<[f64; 3]> {
-    let mut out = vec![[0.0f64; 3]; w * h];
+// Replace each bad (hot/unstable) pixel with the mean of its good same-CFA-phase neighbours at stride
+// `period` (N/S/E/W), so a dead pixel never subtracts garbage nor poisons its bin. Good pixels pass through.
+fn reconstruct_bad(src: &[f64], bad: &[bool], w: usize, h: usize, period: usize) -> Vec<f64> {
+    let mut out = src.to_vec();
+    let p = period as i64;
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
-            for ch in 0..3 {
-                let mut s = 0.0f64;
-                let mut c = 0.0f64;
-                for dy in -1i64..=1 {
-                    for dx in -1i64..=1 {
-                        let xx = x as i64 + dx;
-                        let yy = y as i64 + dy;
-                        if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
-                            s += img[yy as usize * w + xx as usize][ch];
-                            c += 1.0;
-                        }
+            if !bad[i] {
+                continue;
+            }
+            let mut s = 0.0;
+            let mut c = 0.0;
+            let mut acc = |xx: i64, yy: i64| {
+                if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
+                    let j = yy as usize * w + xx as usize;
+                    if !bad[j] {
+                        s += src[j];
+                        c += 1.0;
                     }
                 }
-                out[i][ch] = img[i][ch] - s / c.max(1.0);
+            };
+            acc(x as i64 - p, y as i64);
+            acc(x as i64 + p, y as i64);
+            acc(x as i64, y as i64 - p);
+            acc(x as i64, y as i64 + p);
+            if c > 0.0 {
+                out[i] = s / c;
             }
-        }
-    }
-    out
-}
-
-// Render corrected = light_rgb - (alpha*bias_fp + beta*dark_fp) to an 8-bit RGB PNG, auto-scaled per image
-// (min..max -> 0..255 with a single sqrt gamma) so the structure is visible for eyeballing.
-fn render_rgb(light: &[[f64; 3]], bias_fp: &[[f64; 3]], dark_fp: &[[f64; 3]], w: usize, h: usize, alpha: &[f64; 3], beta: &[f64; 3]) -> Vec<u8> {
-    let n = w * h;
-    let mut vals = vec![[0.0f64; 3]; n];
-    let mut lo = [f64::MAX; 3];
-    let mut hi = [f64::MIN; 3];
-    for i in 0..n {
-        for ch in 0..3 {
-            let c = light[i][ch] - (alpha[ch] * bias_fp[i][ch] + beta[ch] * dark_fp[i][ch]);
-            vals[i][ch] = c;
-            if c < lo[ch] {
-                lo[ch] = c;
-            }
-            if c > hi[ch] {
-                hi[ch] = c;
-            }
-        }
-    }
-    let mut out = vec![0u8; n * 3];
-    for i in 0..n {
-        for ch in 0..3 {
-            let span = (hi[ch] - lo[ch]).max(1e-6);
-            let v = ((vals[i][ch] - lo[ch]) / span).clamp(0.0, 1.0);
-            out[i * 3 + ch] = (v.sqrt() * 255.0) as u8;
         }
     }
     out
@@ -319,10 +318,61 @@ fn load_light(path: &str, n: usize) -> Vec<u16> {
     v
 }
 
+#[allow(dead_code)]
 fn write_png(path: &Path, w: usize, h: usize, rgb: &[u8]) {
     let f = fs::File::create(path).expect("create png");
     let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w as u32, h as u32);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header().unwrap().write_image_data(rgb).unwrap();
+}
+
+// 16-bit RGB PNG. png wants big-endian u16 samples, so serialise each sample as two BE bytes.
+fn write_png16(path: &Path, w: usize, h: usize, rgb16: &[u16]) {
+    let f = fs::File::create(path).expect("create png");
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w as u32, h as u32);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Sixteen);
+    let mut be = Vec::with_capacity(rgb16.len() * 2);
+    for &s in rgb16 {
+        be.extend_from_slice(&s.to_be_bytes());
+    }
+    enc.write_header().unwrap().write_image_data(&be).unwrap();
+}
+
+// Minimal uncompressed 16-bit single-channel (grayscale) little-endian TIFF. Hand-rolled: an 8-byte header
+// pointing at one IFD, the IFD with the tags a raw-viewer needs, then the pixel data. The cal maps are the
+// raw stored u16 values (no scaling) so the TIFF shows EXACTLY what's in the .vsf - the honest fixed-pattern.
+fn write_tiff16(path: &Path, w: usize, h: usize, gray16: &[u16]) {
+    assert_eq!(gray16.len(), w * h, "tiff size mismatch");
+    let entries: u16 = 8;
+    let ifd_off: u32 = 8;
+    let ifd_bytes = 2 + entries as u32 * 12 + 4;
+    let data_off: u32 = ifd_off + ifd_bytes;
+    let mut buf: Vec<u8> = Vec::with_capacity(data_off as usize + w * h * 2);
+    buf.extend_from_slice(b"II"); // little-endian
+    buf.extend_from_slice(&42u16.to_le_bytes()); // magic
+    buf.extend_from_slice(&ifd_off.to_le_bytes());
+    buf.extend_from_slice(&entries.to_le_bytes());
+    // helper to push one 12-byte IFD entry (tag, type, count, value/offset)
+    let mut entry = |buf: &mut Vec<u8>, tag: u16, typ: u16, count: u32, val: u32| {
+        buf.extend_from_slice(&tag.to_le_bytes());
+        buf.extend_from_slice(&typ.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&val.to_le_bytes());
+    };
+    // types: 3=SHORT, 4=LONG. Tags must be ascending.
+    entry(&mut buf, 256, 4, 1, w as u32); // ImageWidth
+    entry(&mut buf, 257, 4, 1, h as u32); // ImageLength
+    entry(&mut buf, 258, 3, 1, 16); // BitsPerSample (SHORT stored in low 2 bytes of the value field)
+    entry(&mut buf, 259, 3, 1, 1); // Compression = none
+    entry(&mut buf, 262, 3, 1, 1); // PhotometricInterpretation = BlackIsZero
+    entry(&mut buf, 273, 4, 1, data_off); // StripOffsets
+    entry(&mut buf, 278, 4, 1, h as u32); // RowsPerStrip = whole image
+    entry(&mut buf, 279, 4, 1, (w * h * 2) as u32); // StripByteCounts
+    buf.extend_from_slice(&0u32.to_le_bytes()); // next IFD = none
+    for &v in gray16 {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fs::write(path, &buf).expect("write tiff");
 }

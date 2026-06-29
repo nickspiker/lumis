@@ -69,6 +69,9 @@ pub struct UserInterface {
     pub sensor_orientation: i32,
     pub camera_facing: i32,
     pub device_rotation: u16,
+    // Continuous roll/pitch (radians) from the gravity vector, for the level indicator. roll = rotation about the view axis (0 when the phone's top edge points up); pitch = tilt toward sky (+) / ground (-).
+    pub roll: f32,
+    pub pitch: f32,
     pub sensor_white_level: u16,
     pub sensor_black_level: u16,
     pub bayer_pattern: u32,
@@ -418,6 +421,8 @@ impl UserInterface {
             sensor_orientation,
             camera_facing,
             device_rotation: initial_rotation,
+            roll: 0.0,
+            pitch: 0.0,
             sensor_white_level,
             sensor_black_level,
             bayer_pattern,
@@ -921,7 +926,7 @@ impl UserInterface {
         touch_y: f32,
         gravity_x: f32,
         gravity_y: f32,
-        _gravity_z: f32,
+        gravity_z: f32,
     ) {
         let mut draw = false;
         let unix_time = std::time::SystemTime::now()
@@ -955,9 +960,21 @@ impl UserInterface {
             self.device_rotation = new_rotation;
             draw = true;
         }
-        // Publish the live device rotation so the save path can orient the EXIF/DNG tag + baked exports
-        // to match how the phone is held (written every tick - cheap, and covers the initial value too).
+        // Publish the live device rotation so the save path can orient the EXIF/DNG tag + baked exports to match how the phone is held (written every tick - cheap, and covers the initial value too).
         self.header[DEVICE_ROTATION_IDX] = new_rotation as u64;
+
+        // Continuous roll/pitch from the gravity vector, for the level indicator. Android device frame (portrait): +x right, +y toward the top edge, +z out of the screen. Held upright at the horizon, gravity ~ (0, -g, 0).
+        // roll = atan2(gx, -gy): 0 when the top edge points up; +/- as the phone rolls about the view axis.
+        // pitch = atan2(-gz, hypot(gx,gy)): tilt of the back-camera view axis above the horizon. Positive when aimed toward the sky, negative toward the ground; 0 when level.
+        // NO smoothing - raw values straight through, so the indicator tracks the phone with zero lag.
+        let prev_roll = self.roll;
+        let prev_pitch = self.pitch;
+        self.roll = gravity_x.atan2(-gravity_y);
+        self.pitch = (-gravity_z).atan2((gravity_x * gravity_x + gravity_y * gravity_y).sqrt());
+        // Repaint whenever the level changed at all and the controls (which host the indicator) are showing.
+        if self.controls_visible && (self.roll != prev_roll || self.pitch != prev_pitch) {
+            draw = true;
+        }
         let current_touch_valid = !touch_x.is_nan();
 
         // A fresh touch while the full-screen calibration scan is held dismisses it (and

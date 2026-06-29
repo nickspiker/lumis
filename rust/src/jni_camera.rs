@@ -105,7 +105,9 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeApplyCalToDng<'loc
             return 0;
         }
     };
-    let dark_file = match CalFile::decode(&dark_bytes, true) {
+    // mean only (false): hot-pixel masking is disabled for now, so the dark's ~100MB variance map isn't
+    // needed - skipping it keeps the camera process's transient memory lower.
+    let dark_file = match CalFile::decode(&dark_bytes, false) {
         Some(c) => c,
         None => {
             error!("ApplyCal: dark decode failed");

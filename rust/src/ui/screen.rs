@@ -1126,10 +1126,14 @@ fn draw_progress(ui: &mut UserInterface, pixels: &mut [u8], buffer: &ANativeWind
         let completion = (elapsed as f32 / total_ms as f32).min(1.0);
         let fill = completion * ui.exposure_time_slider as f32;
 
-        // Bar colour from completion: red fades out, green fades in -> yellow mid -> green at completion. .clamp guards float drift before the saturating u8 cast.
-        let cr = (((1.0 - completion) * 2.0).clamp(0.0, 1.0) * 255.0) as u8;
-        let cg = ((completion * 2.0).clamp(0.0, 1.0) * 255.0) as u8;
-        let (cr, cg, cb) = (cr, cg, 0u8);
+        // Bar colour from completion: red fades out, green fades in -> yellow mid -> green at completion.
+        // Both channels overshoot to 510 and the f32->u8 saturating cast clamps to 255 (no explicit clamp
+        // needed - the cast saturates, incl. any float drift past the ends).
+        let (cr, cg, cb) = (
+            ((1.0 - completion) * 510.0) as u8,
+            (completion * 510.0) as u8,
+            0u8,
+        );
 
         let is_vertical = (ui.slider_start_x - ui.slider_end_x).abs() < 1.0;
         let stroke = ui.slider_thickness as i32; // band half-thickness (original line width, unchanged)

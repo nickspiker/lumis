@@ -13,9 +13,11 @@
 //!   corrected[i]     = light[i] - offset_term - darkcurrent_term
 //!
 //! The flat black pedestal is deliberately LEFT in (only the per-pixel pattern is removed) so the DNG keeps
-//! its normal BlackLevel tag and downstream demosaicers behave. Dead/hot pixels (flagged by the dark level
-//! or its frame-to-frame variance) are RECONSTRUCTED from good same-CFA-phase neighbours instead of
-//! subtracted, so a hot pixel neither leaves a hole nor injects garbage.
+//! its normal BlackLevel tag and downstream demosaicers behave.
+//!
+//! NOTE: hot/dead-pixel masking + reconstruction is currently DISABLED - every pixel gets the same
+//! dark/bias subtraction, nothing special-cased. This isolates the base correction so it can be verified
+//! on its own; reconstruction can be layered back on once confirmed.
 //!
 //! iso_cal / exposure_ns / black_level come from the cal VSF itself (stored at finalize), never re-queried
 //! from the sensor - a firmware/HAL update can move the ISO range, which would corrupt g if we trusted the
@@ -68,6 +70,10 @@ impl CalFile {
                     let mut dec = ZlibDecoder::new(&compressed[..]);
                     let mut raw = Vec::new();
                     dec.read_to_end(&mut raw).ok()?;
+                    // Validating UNTRUSTED external data: this is a deflate blob from a .vsf file on disk that
+                    // could be corrupt or truncated. A short/long inflate would make the index below read OOB,
+                    // so reject it as a decode failure (None -> caller falls back to no correction). This
+                    // guards real untrusted input, not a guaranteed-correct internal buffer.
                     if raw.len() != n * 2 {
                         return None;
                     }
@@ -82,8 +88,8 @@ impl CalFile {
     }
 }
 
-/// A decoded, ready-to-apply calibration (bias map + dark map + metadata + bad-pixel mask). Maps are raw
-/// 10-bit DN (as stored); scaling to the light's domain happens in `apply`.
+/// A decoded, ready-to-apply calibration (bias map + dark map + metadata). Maps are raw 10-bit DN (as
+/// stored); scaling to the light's domain happens in `apply`.
 pub struct LoadedCalibration {
     pub width: usize,
     pub height: usize,
@@ -92,13 +98,12 @@ pub struct LoadedCalibration {
     pub black_level: f64,
     pub bias: Vec<u16>, // per-pixel mean, max-ISO shortest-shutter
     pub dark: Vec<u16>, // per-pixel mean, max-ISO longest-shutter (bias + dark current)
-    pub bad: Vec<bool>, // hot/unstable pixels (from dark level OR dark variance)
 }
 
 impl LoadedCalibration {
     /// Combine a decoded BIAS file and a decoded DARK file into a ready calibration. Dimensions must match.
     /// Metadata (iso_cal/exposure_ns/black_level) comes from the DARK file (its exposure_ns = the 16s the
-    /// dark current was integrated over). The bad-pixel mask uses the DARK level + variance.
+    /// dark current was integrated over).
     ///
     /// CONSUMES both CalFiles and MOVES their map Vecs (no clone). Each map is ~50M u16 = 100MB; on the
     /// camera process cloning them (plus the still-live raw VSF bytes) blew the memory budget and the OS
@@ -107,10 +112,6 @@ impl LoadedCalibration {
         if bias_file.width != dark_file.width || bias_file.height != dark_file.height {
             return None;
         }
-        let bad = match &dark_file.variance {
-            Some(v) => Self::bad_mask(&dark_file.mean, v),
-            None => dark_file.mean.iter().map(|&d| d > 140).collect(), // level-only fallback
-        };
         Some(LoadedCalibration {
             width: dark_file.width,
             height: dark_file.height,
@@ -119,17 +120,7 @@ impl LoadedCalibration {
             black_level: dark_file.black_level,
             bias: bias_file.mean, // moved, not cloned
             dark: dark_file.mean, // moved, not cloned
-            bad,
         })
-    }
-
-    /// Hot/unstable pixel mask: bad if the dark adder is too hot (level) OR its frame-to-frame diff is too
-    /// unstable (variance). Thresholds are well above the dark's bulk; tuned in the host harness.
-    fn bad_mask(dark: &[u16], variance: &[u16]) -> Vec<bool> {
-        // Raw 10-bit DN thresholds (the harness used 16-bit /64): level ~140 DN (=9000/64), diff ~125 (=8000/64).
-        const HOT_LEVEL: u16 = 140;
-        const HOT_DIFF: u16 = 125;
-        (0..dark.len()).map(|i| dark[i] > HOT_LEVEL || variance[i] > HOT_DIFF).collect()
     }
 
     /// Apply the correction to a light frame (u16, same w*h, the light's native raw scale). `iso_light` and
@@ -138,58 +129,28 @@ impl LoadedCalibration {
     /// corrected frame in place semantics by returning a new Vec. Black pedestal is preserved.
     pub fn apply(&self, light: &[u16], iso_light: f64, t_light_ns: f64, cal_scale: f64) -> Vec<u16> {
         let n = self.width * self.height;
-        if light.len() != n {
-            return light.to_vec(); // size mismatch: pass through unchanged
-        }
+        // Not a defensive guard: the caller (nativeApplyCalToDng) already verified the DNG's raw strip is
+        // exactly n pixels before calling, and indexes light[0..n] below. If light isn't n long, WE built it
+        // wrong upstream - panic loud so the bug surfaces, don't silently emit a mis-corrected file.
+        assert_eq!(light.len(), n, "calibration apply: light {} != {}x{}={}", light.len(), self.width, self.height, n);
         // Gain + exposure ratios. Guard the denominators (older cals may store 0 -> fall back to ratio 1).
         let g = if self.iso_cal > 0.0 { iso_light / self.iso_cal } else { 1.0 };
         let te = if self.exposure_ns > 0.0 { t_light_ns / self.exposure_ns } else { 1.0 };
         let black = self.black_level * cal_scale;
 
+        // Step 1: just the dark/bias subtraction on EVERY pixel - no hot-pixel skip, no reconstruction.
+        // (Hot-pixel masking + reconstruction is deliberately disabled for now so we can verify the base
+        // correction in isolation; it can be layered back on once this is confirmed.)
         let mut out = vec![0u16; n];
         for i in 0..n {
-            if self.bad[i] {
-                continue; // fill after, by reconstruction
-            }
             let bias = self.bias[i] as f64 * cal_scale;
             let dark = self.dark[i] as f64 * cal_scale;
             let offset_term = (bias - black) * g;
             let darkcurrent_term = (dark - bias) * g * te;
             let corrected = light[i] as f64 - offset_term - darkcurrent_term;
-            out[i] = corrected.clamp(0.0, 65535.0).round() as u16;
-        }
-        // Reconstruct bad pixels from good same-CFA-phase neighbours (stride 4 for the 4x4 quad CFA; lands on
-        // the same colour). Reads `out` (already-corrected good pixels) so the fill matches the corrected scene.
-        let w = self.width;
-        let h = self.height;
-        let period = 4i64;
-        for y in 0..h {
-            for x in 0..w {
-                let i = y * w + x;
-                if !self.bad[i] {
-                    continue;
-                }
-                let mut s = 0.0f64;
-                let mut c = 0.0f64;
-                let mut acc = |xx: i64, yy: i64| {
-                    if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
-                        let j = yy as usize * w + xx as usize;
-                        if !self.bad[j] {
-                            s += out[j] as f64;
-                            c += 1.0;
-                        }
-                    }
-                };
-                acc(x as i64 - period, y as i64);
-                acc(x as i64 + period, y as i64);
-                acc(x as i64, y as i64 - period);
-                acc(x as i64, y as i64 + period);
-                out[i] = if c > 0.0 {
-                    (s / c).clamp(0.0, 65535.0).round() as u16
-                } else {
-                    light[i] // no good neighbour: leave the original (vanishingly rare)
-                };
-            }
+            // f64->u16 saturates: corrected < 0 -> 0 (clipped black), > 65535 -> 65535. round() for correct
+            // nearest-integer; no explicit clamp needed (the cast does it).
+            out[i] = corrected.round() as u16;
         }
         out
     }
