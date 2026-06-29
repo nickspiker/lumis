@@ -422,8 +422,10 @@ pub fn draw_controls(
                 }
             }
         }
-        // Level indicator: three circles, center-top of the screen (only while controls are visible).
+        // Level indicator: three circles (slot 2 when a colour cal is active, else centred).
         draw_level_indicator(ui, pixels, screen_buffer.stride as usize, screen_buffer.height as u32);
+        // Slot 1: colour-calibration readout (target type/serial/life/UV/IR/warning), only when a cal is active.
+        draw_cal_info(ui, pixels, screen_buffer.stride as usize, screen_buffer.height as u32);
     } // End of controls_visible block
 }
 
@@ -444,8 +446,9 @@ fn draw_level_indicator(ui: &mut UserInterface, pixels: &mut [u8], stride: usize
     // Layout sizes scaled to the screen's short edge so it looks right on any device/orientation (half the original size).
     let radius = short * 0.006; // circle radius
     let pitch_gain = short * 0.03; // how far a full tilt pushes the circles vertically
-    // Anchor at top-centre of the HELD orientation (not the physical screen): user_to_screen maps user-space (0.5 horizontal, near top) through the same device_rotation flip/swap the controls use, so the indicator follows the phone from portrait to landscape and stays at the user's top-centre.
-    let (cx, cy) = user_to_screen(ui, 0.5, 0.04);
+    // Anchor via user_to_screen (held-orientation aware). When a colour calibration is active the top row is a 4-slot grid - slot 0 target, slot 1 cal info, slot 2 level, slot 3 counters - so the indicator sits at slot 2's centre (x=2/3). Uncalibrated, it's centred (x=1/2) with slots 1/2 unused.
+    let anchor_x = if ui.calibration_info.load().is_some() { 2.0 / 3.0 } else { 0.5 };
+    let (cx, cy) = user_to_screen(ui, anchor_x, 0.04);
 
     // ROLL drives the triad's orientation (counter-spun x4) PLUS the held-orientation offset so the triad's base frame matches the rotated UI (otherwise landscape reads 90deg off). device_rotation is degrees (0/90/180/270); add it in radians so portrait and landscape share the same "level" reference.
     let ui_offset = (ui.device_rotation as f32).to_radians();
@@ -471,7 +474,7 @@ fn draw_level_indicator(ui: &mut UserInterface, pixels: &mut [u8], stride: usize
     let line = (c, s); // unit vector along the triad
 
     // The PITCH axis must always be the user's true screen-up, regardless of held orientation - derived directly from user_to_screen (the vector from a lower point to the anchor), NOT from the spun perpendicular (which mixed in the roll spin and orientation and flipped wrong at 180/270). Normalise it; pitch then pushes the centre along +up and the outers along -up.
-    let (bx, by) = user_to_screen(ui, 0.5, 0.08);
+    let (bx, by) = user_to_screen(ui, anchor_x, 0.08);
     let (ux, uy) = (cx - bx, cy - by);
     let ulen = (ux * ux + uy * uy).sqrt().max(1e-6);
     let up = (ux / ulen, uy / ulen); // unit "toward the user's top of screen"
@@ -501,10 +504,51 @@ fn draw_level_indicator(ui: &mut UserInterface, pixels: &mut [u8], stride: usize
     let rot = ui.device_rotation as u16;
     // Place the text in USER space (left/right of the anchor) via user_to_screen, so the held-orientation flip/swap keeps it horizontal beside the dots - offsetting raw screen-x put it top/bottom in portrait. gap_frac is a fraction of the content width, clear of the triad's widest spread.
     let gap_frac = 0.10;
-    let (rx, ry) = user_to_screen(ui, 0.5 - gap_frac, 0.04);
-    let (px, py) = user_to_screen(ui, 0.5 + gap_frac, 0.04);
+    let (rx, ry) = user_to_screen(ui, anchor_x - gap_frac, 0.04);
+    let (px, py) = user_to_screen(ui, anchor_x + gap_frac, 0.04);
     ui.text_renderer.draw_text_right(pixels, stride as u32, height, &format!("{:+.2}", roll_deg), rx, ry, text_size, 400, outer_col.0, outer_col.1, outer_col.2, rot);
     ui.text_renderer.draw_text_left(pixels, stride as u32, height, &format!("{:+.2}", pitch_deg), px, py, text_size, 400, center_col.0, center_col.1, center_col.2, rot);
+}
+
+// Slot 1 of the calibrated 4-slot top row (target | cal info | level | counts): the colour-calibration readout - target type/serial, target life, UV + IR content, and any warning. Drawn only when a colour cal is active (calibration_info is Some); centred horizontally on slot 1 (x = 1/3), stacked vertically, rotated with the held UI. Colours mirror chameleon's terminal report: life green->red by remaining %, UV violet, IR per-channel R/G/B, warnings amber.
+fn draw_cal_info(ui: &mut UserInterface, pixels: &mut [u8], stride: usize, height: u32) {
+    let info = ui.calibration_info.load();
+    let info = match info.as_ref() {
+        Some(i) => i.clone(),
+        None => return,
+    };
+    let short = ui.screen_run.min(ui.screen_rise) as f32;
+    let size = short * 0.018; // line text height
+    let line_step = 0.035; // vertical spacing between lines, in user-space fraction
+    let rot = ui.device_rotation as u16;
+    let cx_frac = 1.0 / 3.0; // slot 1 centre
+
+    // Target life colour: green (fresh) -> red (worn), matching the terminal's tl_r/tl_g ramp.
+    let life = info.life.clamp(0.0, 1.0);
+    let life_col = (((1.0 - life) * 128.0 + 127.0) as u8, (life * 128.0 + 127.0) as u8, 127u8);
+
+    // (text, r, g, b) per line. IR is per-channel so we show it as one R/G/B-tinted triple line.
+    let lines: [(String, u8, u8, u8); 5] = [
+        (format!("TYPE {} / SN {}", info.target_type, info.serial), 0xE0, 0xE0, 0xE0),
+        (format!("life {:.0}%", life * 100.0), life_col.0, life_col.1, life_col.2),
+        (format!("UV {:.0}%", (info.uv.max(0.0)) * 100.0), 0x9F, 0x7F, 0xFF),
+        (
+            format!("IR {:.0}/{:.0}/{:.0}%", info.ir[0] * 100.0, info.ir[1] * 100.0, info.ir[2] * 100.0),
+            0xE0, 0xC0, 0xC0,
+        ),
+        // Warning line (amber) if present, else gamma as a quiet status line.
+        if info.warning.trim().is_empty() {
+            (format!("gamma {:.2}", info.gamma), 0xA0, 0xA0, 0xA0)
+        } else {
+            ("CHECK TARGET".to_string(), 0xFF, 0xC0, 0x00)
+        },
+    ];
+
+    let y0 = 0.03;
+    for (i, (text, r, g, b)) in lines.iter().enumerate() {
+        let (tx, ty) = user_to_screen(ui, cx_frac, y0 + i as f32 * line_step);
+        ui.text_renderer.draw_text_center(pixels, stride as u32, height, text, tx, ty, size, 400, *r, *g, *b, rot);
+    }
 }
 
 // Anti-aliased filled circle in screen pixel space, alpha-blended over the live preview. No sqrt: like photon's draw_filled_circle, we compare SQUARED distances - full inside r_inner2, zero outside r_outer2, linear AA across the one-pixel edge band between them (coverage = (r_outer2 - dist2) / (r_outer2 - r_inner2)).

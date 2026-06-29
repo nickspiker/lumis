@@ -8,7 +8,8 @@ use crate::ui::touch::*;
 use crate::ui::ui::ui_constants::CALIBRATION_BUTTON_SIZE;
 use arc_swap::ArcSwap;
 use chameleon::{
-    encode_settings, get_settings, scan_target, verichrome_dir, write_settings, ImageData, RawInfo,
+    encode_settings, get_settings, scan_target, verichrome_dir, write_settings, CalInfo, ImageData,
+    RawInfo,
 };
 use log::*;
 use std::sync::atomic::AtomicBool;
@@ -126,6 +127,8 @@ pub struct UserInterface {
     // Cropped target-scan overlay (w, h, RGB bytes) from the last successful calibration.
     // When present, it replaces the calibration button as a visual "calibrated" indicator.
     pub calibration_overlay: Arc<ArcSwap<Option<(u32, u32, Vec<u8>)>>>,
+    // Structured colour-cal summary from the last successful scan (target type/serial/life/UV/IR/warning), for the slot-1 readout. None until a colour calibration succeeds.
+    pub calibration_info: Arc<ArcSwap<Option<CalInfo>>>,
     // scan_target's live_overlay, held over the frozen frame after calibration until the
     // user taps: (min_x, min_y, width, height, rgba_f32). Coords are in the full-res sensor
     // frame at 2x scale (as chameleon produces); RGBA linear 0..1. Composited in-place in
@@ -496,6 +499,7 @@ impl UserInterface {
             calculating_histogram: Arc::new(AtomicBool::new(false)),
             calibrating: Arc::new(AtomicBool::new(false)),
             calibration_overlay: Arc::new(ArcSwap::from_pointee(None)),
+            calibration_info: Arc::new(ArcSwap::from_pointee(None)),
             calibration_hold: Arc::new(ArcSwap::from_pointee(None)),
             frozen_image_counter: None,
             frozen_image: Vec::new(),
@@ -700,6 +704,7 @@ impl UserInterface {
                 let magic_9 = *self.magic_9_display;
                 let calibrating_flag = self.calibrating.clone();
                 let calibration_overlay = self.calibration_overlay.clone();
+                let calibration_info = self.calibration_info.clone();
                 let calibration_hold = self.calibration_hold.clone();
 
                 // Pointers to shared memory for writing calibration results back (as usize for Send)
@@ -790,6 +795,7 @@ impl UserInterface {
                                 _report,
                                 _warning,
                                 live_overlay,
+                                cal_info,
                             )) => {
                                 // Write the calibration results to shared memory:
                                 // - cam2terminal9 (Rec.2020) -> magic_9_display for live preview.
@@ -830,6 +836,8 @@ impl UserInterface {
                                     overlayheight,
                                     overlayimage,
                                 ))));
+                                // Structured cal summary for the slot-1 readout (target type/serial/life/UV/IR/warning).
+                                calibration_info.store(Arc::new(cal_info));
                                 log::info!(
                                     "Wrote display matrix to shared memory: {:?}, gamma: {}",
                                     raw_info.cam2terminal9,
