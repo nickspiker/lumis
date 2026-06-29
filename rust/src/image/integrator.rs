@@ -20,6 +20,23 @@ pub fn set_pending_save_data(dng_data: Vec<u8>, filename: String) {
     PENDING_SAVE_DATA.lock().unwrap().push_back((dng_data, filename));
 }
 
+/// Read an entire file referenced by a raw fd into a Vec (native memory). dup()s so our File owns its own
+/// descriptor; reads from the start (rewinds via the dup). Used by the save thread to stream the cal VSFs
+/// without holding them resident. None on any error. The caller still owns/closes the original fd.
+fn read_fd_bytes(fd: i32) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::fd::FromRawFd;
+    let dup = unsafe { libc::dup(fd) };
+    if dup < 0 {
+        return None;
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(dup) };
+    let _ = file.seek(SeekFrom::Start(0)); // a prior save may have read to EOF on the shared description
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?; // File drop closes `dup`
+    Some(buf)
+}
+
 pub struct CameraSettings {
     pub iso: f32,
     pub shutter_ns: f32,
@@ -154,6 +171,10 @@ pub struct CameraIntegrator {
     // Dark-frame calibration state (only used while CALIBRATING_BIT is set). None until the first
     // calibration frame arrives; reset when finalized so a later calibration starts fresh.
     cal: Option<CalibrationState>,
+    // Dup'd fds for the loaded calibration's bias + dark .vsf files (set by Kotlin at camera open when a cal exists for this sensor/resolution; -1 = none). The save thread re-reads + decodes these per save (transient, freed after - NOT held resident, which OOM-killed the camera process), applies the correction to the raw before the format branch, so every output format is calibrated.
+    cal_bias_fd: i32,
+    cal_dark_fd: i32,
+    cal_white_level: u16, // sensor white level captured at load, for the cal->light scale (65535/white)
 }
 
 // Accumulated state for a running dark-frame calibration capture. Mean and variance use the shared
@@ -297,7 +318,26 @@ impl CameraIntegrator {
             last_image_timestamp: SystemTime::now(),
             last_saved_counter: u64::MAX,
             cal: None,
+            cal_bias_fd: -1,
+            cal_dark_fd: -1,
+            cal_white_level: 0,
         }
+    }
+
+    /// Install (or clear) the loaded-calibration fds. Kotlin dup()s the bias + dark .vsf file descriptors at
+    /// camera open and passes them here; the save thread re-reads them per save. Pass bias_fd<0 or dark_fd<0
+    /// to clear (no calibration -> saves are uncorrected). white_level is the sensor white for the cal scale.
+    pub fn set_calibration_fds(&mut self, bias_fd: i32, dark_fd: i32, white_level: u16) {
+        // Close any previously-held fds before replacing, so re-opening the camera doesn't leak descriptors.
+        if self.cal_bias_fd >= 0 {
+            unsafe { libc::close(self.cal_bias_fd); }
+        }
+        if self.cal_dark_fd >= 0 {
+            unsafe { libc::close(self.cal_dark_fd); }
+        }
+        self.cal_bias_fd = bias_fd;
+        self.cal_dark_fd = dark_fd;
+        self.cal_white_level = white_level;
     }
 
     pub fn process_frame(
@@ -695,13 +735,23 @@ impl CameraIntegrator {
                 mode_str
             );
 
-            // Copy the slot's raw u16 data for the save thread (the camera thread keeps overwriting the live slots). DNG needs the full data_length (avg, or avg+diff for motion); RGB exports debayer the average half.
-            let raw_slot: Vec<u16> =
+            // Copy the slot's raw u16 data for the save thread (the camera thread keeps overwriting the live slots). DNG needs the full data_length (avg, or avg+diff for motion); RGB exports debayer the average half. `mut` so the calibration correction can rewrite the avg region in place before any format branch.
+            let mut raw_slot: Vec<u16> =
                 self.image_buffer[data_offset..data_offset + data_length].to_vec();
 
             let width = self.width;
             let height = self.height;
             let display_orientation = device_orientation; // 0/1/2/3 -> 0/90/180/270 below
+
+            // Calibration apply inputs for the save thread: dup the cal fds (the thread owns its copies, freed when read), the light's effective ISO + integration time (so the dark-current/offset terms scale right), and the cal->light value scale (65535/sensor_white). cal_bias_fd<0 = no cal loaded -> skip, save uncorrected.
+            let (cal_bias_fd, cal_dark_fd) = if self.cal_bias_fd >= 0 && self.cal_dark_fd >= 0 {
+                (unsafe { libc::dup(self.cal_bias_fd) }, unsafe { libc::dup(self.cal_dark_fd) })
+            } else {
+                (-1, -1)
+            };
+            let cal_iso_light = eff_iso;
+            let cal_t_light_ns = integ_s * 1.0e9;
+            let cal_scale = 65535.0 / (self.cal_white_level.max(1) as f64);
 
             thread::spawn(move || {
                 use crate::image::save_encode::*;
@@ -715,6 +765,33 @@ impl CameraIntegrator {
                     270 => 270,
                     _ => 0,
                 };
+
+                // CALIBRATION: if a cal is loaded, decode the bias+dark VSFs (streamed from the dup'd fds, freed at end of scope - NOT held resident, which OOM-killed the process) and correct the avg region of raw_slot IN PLACE, before any format branch. So DNG (raw) and JPEG/TIFF/JXL (demosaiced from this same raw) are all calibrated from one corrected buffer. Motion mode (current_mode==2) uses the diff half and isn't a straight light frame, so skip it.
+                if cal_bias_fd >= 0 && cal_dark_fd >= 0 && current_mode != 2 {
+                    use crate::image::calibration::{CalFile, LoadedCalibration};
+                    let pc = width * height;
+                    let bias = read_fd_bytes(cal_bias_fd);
+                    let dark = read_fd_bytes(cal_dark_fd);
+                    let loaded = bias.and_then(|b| CalFile::decode(&b, false)).and_then(|bf| {
+                        dark.and_then(|d| CalFile::decode(&d, true)).and_then(|df| LoadedCalibration::from_pair(bf, df))
+                    });
+                    match loaded {
+                        Some(cal) if cal.width == width && cal.height == height && raw_slot.len() >= pc => {
+                            let corrected = cal.apply(&raw_slot[0..pc], cal_iso_light, cal_t_light_ns, cal_scale);
+                            raw_slot[0..pc].copy_from_slice(&corrected);
+                            log::info!("Calibration applied to {}x{} raw before encode (iso_cal={:.0} exp={:.0})", cal.width, cal.height, cal.iso_cal, cal.exposure_ns);
+                        }
+                        Some(cal) => log::warn!("Cal {}x{} != light {}x{}; saving uncorrected", cal.width, cal.height, width, height),
+                        None => log::warn!("Cal decode failed; saving uncorrected"),
+                    }
+                }
+                // Close the thread's dup'd fds (whether or not we used them).
+                if cal_bias_fd >= 0 {
+                    unsafe { libc::close(cal_bias_fd); }
+                }
+                if cal_dark_fd >= 0 {
+                    unsafe { libc::close(cal_dark_fd); }
+                }
 
                 let (bytes, ext): (Vec<u8>, &str) = if save_format == SAVE_FORMAT_DNG {
                     // DNG: raw bayer + the real chameleon ColorMatrix1 (magic9inv) + D50.

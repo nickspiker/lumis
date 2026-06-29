@@ -52,9 +52,6 @@ class CameraInterface : Service() {
    private var activeCameraIndex: Int = -1
    // Calibration capture intent for the camera being opened: -1 = normal, 0 = bias, 1 = dark.
    private var calibrationMode: Int = -1
-   // The active camera's info (resolution/focal/white), kept so the post-save cal correction can locate the
-   // matching cal_bias/cal_dark .vsf pair and pass the light's white level. Null until a camera opens.
-   private var calCameraInfo: CameraInfo? = null
    private var isCameraActive: Boolean = false
    private var isContinuousSaveActive: Boolean = false
    
@@ -193,14 +190,11 @@ class CameraInterface : Service() {
        // result screen reads. Returns true if verified.
        @JvmStatic
        external fun nativeVerifyCalVsf(contextPtr: Long, fd: Int): Boolean
-       // Apply a cal (bias+dark fds) to an already-saved DNG (dngFd) and write the corrected DNG to outFd.
-       // Streams the maps in native memory and frees them - the camera process can't hold them resident.
-       // Returns true on success.
+       // Install the loaded calibration: hand the bias+dark .vsf file descriptors (and sensor white level)
+       // to native at camera open. The save thread streams them per save and corrects the raw before any
+       // format encode, so DNG/JPEG/TIFF/JXL are all calibrated. Pass -1,-1 to clear (no cal).
        @JvmStatic
-       external fun nativeApplyCalToDng(
-           dngFd: Int, biasFd: Int, darkFd: Int, outFd: Int,
-           isoLight: Double, tLightNs: Double, whiteLevel: Int
-       ): Boolean
+       external fun nativeSetCalibrationFds(contextPtr: Long, biasFd: Int, darkFd: Int, whiteLevel: Int)
 
        @JvmStatic
        external fun nativeCameraGetSharedMemoryPtr(contextPtr: Long): Long
@@ -569,10 +563,38 @@ class CameraInterface : Service() {
        // accumulates mean+variance without per-exposure reset and publishes progress stats.
        if (calibrationMode >= 0) {
            nativeSetCalibrationMode(nativeCameraContextPtr, calibrationMode == 1)
+       } else {
+           // Normal capture: install the matching cal pair (if any) so every save is calibrated. The native
+           // side keeps the fds and streams them per save; missing cal -> uncorrected saves as before.
+           installCalibrationForCurrentCamera(cameraInfo)
        }
-       // Remember this camera's resolution/focal/white so the post-save correction can find the matching
-       // cal pair without re-enumerating. Cleared to no-cal if none of the fields are valid.
-       calCameraInfo = cameraInfo
+   }
+
+   // Find the bias+dark cal .vsf pair in Download/Lumis matching this camera (focal + resolution), open each
+   // as a file descriptor, and hand them to native to keep. Native re-reads them per save and corrects the
+   // raw before encoding, so DNG/JPEG/TIFF/JXL all come out calibrated. Best-effort: missing pair clears the
+   // cal (uncorrected saves). The fds are dup'd into native, so we can close ours immediately after.
+   private fun installCalibrationForCurrentCamera(info: CameraInfo) {
+       try {
+           val focal = String.format("%.1f", info.focalLengthMm)
+           val w = info.widthPixels
+           val h = info.heightPixels
+           val biasUri = findDownloadUri("cal_bias_${focal}mm_${w}x${h}.vsf")
+           val darkUri = findDownloadUri("cal_dark_${focal}mm_${w}x${h}.vsf")
+           if (biasUri == null || darkUri == null) {
+               nativeSetCalibrationFds(nativeCameraContextPtr, -1, -1, info.whiteLevel)
+               Log.i("CameraInterface", "No calibration pair for ${focal}mm ${w}x${h} - saves uncorrected")
+               return
+           }
+           contentResolver.openFileDescriptor(biasUri, "r")?.use { bpfd ->
+               contentResolver.openFileDescriptor(darkUri, "r")?.use { dpfd ->
+                   nativeSetCalibrationFds(nativeCameraContextPtr, bpfd.fd, dpfd.fd, info.whiteLevel)
+                   Log.i("CameraInterface", "Calibration installed for ${focal}mm ${w}x${h}")
+               }
+           }
+       } catch (e: Exception) {
+           Log.e("CameraInterface", "installCalibrationForCurrentCamera failed: ${e.javaClass.simpleName}: ${e.message}")
+       }
    }
 
    // Resolve a Download/Lumis file by display name to a content Uri, or null if absent.
@@ -594,85 +616,6 @@ class CameraInterface : Service() {
        return null
    }
 
-   // After a normal DNG is saved, produce a calibration-corrected sibling "<name>_corrected.dng" - IF a
-   // matching cal_bias/cal_dark .vsf pair exists for this camera. We hand the saved DNG fd, the two cal fds,
-   // and a fresh output fd to native, which streams the maps (read, apply, free) so the camera process never
-   // holds them resident. The light's effective ISO + exposure are read from the saved DNG's own EXIF (the
-   // values native wrote = one effective exposure), so g/te scale correctly. Best-effort; failure is silent
-   // and just leaves the uncorrected DNG.
-   fun correctSavedDng(savedDngName: String) {
-       try {
-           val info = calCameraInfo ?: return
-           val focal = String.format("%.1f", info.focalLengthMm)
-           val w = info.widthPixels
-           val h = info.heightPixels
-           val biasUri = findDownloadUri("cal_bias_${focal}mm_${w}x${h}.vsf") ?: return
-           val darkUri = findDownloadUri("cal_dark_${focal}mm_${w}x${h}.vsf") ?: return
-
-           // Locate the just-saved uncorrected DNG by display name (in Pictures/Lumis).
-           val imgCollection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-           val dngUri = contentResolver.query(
-               imgCollection, arrayOf(MediaStore.Images.Media._ID),
-               "${MediaStore.Images.Media.DISPLAY_NAME} = ?", arrayOf(savedDngName), null
-           )?.use { c ->
-               if (c.moveToFirst()) android.content.ContentUris.withAppendedId(imgCollection, c.getLong(0)) else null
-           } ?: return
-
-           // Read the effective ISO + exposure the DNG records (native wrote the composite/effective values).
-           var isoLight = 0.0
-           var tLightNs = 0.0
-           contentResolver.openInputStream(dngUri)?.use { ins ->
-               val exif = android.media.ExifInterface(ins)
-               val iso = exif.getAttribute(android.media.ExifInterface.TAG_ISO_SPEED_RATINGS)
-               val exp = exif.getAttributeDouble(android.media.ExifInterface.TAG_EXPOSURE_TIME, 0.0)
-               isoLight = iso?.toDoubleOrNull() ?: 0.0
-               tLightNs = exp * 1.0e9
-           }
-           if (isoLight <= 0.0 || tLightNs <= 0.0) {
-               Log.w("CameraInterface", "correctSavedDng: missing ISO/exposure in EXIF ($isoLight, $tLightNs) - skipping")
-               return
-           }
-
-           // Create the corrected output entry.
-           val correctedName = savedDngName.removeSuffix(".dng") + "_corrected.dng"
-           val values = ContentValues().apply {
-               put(MediaStore.Images.Media.DISPLAY_NAME, correctedName)
-               put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
-               if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                   put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Lumis")
-                   put(MediaStore.Images.Media.IS_PENDING, 1)
-               }
-           }
-           contentResolver.delete(imgCollection, "${MediaStore.Images.Media.DISPLAY_NAME} = ?", arrayOf(correctedName))
-           val outUri = contentResolver.insert(imgCollection, values) ?: return
-
-           var ok = false
-           contentResolver.openFileDescriptor(dngUri, "r")?.use { dpfd ->
-               contentResolver.openFileDescriptor(biasUri, "r")?.use { bpfd ->
-                   contentResolver.openFileDescriptor(darkUri, "r")?.use { kpfd ->
-                       contentResolver.openFileDescriptor(outUri, "w")?.use { opfd ->
-                           ok = nativeApplyCalToDng(
-                               dpfd.fd, bpfd.fd, kpfd.fd, opfd.fd,
-                               isoLight, tLightNs, info.whiteLevel
-                           )
-                       }
-                   }
-               }
-           }
-           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-               values.clear(); values.put(MediaStore.Images.Media.IS_PENDING, 0)
-               contentResolver.update(outUri, values, null, null)
-           }
-           if (!ok) {
-               contentResolver.delete(outUri, null, null) // clean the empty pending row
-               Log.w("CameraInterface", "correctSavedDng: native apply failed for $savedDngName")
-           } else {
-               Log.i("CameraInterface", "Calibration-corrected DNG written: $correctedName")
-           }
-       } catch (e: Exception) {
-           Log.e("CameraInterface", "correctSavedDng failed: ${e.javaClass.simpleName}: ${e.message}")
-       }
-   }
 
    private fun getCameraInfo(cameraIndex: Int): CameraInfo? {
        val cameraArray = enumerateRawCameras()
@@ -1355,11 +1298,8 @@ class CameraProcessor(private val service: CameraInterface) {
            // Bump the saved counter only on a genuinely new file; a dedup skip still clears the in-progress
            // flag (and shows the green indicator) but must not increment.
            service.nativeClearSaveInProgress(service.nativeCameraContextPtr, status == CameraInterface.SAVE_WRITTEN)
-           // After a freshly-written DNG, produce the calibration-corrected sibling if a cal pair exists.
-           // Runs the heavy map load+apply in native, streamed and freed - never held in the camera process.
-           if (status == CameraInterface.SAVE_WRITTEN && savedData.filename.endsWith(".dng")) {
-               service.correctSavedDng(savedData.filename)
-           }
+           // (Calibration is now applied IN the native save thread before encoding - every format comes out
+           // calibrated as a single file, so there's no post-save correction step here anymore.)
        }
        }
    }

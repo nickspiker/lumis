@@ -12,12 +12,9 @@
 //!   darkcurrent_term = (dark[i] - bias[i]) * g * te     dark current alone (black cancels in dark-bias)
 //!   corrected[i]     = light[i] - offset_term - darkcurrent_term
 //!
-//! The flat black pedestal is deliberately LEFT in (only the per-pixel pattern is removed) so the DNG keeps
-//! its normal BlackLevel tag and downstream demosaicers behave.
+//! The flat black pedestal is deliberately LEFT in (only the per-pixel pattern is removed) so the DNG keeps its normal BlackLevel tag and downstream demosaicers behave.
 //!
-//! NOTE: hot/dead-pixel masking + reconstruction is currently DISABLED - every pixel gets the same
-//! dark/bias subtraction, nothing special-cased. This isolates the base correction so it can be verified
-//! on its own; reconstruction can be layered back on once confirmed.
+//! Hot/unstable pixels (flagged by the dark level OR its frame-to-frame variance) are reconstructed from good same-CFA-phase neighbours after the subtraction, since subtracting a blown/noisy cal value can't recover a bad pixel.
 //!
 //! iso_cal / exposure_ns / black_level come from the cal VSF itself (stored at finalize), never re-queried
 //! from the sensor - a firmware/HAL update can move the ISO range, which would corrupt g if we trusted the
@@ -97,21 +94,24 @@ pub struct LoadedCalibration {
     pub exposure_ns: f64,
     pub black_level: f64,
     pub bias: Vec<u16>, // per-pixel mean, max-ISO shortest-shutter
-    pub dark: Vec<u16>, // per-pixel mean, max-ISO longest-shutter (bias + dark current)
+    // per-pixel dark mean (max-ISO longest-shutter = bias + dark current). Hot/unstable pixels are marked IN PLACE with the sentinel u16::MAX (cal maps are raw 10-bit, max ~1023, so MAX is unambiguous) - no separate mask Vec. apply() reconstructs any pixel whose dark == MAX.
+    pub dark: Vec<u16>,
 }
+
+/// Sentinel marking a hot/unstable pixel in the dark map. Cal data is raw 10-bit (0..~1023), so u16::MAX never collides with a real value.
+pub const BAD: u16 = u16::MAX;
 
 impl LoadedCalibration {
     /// Combine a decoded BIAS file and a decoded DARK file into a ready calibration. Dimensions must match.
     /// Metadata (iso_cal/exposure_ns/black_level) comes from the DARK file (its exposure_ns = the 16s the
-    /// dark current was integrated over).
+    /// dark current was integrated over). The DARK file must carry its variance map (decode with want_variance=true) so we can flag hot/unstable pixels.
     ///
-    /// CONSUMES both CalFiles and MOVES their map Vecs (no clone). Each map is ~50M u16 = 100MB; on the
-    /// camera process cloning them (plus the still-live raw VSF bytes) blew the memory budget and the OS
-    /// silently killed the process. Moving keeps exactly one copy of bias + one of dark.
-    pub fn from_pair(bias_file: CalFile, dark_file: CalFile) -> Option<LoadedCalibration> {
+    /// CONSUMES both CalFiles and MOVES their mean Vecs (no clone - cloning two 50MP maps on the camera process blew the memory budget and got it OS-killed). Outlier (hot/unstable) pixels are marked IN the dark map as BAD (u16::MAX); the dark variance is consumed to find them and then dropped, so only bias + dark stay resident - no separate mask allocation.
+    pub fn from_pair(bias_file: CalFile, mut dark_file: CalFile) -> Option<LoadedCalibration> {
         if bias_file.width != dark_file.width || bias_file.height != dark_file.height {
             return None;
         }
+        Self::mark_bad_pixels(&mut dark_file.mean, dark_file.variance.as_deref());
         Some(LoadedCalibration {
             width: dark_file.width,
             height: dark_file.height,
@@ -119,8 +119,38 @@ impl LoadedCalibration {
             exposure_ns: dark_file.exposure_ns,
             black_level: dark_file.black_level,
             bias: bias_file.mean, // moved, not cloned
-            dark: dark_file.mean, // moved, not cloned
+            dark: dark_file.mean, // moved, not cloned (outliers now == BAD)
         })
+    }
+
+    /// Mark hot/unstable pixels in the dark map IN PLACE as BAD (u16::MAX), using a robust, self-adapting outlier test: median + N*1.4826*MAD on the dark LEVEL, and (if present) the same on the dark VARIANCE. MAD (median absolute deviation) is outlier-resistant - the hot pixels don't inflate it the way std would - and median+MAD adapts to whatever sensor/ISO/exposure the cal was shot at, so there are no magic DN constants. A pixel is bad if it's a level outlier OR a variance outlier. Stats are taken over a strided sample (a few hundred k pixels is plenty for a stable median/MAD over 50M), then the threshold is applied to all pixels.
+    fn mark_bad_pixels(dark: &mut [u16], variance: Option<&[u16]>) {
+        const N_SIGMA: f64 = 6.0; // outlier distance in MAD-sigmas; ~6 flags genuine hot pixels, spares normal noise
+        let n = dark.len();
+        // Robust threshold from a strided sample. stride chosen for ~300k samples regardless of resolution.
+        let sample_thresh = |get: &dyn Fn(usize) -> u16| -> f64 {
+            let target = 300_000usize.min(n.max(1));
+            let stride = (n / target).max(1);
+            let mut s: Vec<u16> = (0..n).step_by(stride).map(get).collect();
+            s.sort_unstable();
+            let med = s[s.len() / 2] as f64;
+            // MAD = median(|x - med|); reuse the buffer for |deviation|.
+            for v in s.iter_mut() {
+                *v = (*v as f64 - med).abs() as u16;
+            }
+            s.sort_unstable();
+            let mad = s[s.len() / 2] as f64;
+            med + N_SIGMA * 1.4826 * mad.max(1.0) // mad.max(1): a degenerate all-equal sample would give MAD 0; floor it so the threshold stays finite
+        };
+        let lvl_thresh = sample_thresh(&|i| dark[i]);
+        let var_thresh = variance.map(|v| sample_thresh(&|i| v[i]));
+        for i in 0..n {
+            let bad = dark[i] as f64 > lvl_thresh
+                || var_thresh.map_or(false, |t| variance.unwrap()[i] as f64 > t);
+            if bad {
+                dark[i] = BAD;
+            }
+        }
     }
 
     /// Apply the correction to a light frame (u16, same w*h, the light's native raw scale). `iso_light` and
@@ -138,19 +168,50 @@ impl LoadedCalibration {
         let te = if self.exposure_ns > 0.0 { t_light_ns / self.exposure_ns } else { 1.0 };
         let black = self.black_level * cal_scale;
 
-        // Step 1: just the dark/bias subtraction on EVERY pixel - no hot-pixel skip, no reconstruction.
-        // (Hot-pixel masking + reconstruction is deliberately disabled for now so we can verify the base
-        // correction in isolation; it can be layered back on once this is confirmed.)
+        // Dark/bias subtraction on every GOOD pixel. Bad pixels (dark == BAD) are left 0 here and filled by reconstruction below - subtracting their (noisy/blown) cal value can't recover them, so we replace from good neighbours instead.
         let mut out = vec![0u16; n];
         for i in 0..n {
+            if self.dark[i] == BAD {
+                continue; // reconstructed below
+            }
             let bias = self.bias[i] as f64 * cal_scale;
             let dark = self.dark[i] as f64 * cal_scale;
             let offset_term = (bias - black) * g;
             let darkcurrent_term = (dark - bias) * g * te;
             let corrected = light[i] as f64 - offset_term - darkcurrent_term;
-            // f64->u16 saturates: corrected < 0 -> 0 (clipped black), > 65535 -> 65535. round() for correct
-            // nearest-integer; no explicit clamp needed (the cast does it).
+            // f64->u16 saturates: corrected < 0 -> 0 (clipped black), > 65535 -> 65535. round() for correct nearest-integer; no explicit clamp needed (the cast does it).
             out[i] = corrected.round() as u16;
+        }
+
+        // Reconstruct each bad pixel (dark == BAD) from the mean of its good SAME-CFA-PHASE neighbours - stride 4 (the 4x4 quad-Bayer period) lands on the same colour AND same sub-position, so we average like-with-like. Reads `out` (already-subtracted good pixels) so the fill matches the corrected scene; falls back to the subtracted value if a bad pixel has no good same-phase neighbour (vanishingly rare).
+        let w = self.width;
+        let h = self.height;
+        let p = 4i64;
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if self.dark[i] != BAD {
+                    continue;
+                }
+                let mut s = 0.0f64;
+                let mut c = 0.0f64;
+                let mut acc = |xx: i64, yy: i64| {
+                    if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
+                        let j = yy as usize * w + xx as usize;
+                        if self.dark[j] != BAD {
+                            s += out[j] as f64;
+                            c += 1.0;
+                        }
+                    }
+                };
+                acc(x as i64 - p, y as i64);
+                acc(x as i64 + p, y as i64);
+                acc(x as i64, y as i64 - p);
+                acc(x as i64, y as i64 + p);
+                if c > 0.0 {
+                    out[i] = (s / c).round() as u16;
+                }
+            }
         }
         out
     }

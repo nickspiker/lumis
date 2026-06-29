@@ -65,7 +65,7 @@ pub fn draw_controls(
             cal_x as usize,
             cal_y as usize,
             ui.device_rotation as u16,
-            ui.calibration_button_buffer.size,
+            &ui.calibration_button_buffer,
             *ow,
             *oh,
             img,

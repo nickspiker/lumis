@@ -488,16 +488,19 @@ pub fn composite_calibration_scan(
     x_center: usize,
     y_center: usize,
     rotation: u16,
-    size: usize,
+    button_buffer: &CalibrationButtonBuffer,
     src_w: u32,
     src_h: u32,
     src: &[u8],
     pressed: bool,
     buffer_stride: usize,
 ) {
+    let size = button_buffer.size;
     if size == 0 || src_w == 0 || src_h == 0 || src.len() < (src_w * src_h * 3) as usize {
         return;
     }
+    // Honour the chameleon button's OWN rounded-corner alpha (the 4th RGBA channel, already computed at this exact size) as the crop mask - so the captured target is cropped to the identical rounded-corner shape as the live preview, no re-derived corner math. alpha = background-keep factor (corners high -> keep background, interior 0 -> fully show scan).
+    let alpha_src = &button_buffer.normal_buffer;
     let (x_start, y_start) = match rotation {
         0 => (x_center, y_center),
         90 => (x_center, y_center - size),
@@ -522,7 +525,7 @@ pub fn composite_calibration_scan(
         let dst_y = y_start + dy;
         for dx in 0..size {
             let dst_x = x_start + dx;
-            // Button-local coords in the un-rotated frame.
+            // Button-local coords in the un-rotated frame (same rotation mapping composite_chameleon_button uses).
             let (bx, by) = match rotation {
                 0 => (dx, dy),
                 90 => (size - 1 - dy, dx),
@@ -531,20 +534,27 @@ pub fn composite_calibration_scan(
                 _ => (dx, dy),
             };
             let dst_idx = (dst_y * buffer_stride + dst_x) * 3;
-            // Outside the letterboxed scan area -> leave black (transparent letterbox).
-            if bx < off_x || bx >= off_x + fit_w || by < off_y || by >= off_y + fit_h {
-                pixels[dst_idx] = 0;
-                pixels[dst_idx + 1] = 0;
-                pixels[dst_idx + 2] = 0;
-                continue;
-            }
-            // Map into source (nearest-neighbour), preserving aspect.
-            let sx = ((bx - off_x) as u32 * src_w / fit_w as u32).min(src_w - 1);
-            let sy = ((by - off_y) as u32 * src_h / fit_h as u32).min(src_h - 1);
-            let src_idx = ((sy * src_w + sx) * 3) as usize;
-            pixels[dst_idx] = ((src[src_idx] as u16 * dim) >> 8) as u8;
-            pixels[dst_idx + 1] = ((src[src_idx + 1] as u16 * dim) >> 8) as u8;
-            pixels[dst_idx + 2] = ((src[src_idx + 2] as u16 * dim) >> 8) as u8;
+            // The button's stored rounded-corner alpha at this same button-local pixel (RGBA, 4th byte). It's the background-keep factor: corners high (keep background) -> rounded transparent corners; interior ~0 (show scan). Identical mask to the live preview, by construction.
+            let alpha = alpha_src[(by * size + bx) * 4 + 3] as u16;
+
+            // Scan colour (black in the aspect-fit letterbox; the corner alpha handles the rounding).
+            let (sr, sg, sb) = if bx < off_x || bx >= off_x + fit_w || by < off_y || by >= off_y + fit_h {
+                (0u16, 0u16, 0u16)
+            } else {
+                let sx = ((bx - off_x) as u32 * src_w / fit_w as u32).min(src_w - 1);
+                let sy = ((by - off_y) as u32 * src_h / fit_h as u32).min(src_h - 1);
+                let src_idx = ((sy * src_w + sx) * 3) as usize;
+                (
+                    (src[src_idx] as u16 * dim) >> 8,
+                    (src[src_idx + 1] as u16 * dim) >> 8,
+                    (src[src_idx + 2] as u16 * dim) >> 8,
+                )
+            };
+            // Proper alpha-over: out = bg*alpha + scan*(255-alpha), all /255. The button's own blend is bg*alpha + src because ITS colour buffer is PREMULTIPLIED by coverage at generation; the scan is full-strength RGB (not premultiplied), so it must be attenuated by the foreground factor (255-alpha) - otherwise the anti-aliased corner ramp adds the scan at full strength over bg*alpha and the edges over-brighten (the aliasing artefact). fg = 255 - alpha.
+            let fg = 255 - alpha;
+            pixels[dst_idx] = ((pixels[dst_idx] as u16 * alpha + sr * fg) / 255).min(255) as u8;
+            pixels[dst_idx + 1] = ((pixels[dst_idx + 1] as u16 * alpha + sg * fg) / 255).min(255) as u8;
+            pixels[dst_idx + 2] = ((pixels[dst_idx + 2] as u16 * alpha + sb * fg) / 255).min(255) as u8;
         }
     }
 }
