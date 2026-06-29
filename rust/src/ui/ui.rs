@@ -8,8 +8,8 @@ use crate::ui::touch::*;
 use crate::ui::ui::ui_constants::CALIBRATION_BUTTON_SIZE;
 use arc_swap::ArcSwap;
 use chameleon::{
-    encode_settings, get_settings, scan_target, verichrome_dir, write_settings, CalInfo, ImageData,
-    RawInfo,
+    encode_settings, get_last_scan_error, get_settings, scan_target, verichrome_dir, write_settings,
+    CalInfo, ImageData, RawInfo,
 };
 use log::*;
 use std::sync::atomic::AtomicBool;
@@ -129,6 +129,8 @@ pub struct UserInterface {
     pub calibration_overlay: Arc<ArcSwap<Option<(u32, u32, Vec<u8>)>>>,
     // Structured colour-cal summary from the last successful scan (target type/serial/life/UV/IR/warning), for the slot-1 readout. None until a colour calibration succeeds.
     pub calibration_info: Arc<ArcSwap<Option<CalInfo>>>,
+    // Reason the last colour calibration FAILED (e.g. overexposed), surfaced on-device instead of a silent no-op. Set when scan_target returns None with a reason; cleared on a successful scan.
+    pub calibration_error: Arc<ArcSwap<Option<String>>>,
     // scan_target's live_overlay, held over the frozen frame after calibration until the
     // user taps: (min_x, min_y, width, height, rgba_f32). Coords are in the full-res sensor
     // frame at 2x scale (as chameleon produces); RGBA linear 0..1. Composited in-place in
@@ -500,6 +502,7 @@ impl UserInterface {
             calibrating: Arc::new(AtomicBool::new(false)),
             calibration_overlay: Arc::new(ArcSwap::from_pointee(None)),
             calibration_info: Arc::new(ArcSwap::from_pointee(None)),
+            calibration_error: Arc::new(ArcSwap::from_pointee(None)),
             calibration_hold: Arc::new(ArcSwap::from_pointee(None)),
             frozen_image_counter: None,
             frozen_image: Vec::new(),
@@ -664,6 +667,9 @@ impl UserInterface {
 
                 log::info!("Starting Chameleon colour calibration");
 
+                // Clear any prior failure message so each attempt starts fresh.
+                self.calibration_error.store(Arc::new(None));
+
                 // Set calibrating flag for blinking button
                 self.calibrating
                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -705,6 +711,7 @@ impl UserInterface {
                 let calibrating_flag = self.calibrating.clone();
                 let calibration_overlay = self.calibration_overlay.clone();
                 let calibration_info = self.calibration_info.clone();
+                let calibration_error = self.calibration_error.clone();
                 let calibration_hold = self.calibration_hold.clone();
 
                 // Pointers to shared memory for writing calibration results back (as usize for Send)
@@ -838,6 +845,7 @@ impl UserInterface {
                                 ))));
                                 // Structured cal summary for the slot-1 readout (target type/serial/life/UV/IR/warning).
                                 calibration_info.store(Arc::new(cal_info));
+                                calibration_error.store(Arc::new(None)); // success clears any prior failure message
                                 log::info!(
                                     "Wrote display matrix to shared memory: {:?}, gamma: {}",
                                     raw_info.cam2terminal9,
@@ -851,7 +859,11 @@ impl UserInterface {
                                 log::info!("Calibration completed successfully");
                             }
                             None => {
-                                log::info!("Calibration scan_target returned None");
+                                // Surface WHY (e.g. overexposed) on-device instead of a silent no-op. chameleon stashes the rejection reason; show it, or a generic message if none was set (no target found).
+                                let reason = get_last_scan_error()
+                                    .unwrap_or_else(|| "Calibration failed - no target found".to_owned());
+                                log::info!("Calibration scan_target returned None: {}", reason);
+                                calibration_error.store(Arc::new(Some(reason)));
                             }
                         }
                     }
