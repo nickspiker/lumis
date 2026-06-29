@@ -518,8 +518,7 @@ fn draw_cal_info(ui: &mut UserInterface, pixels: &mut [u8], stride: usize, heigh
         None => return,
     };
     let short = ui.screen_run.min(ui.screen_rise) as f32;
-    let size = short * 0.018; // line text height
-    let line_step = 0.035; // vertical spacing between lines, in user-space fraction
+    let size = short * 0.018; // line text height (pixels)
     let rot = ui.device_rotation as u16;
     let cx_frac = 1.0 / 3.0; // slot 1 centre
 
@@ -544,9 +543,19 @@ fn draw_cal_info(ui: &mut UserInterface, pixels: &mut [u8], stride: usize, heigh
         },
     ];
 
-    let y0 = 0.03;
+    // Stack the lines OUT FROM THE CENTRE ROW by a fixed 1.5x line-height in PIXELS - not by user-space fraction divisions, which map to different pixel gaps per orientation (portrait content is taller, so a fixed fraction spread the lines way out; landscape looked right). Centre the block on slot 1's anchor and step along the held-up vector (so it stacks vertically in any orientation, same as the level indicator's pitch axis).
+    // Centre the block on the SAME vertical (y-fraction 0.04) as the level indicator anchor, so the text's vertical centre lines up with the dots in every orientation (a larger fraction sat way low in portrait, where it maps to more pixels).
+    let (cx, cy) = user_to_screen(ui, cx_frac, 0.04); // block centre = level-indicator height
+    let (bx, by) = user_to_screen(ui, cx_frac, 0.08); // a point below it -> held-up direction
+    let (ux, uy) = (cx - bx, cy - by);
+    let ulen = (ux * ux + uy * uy).sqrt().max(1e-6);
+    let up = (ux / ulen, uy / ulen);
+    let step = size * 1.5; // baseline-to-baseline spacing in pixels
+    let mid = (lines.len() as f32 - 1.0) * 0.5; // centre index (2.0 for 5 lines)
     for (i, (text, r, g, b)) in lines.iter().enumerate() {
-        let (tx, ty) = user_to_screen(ui, cx_frac, y0 + i as f32 * line_step);
+        let off = (mid - i as f32) * step; // +above centre, -below
+        let tx = cx + up.0 * off;
+        let ty = cy + up.1 * off;
         ui.text_renderer.draw_text_center(pixels, stride as u32, height, text, tx, ty, size, 400, *r, *g, *b, rot);
     }
 }
