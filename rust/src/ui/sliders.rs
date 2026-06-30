@@ -13,11 +13,31 @@ pub fn get_slider_labels(
         4 => {
             // Use exposure time setting from UI
             let exposure_time = ui.format_time(ui.exposure_time_ms);
-            let max_duration_ms = ui.time_base.duration_ms() as u64;
-            let timescale = ui.format_time(max_duration_ms);
+            // Top-left label: normally the slider's time-base span. In slitscan, show how long a FULL ring
+            // takes to fill instead - the ring holds ring_rows/period time-columns (= width for standard
+            // Bayer, width/2 for quad), and each column is one exposure (or one frame at 1/FPS when the
+            // exposure time is 0/free-running). So you can read off how long the whole strip takes to scroll.
+            let is_slitscan = crate::shared_memory::RawMode::from(
+                ui.header[crate::shared_memory::CURRENT_MODE_IDX] as u8,
+            ) == crate::shared_memory::RawMode::Slitscan;
+            let top_left = if is_slitscan {
+                let w = ui.sensor_x_size.max(1);
+                let ring_rows = ui.slitscan_buffer.len() / w;
+                let period = if ui.header[crate::shared_memory::QUAD_BAYER_IDX] != 0 { 4 } else { 2 };
+                let columns = (ring_rows / period) as u64;
+                let per_column_ms = if ui.exposure_time_ms > 0 {
+                    ui.exposure_time_ms
+                } else {
+                    let fps = f64::from_bits(ui.header[crate::shared_memory::FPS_IDX]);
+                    if fps > 0. { (1000.0 / fps) as u64 } else { 0 }
+                };
+                ui.format_time(columns.saturating_mul(per_column_ms))
+            } else {
+                ui.format_time(ui.time_base.duration_ms() as u64)
+            };
 
             (
-                (timescale, [253, 128, 255]),
+                (top_left, [253, 128, 255]),
                 (exposure_time, [253, 128, 255]),
                 ("".to_string(), [253, 128, 255]), // No elapsed/remaining for slider labels
                 ("".to_string(), [253, 128, 255]), // They get calculated on the fly
