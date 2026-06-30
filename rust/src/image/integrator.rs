@@ -156,9 +156,13 @@ pub struct CameraIntegrator {
     image_buffer: &'static mut [u16],
     // Slitscan ring (width x 2*width), in its own segment region after image_buffer. Written per-frame in
     // RawMode::Slitscan; never touched by the slot/accumulate path, so a held stack survives a trip into the
-    // strip and back. `was_slitscan` tracks the previous frame's mode so the ring is zeroed once on entry.
+    // strip and back. `was_slitscan` tracks the previous frame's mode so the ring is reset once on entry.
     slitscan_buffer: &'static mut [u16],
     was_slitscan: bool,
+    // u32 accumulator for the live slitscan column (period rows x width): each column integrates frames over
+    // the set exposure time exactly like a normal Average exposure, then averages + scales into the ring and
+    // advances the head. Keeps slitscan's frame_count / effective-ISO metadata identical to the other modes.
+    slitscan_accum: Vec<u32>,
     pub magic_9_display: &'static mut [f32; 9],
     pub magic_9_display_gamma: &'static mut f32,
     pub magic_9_dng_xyz: &'static mut [f32; 9],
@@ -315,6 +319,7 @@ impl CameraIntegrator {
             image_buffer,
             slitscan_buffer,
             was_slitscan: false,
+            slitscan_accum: Vec::new(),
             magic_9_display,
             magic_9_display_gamma,
             magic_9_dng_xyz,
@@ -460,7 +465,7 @@ impl CameraIntegrator {
         // overwriting the oldest slice with NO data shuffling (same idea as the rolling slots). Handled
         // entirely here; the normal accumulate path below is untouched.
         if self.header[CURRENT_MODE_IDX] as u8 == RawMode::Slitscan as u8 {
-            self.process_slitscan_frame(frame_data);
+            self.process_slitscan_frame(frame_data, elapsed_ms, force_completion);
             return (
                 f64::from_bits(self.header[ISO_IDX]) as i32,
                 f64::from_bits(self.header[SHUTTER_NS_IDX]) as i64,
@@ -1023,54 +1028,79 @@ impl CameraIntegrator {
         }
     }
 
-    /// One frame of a slitscan capture: copy a Bayer-period-tall slice from the frame CENTRE into the ring
-    /// (in the dedicated slitscan_buffer region) and advance the write-head. The ring is width x (2*width) -
-    /// a 2:1 strip - with the head wrapping to overwrite the oldest slice, no data shuffling. The slice scales
-    /// raw -> 16-bit exactly like the normal average path, so the existing demosaic/preview/save read it at
-    /// the same scale. The ring is isolated from the slots, so it never disturbs a held Average/Difference/
-    /// Motion stack.
-    fn process_slitscan_frame(&mut self, frame_data: &[u8]) {
+    /// One frame of a slitscan capture. A slitscan COLUMN is integrated exactly like a normal Average
+    /// exposure - the centre Bayer-period band is summed into a u32 accumulator across frames until the set
+    /// exposure time elapses - then averaged + scaled to 16-bit (the identical formula as process_frame's
+    /// exposure-complete branch) and written into the ring, and the head advances one period. So every column
+    /// is one full exposure's worth of light at the same frame_count / effective-ISO the other modes report,
+    /// not a single free-running frame. The band is one full Bayer period tall so the assembled strip stays a
+    /// valid demosaicable raw, and the ring is isolated from the slots so it never disturbs a held stack.
+    fn process_slitscan_frame(&mut self, frame_data: &[u8], elapsed_ms: u64, force_completion: bool) {
         let w = self.width;
         let h = self.height;
-        // First frame after entering slitscan: zero the ring so the strip starts black instead of scrolling
-        // in stale slices from a previous slitscan session (the head is also reset to 0 by the UI on entry).
+        // Band height = one full Bayer period (4 rows for the quad 4x4 Tetracell, 2 for standard Bayer).
+        let period = if self.header[QUAD_BAYER_IDX] != 0 { 4 } else { 2 };
+        let strip_len = period * w;
+        // Centre band, aligned DOWN to the Bayer period so the colour phase is identical every frame.
+        let center = ((h / 2) / period) * period;
+        // Time axis = the ring's own height: slitscan_buffer is exactly width x (2*width), so this is 2*w.
+        let ring_rows = self.slitscan_buffer.len() / w.max(1);
+        if ring_rows == 0 || frame_data.len() < (center + period) * w * 2 {
+            return;
+        }
+        // Read the centre-band pixel at row r (0..period), column x out of frame_data.
+        let band_px = |frame_data: &[u8], r: usize, x: usize| -> u32 {
+            let off = (center + r) * w * 2 + x * 2;
+            u16::from_le_bytes([frame_data[off], frame_data[off + 1]]) as u32
+        };
+        // Entry: start the strip fresh - black ring, head at 0, and seed the accumulator with this frame as
+        // the live column's first frame (exactly as a completed column seeds the next, so the per-column
+        // frame_count divides the right number of frames). Restart the per-column exposure clock and consume
+        // this frame as the seed.
         if !self.was_slitscan {
             self.slitscan_buffer.fill(0);
             self.header[SLITSCAN_HEAD_IDX] = 0;
+            if self.slitscan_accum.len() != strip_len {
+                self.slitscan_accum = vec![0u32; strip_len];
+            }
+            for r in 0..period {
+                for x in 0..w {
+                    self.slitscan_accum[r * w + x] = band_px(frame_data, r, x);
+                }
+            }
+            self.exposure_start_time = Instant::now();
+            self.header[FRAME_COUNTER_IDX] = 0;
             self.was_slitscan = true;
-        }
-        // Slice height = one full Bayer period so the assembled strip stays a valid demosaicable raw image
-        // (4 rows for the quad 4x4 Tetracell, 2 for standard Bayer).
-        let period = if self.header[QUAD_BAYER_IDX] != 0 { 4 } else { 2 };
-        // Time axis = the ring's own height: slitscan_buffer is exactly width x (2*width), so this is 2*w.
-        let ring_rows = self.slitscan_buffer.len() / w.max(1);
-        if ring_rows == 0 || frame_data.len() < h * w * 2 {
             return;
         }
-        // Centre band, aligned DOWN to the Bayer period so the colour phase is identical every frame.
-        let center = ((h / 2) / period) * period;
-        let white = (self.white_level as u32).max(1);
-        let mut head = (self.header[SLITSCAN_HEAD_IDX] as usize) % ring_rows;
-        for r in 0..period {
-            let src_row = center + r;
-            if src_row >= h {
-                break;
+        if elapsed_ms >= self.exposure_time_ms || force_completion {
+            // Column complete: average (sum / frame_count) and scale to 16-bit EXACTLY like process_frame's
+            // Average branch, write it at the head, advance, then seed the next column with this frame.
+            let frame_count = self.header[FRAME_COUNTER_IDX].max(1);
+            let white = self.white_level as u64;
+            let head = (self.header[SLITSCAN_HEAD_IDX] as usize) % ring_rows;
+            for r in 0..period {
+                let dst_off = ((head + r) % ring_rows) * w;
+                for x in 0..w {
+                    let avg = ((self.slitscan_accum[r * w + x] as u64) << 16) / (white * frame_count);
+                    self.slitscan_buffer[dst_off + x] = avg.min(65535) as u16;
+                    self.slitscan_accum[r * w + x] = band_px(frame_data, r, x); // seed next column
+                }
             }
-            let dst_row = (head + r) % ring_rows;
-            let src_off = src_row * w * 2; // bytes into frame_data
-            let dst_off = dst_row * w; // u16 index into the ring
-            for x in 0..w {
-                let pixel = u16::from_le_bytes([
-                    frame_data[src_off + x * 2],
-                    frame_data[src_off + x * 2 + 1],
-                ]) as u32;
-                self.slitscan_buffer[dst_off + x] = ((pixel << 16) / white).min(65535) as u16;
+            self.header[SLITSCAN_HEAD_IDX] = ((head + period) % ring_rows) as u64;
+            self.exposure_start_time = Instant::now();
+            self.header[FRAME_COUNTER_IDX] = 0;
+            // Bump the image counter so the UI does a full redraw and picks up the new column.
+            self.header[IMAGE_COUNTER_IDX] += 1;
+            self.last_image_timestamp = SystemTime::now();
+        } else {
+            // Still integrating this column: add the centre band to the accumulator.
+            for r in 0..period {
+                for x in 0..w {
+                    self.slitscan_accum[r * w + x] += band_px(frame_data, r, x);
+                }
             }
         }
-        head = (head + period) % ring_rows;
-        self.header[SLITSCAN_HEAD_IDX] = head as u64;
-        // Bump the image counter so the UI does a full redraw and picks up the new slice.
-        self.header[IMAGE_COUNTER_IDX] += 1;
     }
 
     fn process_calibration_frame(&mut self, frame_data: &[u8], captured_iso: i32, captured_shutter_ns: i64) {
