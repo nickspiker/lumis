@@ -166,6 +166,9 @@ pub struct CameraIntegrator {
     // Count of completed full ring rotations (the head wrapping back to 0). Continuous-save in slitscan fires
     // once per rotation off this, instead of once per column like the per-column image counter.
     slitscan_rotations: u64,
+    // Whether slitscan continuous-save was active last poll, to detect its activation edge and arm the first
+    // save to the next full rotation (so enabling it mid-fill doesn't dump a half-filled strip).
+    prev_slit_continuous: bool,
     pub magic_9_display: &'static mut [f32; 9],
     pub magic_9_display_gamma: &'static mut f32,
     pub magic_9_dng_xyz: &'static mut [f32; 9],
@@ -324,6 +327,7 @@ impl CameraIntegrator {
             was_slitscan: false,
             slitscan_accum: Vec::new(),
             slitscan_rotations: 0,
+            prev_slit_continuous: false,
             magic_9_display,
             magic_9_display_gamma,
             magic_9_dng_xyz,
@@ -561,13 +565,23 @@ impl CameraIntegrator {
         let already_saving = (flags & CURRENTLY_SAVING) != 0;
 
         // Continuous-save cadence is "a new image". In slitscan IMAGE_COUNTER ticks every COLUMN (so the
-        // preview scrolls), which would fire a save thousands of times per ring; gate slitscan continuous-save
-        // on the full-rotation counter instead, so it saves one complete strip per ring rotation.
-        let trigger_counter = if self.header[CURRENT_MODE_IDX] as u8 == RawMode::Slitscan as u8 {
+        // preview scrolls), which would fire a save every column; gate slitscan continuous-save on the
+        // full-rotation counter instead, so it saves one complete strip per ring rotation.
+        let is_slitscan = self.header[CURRENT_MODE_IDX] as u8 == RawMode::Slitscan as u8;
+        let trigger_counter = if is_slitscan {
             self.slitscan_rotations
         } else {
             self.header[IMAGE_COUNTER_IDX]
         };
+        // When slitscan continuous-save first becomes active (toggled on, or entered with it already on), arm
+        // to the CURRENT rotation so the first save waits for the NEXT full ring rotation - enabling it partway
+        // through a fill never dumps a half-filled strip. Manual (single) save ignores this and saves straight
+        // away below.
+        let slit_continuous = is_slitscan && continuous_save;
+        if slit_continuous && !self.prev_slit_continuous {
+            self.last_saved_counter = trigger_counter;
+        }
+        self.prev_slit_continuous = slit_continuous;
 
         if !already_saving
             && ((continuous_save && (self.last_saved_counter != trigger_counter)) || manual_save)
