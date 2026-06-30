@@ -960,37 +960,37 @@ impl CameraIntegrator {
                     }
                     (dng_bytes, "dng")
                 } else {
-                    // RGB export: demosaic the average half + Rec.2020 display matrix + sqrt, then encode. Tagged Rec.2020 so it matches the on-screen preview. Quad-Bayer (max-res RAW10) uses the quad demosaic; standard Bayer uses RCD.
+                    // RGB export: demosaic the average half + Rec.2020 display matrix + sqrt, then encode. Tagged Rec.2020 so it matches the on-screen preview. Quad-Bayer (max-res RAW10) uses the quad demosaic; standard Bayer uses RCD. TIFF takes a dedicated 16-bit path (error-diffusion-dithered) so the lossless export keeps the f32 pipeline's precision; JPEG/JPEG XL stay 8-bit.
                     let avg = &raw_slot[0..(width * height).min(raw_slot.len())];
-                    let (ow, oh, rgb) = if raw10 {
-                        quad_to_rgb8(
-                            avg,
-                            width,
-                            height,
-                            image_black_level,
-                            bayer_pattern,
-                            &display_matrix,
-                            orient_deg,
-                            display_gain as f32,
-                        )
+                    let encoded = if save_format == SAVE_FORMAT_TIFF {
+                        let (ow, oh, rgb16) = if raw10 {
+                            quad_to_rgb16(
+                                avg, width, height, image_black_level, bayer_pattern,
+                                &display_matrix, orient_deg, display_gain as f32,
+                            )
+                        } else {
+                            rcd_to_rgb16(
+                                avg, width, height, image_black_level, bayer_pattern,
+                                &display_matrix, orient_deg, display_gain as f32,
+                            )
+                        };
+                        encode_tiff16(&rgb16, ow as u32, oh as u32, &exposure_desc, &exif).map(|b| (b, "tiff"))
                     } else {
-                        rcd_to_rgb8(
-                            avg,
-                            width,
-                            height,
-                            image_black_level,
-                            bayer_pattern,
-                            &display_matrix,
-                            orient_deg,
-                            display_gain as f32,
-                        )
-                    };
-                    let encoded = match save_format {
-                        SAVE_FORMAT_TIFF => {
-                            encode_tiff(&rgb, ow as u32, oh as u32, &exposure_desc, &exif).map(|b| (b, "tiff"))
+                        let (ow, oh, rgb) = if raw10 {
+                            quad_to_rgb8(
+                                avg, width, height, image_black_level, bayer_pattern,
+                                &display_matrix, orient_deg, display_gain as f32,
+                            )
+                        } else {
+                            rcd_to_rgb8(
+                                avg, width, height, image_black_level, bayer_pattern,
+                                &display_matrix, orient_deg, display_gain as f32,
+                            )
+                        };
+                        match save_format {
+                            SAVE_FORMAT_JPEGXL => encode_jpegxl(&rgb, ow, oh, &exif).map(|b| (b, "jxl")),
+                            _ => encode_jpeg(&rgb, ow as u32, oh as u32, &exposure_desc, &exif).map(|b| (b, "jpg")),
                         }
-                        SAVE_FORMAT_JPEGXL => encode_jpegxl(&rgb, ow, oh, &exif).map(|b| (b, "jxl")),
-                        _ => encode_jpeg(&rgb, ow as u32, oh as u32, &exposure_desc, &exif).map(|b| (b, "jpg")),
                     };
                     match encoded {
                         Some((b, e)) => (b, e),

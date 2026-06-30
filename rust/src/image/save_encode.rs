@@ -189,6 +189,122 @@ pub fn quad_to_rgb8(
     (out_w, out_h, rgb)
 }
 
+/// Quantize one sqrt-encoded f32 sample (already scaled to the 0..65535 16-bit range) to u16 with
+/// error-accumulation (error-diffusion) dithering: cast straight to int, cast back to float, and carry the
+/// residual (actual - floor) into `acc` for the next sample. This spreads the sub-LSB quantization error
+/// along the scanline instead of truncating it, so the 16-bit TIFF keeps the f32 pipeline's precision as
+/// dither rather than banding. NaN/negative (a below-black matrix result) clamps to 0 and resets the carry.
+fn dither16(target: f32, acc: &mut f32) -> u16 {
+    // target > 0.0 is false for NaN, so a negative-matrix sqrt=NaN lands here as 0 (black), same as the 8-bit
+    // path's `as u8` behaviour, without poisoning the accumulator.
+    let t = if target > 0.0 { target.min(65535.0) } else { 0.0 };
+    let v = t + *acc; // < 65536.0 since t <= 65535 and acc in [0,1)
+    let q = v as u16; // straight cast = truncate toward zero (floor, v >= 0)
+    *acc = (v - q as f32).clamp(0.0, 1.0); // residual carried to the next sample
+    q
+}
+
+/// RCD-demosaic the full frame, colour-correct, and sqrt-encode to 16-bit RGB with error-diffusion dither,
+/// honouring sensor orientation. The 16-bit sibling of [rcd_to_rgb8] (used for the lossless 16-bit TIFF
+/// export): same sqrt (gamma 2) transfer scaled to fill 16-bit, with per-channel, per-row dithering.
+pub fn rcd_to_rgb16(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    black_level: u16,
+    bayer_pattern: u32,
+    matrix: &[f32; 9],
+    orientation: u16,
+    gain: f32,
+) -> (usize, usize, Vec<u16>) {
+    use crate::debayer::region::rcd_region;
+
+    let scale = gain * 65536. / (65536. - black_level as f32);
+    let demosaiced = rcd_region(
+        raw, width, height, 0, 0, width, height, black_level, scale, bayer_pattern,
+    );
+
+    let (out_w, out_h) = match orientation {
+        90 | 270 => (height, width),
+        _ => (width, height),
+    };
+    let mut rgb = vec![0u16; out_w * out_h * 3];
+    for oy in 0..out_h {
+        // Per-row, per-channel dither accumulator: 1D error diffusion along the scanline, reset each row so
+        // the carried error never streaks vertically.
+        let mut acc = [0f32; 3];
+        for ox in 0..out_w {
+            let (sx, sy) = match orientation {
+                90 => (oy, out_w - 1 - ox),
+                180 => (width - 1 - ox, height - 1 - oy),
+                270 => (height - 1 - oy, ox),
+                _ => (ox, oy),
+            };
+            if sx >= width || sy >= height {
+                continue;
+            }
+            let px = demosaiced[sy * width + sx];
+            let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
+            let lr = matrix[0] * r + matrix[1] * g + matrix[2] * b;
+            let lg = matrix[3] * r + matrix[4] * g + matrix[5] * b;
+            let lb = matrix[6] * r + matrix[7] * g + matrix[8] * b;
+            let o = (oy * out_w + ox) * 3;
+            // sqrt (gamma 2) then *256 to fill 16-bit (sqrt is 0..256 for a 0..65536 linear value).
+            rgb[o] = dither16(lr.sqrt() * 256.0, &mut acc[0]);
+            rgb[o + 1] = dither16(lg.sqrt() * 256.0, &mut acc[1]);
+            rgb[o + 2] = dither16(lb.sqrt() * 256.0, &mut acc[2]);
+        }
+    }
+    (out_w, out_h, rgb)
+}
+
+/// Quad-Bayer (Tetracell, max-res 50MP) demosaic to colour-corrected sqrt-encoded 16-bit RGB with
+/// error-diffusion dither, honouring orientation. The 16-bit sibling of [quad_to_rgb8].
+pub fn quad_to_rgb16(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    black_level: u16,
+    bayer_pattern: u32,
+    matrix: &[f32; 9],
+    orientation: u16,
+    gain: f32,
+) -> (usize, usize, Vec<u16>) {
+    use crate::debayer::quad::quad_demosaic;
+
+    let demosaiced = quad_demosaic(raw, width, height, black_level, 65535, 65536.0 * gain, bayer_pattern);
+
+    let (out_w, out_h) = match orientation {
+        90 | 270 => (height, width),
+        _ => (width, height),
+    };
+    let mut rgb = vec![0u16; out_w * out_h * 3];
+    for oy in 0..out_h {
+        let mut acc = [0f32; 3];
+        for ox in 0..out_w {
+            let (sx, sy) = match orientation {
+                90 => (oy, out_w - 1 - ox),
+                180 => (width - 1 - ox, height - 1 - oy),
+                270 => (height - 1 - oy, ox),
+                _ => (ox, oy),
+            };
+            if sx >= width || sy >= height {
+                continue;
+            }
+            let px = demosaiced[sy * width + sx];
+            let (r, g, b) = (px[0], px[1], px[2]);
+            let lr = matrix[0] * r + matrix[1] * g + matrix[2] * b;
+            let lg = matrix[3] * r + matrix[4] * g + matrix[5] * b;
+            let lb = matrix[6] * r + matrix[7] * g + matrix[8] * b;
+            let o = (oy * out_w + ox) * 3;
+            rgb[o] = dither16(lr.sqrt() * 256.0, &mut acc[0]);
+            rgb[o + 1] = dither16(lg.sqrt() * 256.0, &mut acc[1]);
+            rgb[o + 2] = dither16(lb.sqrt() * 256.0, &mut acc[2]);
+        }
+    }
+    (out_w, out_h, rgb)
+}
+
 /// Encode RGB8 to JPEG bytes (quality 95), tagged with the Rec.2020 ICC profile (APP2 marker).
 pub fn encode_jpeg(
     rgb: &[u8],
@@ -335,6 +451,77 @@ pub fn encode_tiff(
     }
     // Try to embed a thumbnail; on any failure fall back to the plain (still valid) TIFF.
     match embed_tiff_thumbnail(tiff.clone(), rgb, width, height) {
+        Some(with_thumb) => Some(with_thumb),
+        None => Some(tiff),
+    }
+}
+
+/// Encode RGB16 (16-bit-per-channel) to a lossless Deflate TIFF, with the same Rec.2020 ICC + EXIF + GPS +
+/// thumbnail treatment as [encode_tiff]. The pixels come from [rcd_to_rgb16] / [quad_to_rgb16] (sqrt-encoded,
+/// error-diffusion-dithered), so this carries the full f32-pipeline precision the 8-bit path discards.
+pub fn encode_tiff16(
+    rgb16: &[u16],
+    width: u32,
+    height: u32,
+    description: &str,
+    exif: &crate::image::dng::ExifData,
+) -> Option<Vec<u8>> {
+    use crate::image::icc::rec2020_icc;
+    use tiff::encoder::{colortype::RGB16, compression::Deflate, Rational, TiffEncoder};
+    use tiff::tags::Tag;
+    let rat = |v: f64| -> Rational {
+        if v >= 1.0 {
+            Rational { n: (v * 1000.0).round() as u32, d: 1000 }
+        } else {
+            Rational { n: 1000, d: (1000.0 / v).round() as u32 }
+        }
+    };
+    let mut out = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut out).ok()?;
+        let mut image = enc
+            .new_image_with_compression::<RGB16, _>(width, height, Deflate::default())
+            .ok()?;
+        image.encoder().write_tag(Tag::Unknown(34675), rec2020_icc()).ok()?;
+        if !description.is_empty() {
+            image.encoder().write_tag(Tag::Unknown(270), description).ok()?;
+        }
+        let e = exif;
+        if e.exposure_time_s > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0x829A), rat(e.exposure_time_s)).ok()?;
+        }
+        if e.f_number > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0x829D), rat(e.f_number)).ok()?;
+        }
+        if e.iso > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0x8827), (e.iso.round() as u32).min(65535) as u16).ok()?;
+        }
+        if !e.datetime_original.is_empty() {
+            image.encoder().write_tag(Tag::Unknown(0x9003), e.datetime_original.as_str()).ok()?;
+        }
+        if e.subject_distance_m > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0x9206), rat(e.subject_distance_m)).ok()?;
+        }
+        if e.focal_length_mm > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0x920A), rat(e.focal_length_mm)).ok()?;
+        }
+        if e.focal_length_35mm > 0.0 {
+            image.encoder().write_tag(Tag::Unknown(0xA405), (e.focal_length_35mm.round() as u32).min(65535) as u16).ok()?;
+        }
+        if e.has_gps {
+            image.encoder().write_tag(Tag::Unknown(0x8825), 0u32).ok()?;
+        }
+        image.write_data(rgb16).ok()?;
+    }
+    let mut tiff = out.into_inner();
+    if exif.has_gps {
+        if let Some(with_gps) = embed_tiff_gps(tiff.clone(), exif) {
+            tiff = with_gps;
+        }
+    }
+    // The thumbnail builder is 8-bit; down-convert the high byte of each 16-bit sample for it.
+    let rgb8: Vec<u8> = rgb16.iter().map(|&v| (v >> 8) as u8).collect();
+    match embed_tiff_thumbnail(tiff.clone(), &rgb8, width, height) {
         Some(with_thumb) => Some(with_thumb),
         None => Some(tiff),
     }
