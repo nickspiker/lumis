@@ -86,25 +86,40 @@ pub fn draw_controls(
     }
 
     // Colour-calibration failure banner (e.g. "Target is overexposed - reduce exposure"): drawn whenever a
-    // reason is set. Centred, amber. The user triggers calibration from the cal button (controls visible),
-    // so this draws on the next frame after the scan rejects; cleared on the next attempt / a success.
+    // reason is set. Centred, amber, WORD-WRAPPED across 2-3 lines (a single long line ran off the edges).
+    // The user triggers calibration from the cal button (controls visible), so this draws on the next frame
+    // after the scan rejects; cleared on the next attempt / a success.
     if let Some(msg) = ui.calibration_error.load().as_ref().as_ref() {
         let short = ui.screen_run.min(ui.screen_rise) as f32;
-        let (mx, my) = user_to_screen(ui, 0.5, 0.5);
-        ui.text_renderer.draw_text_center(
-            pixels,
-            screen_buffer.stride as u32,
-            screen_buffer.height as u32,
-            msg,
-            mx,
-            my,
-            short * 0.03,
-            500,
-            0xFF,
-            0xC0,
-            0x00,
-            ui.device_rotation as u16,
-        );
+        let size = short * 0.03;
+        let lines = word_wrap(msg, 22); // ~22 chars/line -> 2-3 lines for the typical message
+        let (cx, cy) = user_to_screen(ui, 0.5, 0.5);
+        // Held-up vector (orientation-correct stacking), same approach as the cal-info block.
+        let (bx, by) = user_to_screen(ui, 0.5, 0.55);
+        let (ux, uy) = (cx - bx, cy - by);
+        let ulen = (ux * ux + uy * uy).sqrt().max(1e-6);
+        let up = (ux / ulen, uy / ulen);
+        let step = size * 1.4; // baseline-to-baseline
+        let mid = (lines.len() as f32 - 1.0) * 0.5;
+        for (i, line) in lines.iter().enumerate() {
+            let off = (mid - i as f32) * step;
+            let tx = cx + up.0 * off;
+            let ty = cy + up.1 * off;
+            ui.text_renderer.draw_text_center(
+                pixels,
+                screen_buffer.stride as u32,
+                screen_buffer.height as u32,
+                line,
+                tx,
+                ty,
+                size,
+                500,
+                0xFF,
+                0xC0,
+                0x00,
+                ui.device_rotation as u16,
+            );
+        }
     }
 
     // Only draw other controls if controls_visible is true
@@ -460,6 +475,27 @@ const PITCH_EASE_K: f32 = 16.0; // pitch: colour only (tighter green sliver than
 const SPACING_SPREAD: f32 = 6.0; // extra centre-to-outer spacing (in radii) added as the centre dot goes red; 0 = always tangent
 fn level_ease(t: f32, k: f32) -> f32 {
     t * (1.0 + k) / (1.0 + k * t)
+}
+
+// Greedy word-wrap to lines of at most `max` chars (breaking only at spaces; a word longer than `max` gets its own line uncut). Used for the calibration failure banner so a long reason breaks across 2-3 lines instead of running off the screen.
+fn word_wrap(text: &str, max: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.len() + 1 + word.len() <= max {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 fn draw_level_indicator(ui: &mut UserInterface, pixels: &mut [u8], stride: usize, height: u32) {
