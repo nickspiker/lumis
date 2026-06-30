@@ -474,11 +474,24 @@ pub fn handle_touch(
                     // Enter 1:1 mode keeping content under finger in place
                     ui.view_1to1 = true;
 
-                    let needs_rotated = ui.sensor_orientation == 90 || ui.sensor_orientation == 270;
-                    let (effective_width, effective_height) = if needs_rotated {
-                        (ui.sensor_y_size as f32, ui.sensor_x_size as f32)
+                    // Slitscan zooms the RING (W slit x ring_rows time), drawn screen-aligned with no sensor
+                    // rotation; every other mode zooms the sensor frame (rotated to how it's held). Either way
+                    // the rest of the math below (fit scale, centring, pan to keep content under the finger) is
+                    // identical - only the effective image dimensions differ.
+                    let is_slitscan = crate::shared_memory::RawMode::from(
+                        ui.header[crate::shared_memory::CURRENT_MODE_IDX] as u8,
+                    ) == crate::shared_memory::RawMode::Slitscan;
+                    let (effective_width, effective_height) = if is_slitscan {
+                        let ring_rows = ui.slitscan_buffer.len() / ui.sensor_x_size.max(1);
+                        (ui.sensor_x_size as f32, ring_rows as f32)
                     } else {
-                        (ui.sensor_x_size as f32, ui.sensor_y_size as f32)
+                        let needs_rotated =
+                            ui.sensor_orientation == 90 || ui.sensor_orientation == 270;
+                        if needs_rotated {
+                            (ui.sensor_y_size as f32, ui.sensor_x_size as f32)
+                        } else {
+                            (ui.sensor_x_size as f32, ui.sensor_y_size as f32)
+                        }
                     };
 
                     if crate::DEBUG {

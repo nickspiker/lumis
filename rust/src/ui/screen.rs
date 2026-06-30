@@ -22,7 +22,7 @@ fn apply_display_matrix(ui: &UserInterface, r: f32, g: f32, b: f32) -> (f32, f32
     )
 }
 
-/// Slitscan preview: render the time-strip ring buffer fit-to-screen, scrolled by the write head (oldest at the top, newest at the bottom). The ring is `image_buffer[0 .. w*ring_rows]`, a W x ring_rows Bayer image in the same (value<<16)/white domain as the Average slots, so the same black-subtract / scale / matrix / sqrt encode applies. Each Bayer (or quad) tile is binned to one RGB sample for a cheap, full-colour strip.
+/// Slitscan preview: render the time-strip ring buffer, scrolled by the write head (oldest at the top, newest at the bottom). The ring is `slitscan_buffer`, a W x ring_rows Bayer image in the same (value<<16)/white domain as the Average slots, so the same black-subtract / scale / sqrt encode applies. Two views, sharing the same pan/zoom state as the live camera: fit-to-screen (the default - each Bayer/quad tile binned to one RGB sample, a clean full-colour overview), and 1:1 pixel-peek (view_1to1 - actual ring pixels as raw-direct greyscale, panned by pan_offset, with the time axis WRAPPING the circular ring so you can roll around past the newest column back to the oldest).
 fn draw_slitscan(ui: &UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_Buffer) {
     let sw = ui.screen_run;
     let sh = ui.screen_rise;
@@ -33,11 +33,45 @@ fn draw_slitscan(ui: &UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_B
     let ring_rows = ui.slitscan_buffer.len() / w.max(1);
     // Bin to whole Bayer (2) or quad (4) tiles so a binned cell is full colour, not grey.
     let tile = if ui.header[crate::shared_memory::QUAD_BAYER_IDX] != 0 { 4 } else { 2 };
-    let tiles_x = w / tile;
-    let tiles_t = ring_rows / tile;
-    if tiles_x == 0 || tiles_t == 0 {
+    if w < tile || ring_rows < tile {
         return;
     }
+    let buf = ui.slitscan_buffer;
+    // The head is the next ring row to be written; oldest data sits at `head`, newest just before it. A
+    // chronological index (0 = oldest, top of the strip) maps to physical row (head + chrono) % ring_rows.
+    let head = (ui.header[crate::shared_memory::SLITSCAN_HEAD_IDX] as usize) % ring_rows;
+
+    if ui.view_1to1 {
+        // 1:1 pixel-peek: each screen pixel = one ring pixel (slit horizontally, time vertically), shifted by
+        // the pan offset - exactly the sensor 1:1 mapping but against ring coordinates (no rotation; the strip
+        // is screen-aligned). Raw-direct greyscale (no debayer, no matrix - it would tint a grey value) so you
+        // can inspect actual strip pixels: hot pixels, noise, motion edges. The time axis WRAPS the circular
+        // ring (rem_euclid), so panning past the newest column rolls around to the oldest; the slit axis is
+        // finite, so outside [0, w) is black.
+        for sy in 0..sh {
+            for sx in 0..sw {
+                let dst = (sy * stride + sx) * 3;
+                let rx = sx as f32 + ui.pan_offset_x;
+                let rt = sy as f32 + ui.pan_offset_y; // chronological row (0 = oldest)
+                if rx < 0. || rx >= w as f32 {
+                    pixels[dst] = 0;
+                    pixels[dst + 1] = 0;
+                    pixels[dst + 2] = 0;
+                    continue;
+                }
+                let col = rx as usize;
+                let chrono = (rt as isize).rem_euclid(ring_rows as isize) as usize;
+                let row = (head + chrono) % ring_rows;
+                let v = (buf[row * w + col] as f32 - bk).max(0.) * scale;
+                let l = v.sqrt() as u8;
+                pixels[dst] = l;
+                pixels[dst + 1] = l;
+                pixels[dst + 2] = l;
+            }
+        }
+        return;
+    }
+
     // base[(row%2)*2 + col%2] = colour (0=R,1=G,2=B) of each pixel of the 2x2 Bayer cell; for quad it is the colour of each 2x2 CLUSTER of the 4x4 tile.
     let base = match ui.bayer_pattern {
         0 => [0usize, 1, 1, 2],
@@ -46,41 +80,34 @@ fn draw_slitscan(ui: &UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_B
         3 => [2, 1, 1, 0],
         _ => [0, 1, 1, 2],
     };
-    // The head is the next ring row to be written; it is a tile boundary because it advances by `tile` each frame. Oldest data sits at `head`, newest just before it, so display top->bottom maps to oldest->newest.
-    let head_tile = (ui.header[crate::shared_memory::SLITSCAN_HEAD_IDX] as usize / tile) % tiles_t;
-    // Fit the (tiles_x wide x tiles_t tall) strip into the screen, letterboxed, preserving aspect.
-    let strip_aspect = tiles_x as f32 / tiles_t as f32;
-    let screen_aspect = sw as f32 / sh as f32;
-    let (fit_w, fit_h) = if strip_aspect > screen_aspect {
-        (sw, ((sw as f32) / strip_aspect) as usize)
-    } else {
-        (((sh as f32) * strip_aspect) as usize, sh)
-    };
-    let off_x = (sw - fit_w) / 2;
-    let off_y = (sh - fit_h) / 2;
-    let buf = ui.slitscan_buffer;
+    // Fit the W x ring_rows strip into the screen, letterboxed (preserve aspect). This `fit` scale is the
+    // SAME one the touch handler uses to enter 1:1 keeping content under the finger (touch.rs).
+    let fit = (sw as f32 / w as f32).min(sh as f32 / ring_rows as f32);
+    let scaled_w = (w as f32 * fit) as usize;
+    let scaled_h = (ring_rows as f32 * fit) as usize;
+    let off_x = (sw - scaled_w) / 2;
+    let off_y = (sh - scaled_h) / 2;
     for sy in 0..sh {
         for sx in 0..sw {
             let dst = (sy * stride + sx) * 3;
-            if sx < off_x || sx >= off_x + fit_w || sy < off_y || sy >= off_y + fit_h {
+            if sx < off_x || sx >= off_x + scaled_w || sy < off_y || sy >= off_y + scaled_h {
                 pixels[dst] = 0;
                 pixels[dst + 1] = 0;
                 pixels[dst + 2] = 0;
                 continue;
             }
-            let tx = (sx - off_x) * tiles_x / fit_w;
-            let td = (sy - off_y) * tiles_t / fit_h; // 0 = oldest (top)
-            let src_t = (head_tile + td) % tiles_t;
-            let row0 = src_t * tile;
-            let col0 = tx * tile;
+            // screen -> ring pixel, aligned DOWN to the tile so a binned cell stays a whole Bayer/quad period.
+            let col0 = (((sx - off_x) as f32 / fit) as usize / tile) * tile;
+            let t0 = (((sy - off_y) as f32 / fit) as usize / tile) * tile; // chronological (0 = oldest)
             // Bin the tile to one RGB sample.
             let mut r = 0f32;
             let mut g = 0f32;
             let mut b = 0f32;
             let mut gn = 0f32;
             for dy in 0..tile {
+                let row = (head + t0 + dy) % ring_rows;
                 for dx in 0..tile {
-                    let v = (buf[(row0 + dy) * w + col0 + dx] as f32 - bk).max(0.);
+                    let v = (buf[row * w + col0 + dx] as f32 - bk).max(0.);
                     let c = if tile == 4 {
                         base[(dy / 2) * 2 + dx / 2]
                     } else {
