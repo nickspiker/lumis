@@ -9,7 +9,7 @@ android {
         applicationId "com.lumis.camera"
         minSdk 21
         targetSdk 34
-        versionCode 17
+        versionCode 18
         versionName "1.1"
 
         // Tell Gradle which ABIs to include (ARM64 only)
