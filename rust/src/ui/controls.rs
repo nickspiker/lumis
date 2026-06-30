@@ -85,10 +85,7 @@ pub fn draw_controls(
         );
     }
 
-    // Colour-calibration failure banner (e.g. "Target is overexposed - reduce exposure"): drawn whenever a
-    // reason is set. Centred, amber, WORD-WRAPPED across 2-3 lines (a single long line ran off the edges).
-    // The user triggers calibration from the cal button (controls visible), so this draws on the next frame
-    // after the scan rejects; cleared on the next attempt / a success.
+    // Colour-calibration failure banner (e.g. "Target is overexposed - reduce exposure"): drawn whenever a reason is set. Centred, amber, word-wrapped across 2-3 lines (a single long line ran off the edges). The user triggers calibration from the cal button (controls visible), so this draws on the next frame after the scan rejects; cleared on the next attempt / a success.
     if let Some(msg) = ui.calibration_error.load().as_ref().as_ref() {
         let short = ui.screen_run.min(ui.screen_rise) as f32;
         let size = short * 0.03;

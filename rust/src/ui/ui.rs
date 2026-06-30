@@ -997,13 +997,28 @@ impl UserInterface {
         }
         let current_touch_valid = !touch_x.is_nan();
 
-        // A fresh touch while the full-screen calibration scan is held dismisses it (and
-        // unfreezes the feed). Per design the same touch still passes through to normal
-        // handling below, so e.g. tapping a control both dismisses and acts.
-        if current_touch_valid && !self.last_touch_valid && self.calibration_hold.load().is_some() {
+        // Auto-unfreeze on calibration FAILURE: the feed is frozen the moment a calibration starts; on SUCCESS the scan thread sets a live overlay (calibration_hold) that a tap dismisses, but on FAILURE (scan_target returned None - e.g. overexposed) no hold is set, so without this the feed stayed frozen forever (looked like a hang). When the scan thread has finished (!calibrating) with no hold, release the freeze so the live feed resumes; the error banner stays up until the next attempt.
+        if self.frozen_image_counter.is_some()
+            && self.calibration_hold.load().is_none()
+            && !self.calibrating.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.frozen_image_counter = None;
+            self.frozen_image = Vec::new();
+            draw = true;
+        }
+
+        // A fresh touch dismisses the calibration result: the held live overlay on SUCCESS (clearing the
+        // hold + unfreezing) AND the error banner on FAILURE. Per design the same touch still passes through
+        // to normal handling below, so e.g. tapping a control both dismisses and acts.
+        let fresh_touch = current_touch_valid && !self.last_touch_valid;
+        if fresh_touch && self.calibration_hold.load().is_some() {
             self.calibration_hold.store(std::sync::Arc::new(None));
             self.frozen_image_counter = None;
             self.frozen_image = Vec::new();
+            draw = true;
+        }
+        if fresh_touch && self.calibration_error.load().is_some() {
+            self.calibration_error.store(std::sync::Arc::new(None));
             draw = true;
         }
 
