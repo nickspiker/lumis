@@ -365,100 +365,10 @@ fn jpeg_with_comment(jpeg: &[u8], text: &str) -> Vec<u8> {
     out
 }
 
-/// Encode RGB8 to lossless Deflate-compressed TIFF bytes, with a small JPEG thumbnail embedded in a chained IFD1.
-///
-/// The `image` crate's TIFF encoder is uncompressed-only, so we use the `tiff` crate directly to get lossless Deflate (≈1.5-2x smaller than raw RGB, still universally readable).
-///
-/// Big 50MP TIFFs fail to thumbnail in Android file managers/galleries (ExifInterface logs "No image meets the size requirements of a thumbnail image"). The `tiff` crate writes IFD0 with a next-IFD pointer of 0 and does not expose that pointer, so we post-process its output: append a thumbnail JPEG and a chained IFD1 (classic TIFF thumbnail convention - exiftool/galleries read IFD1 of a TIFF as the thumbnail), then patch IFD0's next-IFD u32 to point at IFD1. If thumbnail generation fails we still return the valid TIFF without a thumbnail rather than failing the whole save.
-pub fn encode_tiff(
-    rgb: &[u8],
-    width: u32,
-    height: u32,
-    description: &str,
-    exif: &crate::image::dng::ExifData,
-) -> Option<Vec<u8>> {
-    use crate::image::icc::rec2020_icc;
-    use tiff::encoder::{colortype::RGB8, compression::Deflate, Rational, TiffEncoder};
-    use tiff::tags::Tag;
-    // EXIF as a RATIONAL (num/den, 1000 denom preserving sub-1.0 values).
-    let rat = |v: f64| -> Rational {
-        if v >= 1.0 {
-            Rational { n: (v * 1000.0).round() as u32, d: 1000 }
-        } else {
-            Rational { n: 1000, d: (1000.0 / v).round() as u32 }
-        }
-    };
-    let mut out = Cursor::new(Vec::new());
-    {
-        let mut enc = TiffEncoder::new(&mut out).ok()?;
-        // Use the lower-level image encoder so we can write the ICCProfile tag (0x8773 = 34675) alongside the pixel data, keeping lossless Deflate.
-        let mut image = enc
-            .new_image_with_compression::<RGB8, _>(width, height, Deflate::default())
-            .ok()?;
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(34675), rec2020_icc())
-            .ok()?;
-        // ImageDescription (tag 270): the exposure summary (per-frame + composite/effective), matching
-        // the DNG. Skip when empty so we don't write a stray empty tag.
-        if !description.is_empty() {
-            image
-                .encoder()
-                .write_tag(Tag::Unknown(270), description)
-                .ok()?;
-        }
-        // EXIF tags written directly into IFD0 (viewers read ExposureTime/FNumber/etc. there too). The
-        // tiff crate's sub-IFD support is awkward, and IFD0 placement is universally understood. Tags in
-        // ascending id order. RATIONAL via the crate's Rational; ISO/35mm-equiv as SHORT.
-        let e = exif;
-        if e.exposure_time_s > 0.0 {
-            image.encoder().write_tag(Tag::Unknown(0x829A), rat(e.exposure_time_s)).ok()?;
-        }
-        if e.f_number > 0.0 {
-            image.encoder().write_tag(Tag::Unknown(0x829D), rat(e.f_number)).ok()?;
-        }
-        if e.iso > 0.0 {
-            image.encoder().write_tag(Tag::Unknown(0x8827), (e.iso.round() as u32).min(65535) as u16).ok()?;
-        }
-        if !e.datetime_original.is_empty() {
-            image.encoder().write_tag(Tag::Unknown(0x9003), e.datetime_original.as_str()).ok()?;
-        }
-        if e.subject_distance_m > 0.0 {
-            image.encoder().write_tag(Tag::Unknown(0x9206), rat(e.subject_distance_m)).ok()?;
-        }
-        if e.focal_length_mm > 0.0 {
-            image.encoder().write_tag(Tag::Unknown(0x920A), rat(e.focal_length_mm)).ok()?;
-        }
-        if e.focal_length_35mm > 0.0 {
-            image.encoder().write_tag(Tag::Unknown(0xA405), (e.focal_length_35mm.round() as u32).min(65535) as u16).ok()?;
-        }
-        // GPS IFD pointer (0x8825) as a placeholder 0 - the GPS sub-IFD is appended + the offset patched in
-        // post-process (the tiff crate can't write a sub-IFD itself). Only when there's a fix.
-        if e.has_gps {
-            image.encoder().write_tag(Tag::Unknown(0x8825), 0u32).ok()?;
-        }
-        image.write_data(rgb).ok()?;
-    }
-    let mut tiff = out.into_inner();
-    // Embed the GPS sub-IFD (the crate wrote a placeholder 0x8825 pointer = 0; we append the IFD and patch
-    // it). Do this BEFORE the thumbnail (which chains IFD1 via the next-IFD pointer); GPS only appends data
-    // + patches a value field, so order is independent, but keep GPS first for clarity. On any failure,
-    // continue with the un-GPS'd TIFF.
-    if exif.has_gps {
-        if let Some(with_gps) = embed_tiff_gps(tiff.clone(), exif) {
-            tiff = with_gps;
-        }
-    }
-    // Try to embed a thumbnail; on any failure fall back to the plain (still valid) TIFF.
-    match embed_tiff_thumbnail(tiff.clone(), rgb, width, height) {
-        Some(with_thumb) => Some(with_thumb),
-        None => Some(tiff),
-    }
-}
-
-/// Encode RGB16 (16-bit-per-channel) to a lossless Deflate TIFF, with the same Rec.2020 ICC + EXIF + GPS +
-/// thumbnail treatment as [encode_tiff]. The pixels come from [rcd_to_rgb16] / [quad_to_rgb16] (sqrt-encoded,
-/// error-diffusion-dithered), so this carries the full f32-pipeline precision the 8-bit path discards.
+/// Encode RGB16 (16-bit-per-channel) to a lossless Deflate TIFF, with Rec.2020 ICC + EXIF + GPS + a chained
+/// IFD1 thumbnail. The pixels come from [rcd_to_rgb16] / [quad_to_rgb16] (sqrt-encoded, error-diffusion-
+/// dithered), so this carries the full f32-pipeline precision an 8-bit export would discard. TIFF is the only
+/// 16-bit RGB export; JPEG / JPEG XL stay 8-bit.
 pub fn encode_tiff16(
     rgb16: &[u16],
     width: u32,

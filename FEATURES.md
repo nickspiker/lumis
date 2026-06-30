@@ -74,10 +74,6 @@ Lumis is a manual RAW camera for Android with a Rust core and a spectral colour-
 - **Live AR overlay of the corrected target.** Composites a perfectly-exposed, colour-correct rendition of the target back onto the physical target in frame, re-fished and oriented to match, with readout text rastered in.
 - **Per-channel vignette correction (white & black).** Fits quadratic R/G/B black and white surfaces from anchor patches and removes lens brightness/black-level falloff before measuring colour.
 - **Patch-quality / deviation flagging.** Flags dirty, noisy, or off-colour patches against brightness/chroma limits and intra-patch variance, warning when the target needs cleaning.
-- **Re-solve from a saved scan under different settings.** Every scan's raw patch colours are saved and can be re-processed for a different illuminant/observer without re-shooting.
-- **Illuminant selection by name, index, or Kelvin.** Choose the reference illuminant from a built-in catalogue by index or case-insensitive name prefix, or enter a raw Kelvin temperature directly — backed by a D65/D50 observer/whitepoint catalogue (e.g. "D65 – ISO/CIE 11664-2:2022").
-- **Custom measured illuminant via Sekonic SPD import.** Loads a Sekonic C-7000 CSV (preferring the 1nm spectral block) as the reference illuminant SPD.
-- **DaVinci Resolve DCTL export.** Writes a self-contained "VERICHROME DSR.dctl" you drag onto a Resolve clip to apply the solved scene-referred transform.
 
 ## Calibration (dark-frame)
 

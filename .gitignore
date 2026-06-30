@@ -26,6 +26,12 @@ local.properties
 # Captured bias/dark calibration frames - large (~100MB each), device-specific; not synced
 /dark frames/
 
+# Calibration sample/target captures and calibration files - device-specific, not for the public repo.
+/calibration samples/
+*.dng
+*.vsf
+*.pp3
+
 # quad demosaic harness build output (source committed, build dir not)
 /rust/quad_harness/target/
 /rust/cal_harness/target/
