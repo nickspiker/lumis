@@ -441,6 +441,21 @@ impl CameraIntegrator {
             );
         }
 
+        // SLITSCAN: a photo-finish time-strip. Instead of accumulating whole frames, take a thin horizontal
+        // slice (one full Bayer period of rows, so the strip stays a valid demosaicable raw) from the centre
+        // of EACH frame and write it into a ring carved from the shared image_buffer; time fills the vertical
+        // axis. The ring is width x (2*width) -> a 2:1 strip; the write-head advances per frame and wraps,
+        // overwriting the oldest slice with NO data shuffling (same idea as the rolling slots). Handled
+        // entirely here; the normal accumulate path below is untouched.
+        if self.header[CURRENT_MODE_IDX] as u8 == RawMode::Slitscan as u8 {
+            self.process_slitscan_frame(frame_data);
+            return (
+                f64::from_bits(self.header[ISO_IDX]) as i32,
+                f64::from_bits(self.header[SHUTTER_NS_IDX]) as i64,
+                f64::from_bits(self.header[FOCUS_IDX]) as f32,
+            );
+        }
+
         if elapsed_ms >= self.exposure_time_ms || force_completion {
             // Exposure complete - write to SharedMemory
             let pixel_count = self.width * self.height;
@@ -546,6 +561,17 @@ impl CameraIntegrator {
             let device_held = self.header[DEVICE_ROTATION_IDX] as u16;
             let device_orientation = (sensor_mount + device_held) % 360;
             let pixel_count = self.width * self.height;
+            // Slitscan saves the whole ring (width x ring_rows, a 2:1 time-strip), not a single slot. Its
+            // dimensions differ from the per-frame width/height, so resolve the save dimensions once here
+            // and use them for the EXIF, the raw buffer and the encoders below. Non-slitscan modes save the
+            // native frame.
+            let is_slitscan = current_mode == 3;
+            let (save_width, save_height) = if is_slitscan {
+                let rr = (2 * self.width).min(self.image_buffer.len() / self.width.max(1));
+                (self.width, rr)
+            } else {
+                (self.width, self.height)
+            };
             // JXL fallback: if the format is JXL but this device's MediaStore can't accept it (flag = 2),
             // save as JPEG instead. Belt-and-suspenders for the zero-init default (JXL=0); the UI cycle
             // also skips JXL when unsupported, but the very first save could still land on the default.
@@ -580,6 +606,7 @@ impl CameraIntegrator {
                 0 => "average",
                 1 => "difference",
                 2 => "motion",
+                3 => "slitscan",
                 _ => "unknown",
             };
             let exposure_desc = format!(
@@ -615,8 +642,8 @@ impl CameraIntegrator {
                 gps_lat: f64::from_bits(self.header[GPS_LAT_IDX]),
                 gps_lon: f64::from_bits(self.header[GPS_LON_IDX]),
                 gps_alt: f64::from_bits(self.header[GPS_ALT_IDX]),
-                image_width: self.width as u32,
-                image_height: self.height as u32,
+                image_width: save_width as u32,
+                image_height: save_height as u32,
             };
             // XYZ matrix for RGB exports, and the magic9inv bytes for the DNG ColorMatrix1. magic_9_dng_xyz lives in zero-initialized shared memory and is only populated by a calibration scan. Pre-calibration it is all zeros, which would multiply every exported pixel to black; fall back to identity so uncalibrated RGB exports show the raw debayered scene (accuracy doesn't matter until calibrated anyway).
             let xyz_matrix = {
@@ -660,8 +687,10 @@ impl CameraIntegrator {
 
             // Calculate black level based on mode
             let image_black_level = match current_mode {
-                0 => (sensor_black_level as u32 * 65536 / sensor_white_level as u32) as u16, // Average
-                _ => 0, // Diff/Motion
+                // Average and Slitscan store raw counts rescaled to 16-bit (value<<16)/white with no black
+                // subtraction, so the DNG carries the rescaled black; Diff/Motion are zero-centred magnitudes.
+                0 | 3 => (sensor_black_level as u32 * 65536 / sensor_white_level as u32) as u16,
+                _ => 0,
             };
 
             // Convert Android bayer pattern to CFA pattern
@@ -705,6 +734,7 @@ impl CameraIntegrator {
                     let avg_offset = (current_slot * 2) * pixel_count;
                     (avg_offset, pixel_count * 2)
                 }
+                3 => (0, 0), // Slitscan: raw_slot is assembled from the ring below, not a contiguous slot.
                 _ => {
                     panic!("Unknown image mode");
                 }
@@ -715,6 +745,7 @@ impl CameraIntegrator {
                 0 => "average",
                 1 => "difference",
                 2 => "motion",
+                3 => "slitscan",
                 _ => panic!("Unknown integration mode: {}", current_mode),
             };
 
@@ -736,11 +767,26 @@ impl CameraIntegrator {
             );
 
             // Copy the slot's raw u16 data for the save thread (the camera thread keeps overwriting the live slots). DNG needs the full data_length (avg, or avg+diff for motion); RGB exports debayer the average half. `mut` so the calibration correction can rewrite the avg region in place before any format branch.
-            let mut raw_slot: Vec<u16> =
-                self.image_buffer[data_offset..data_offset + data_length].to_vec();
+            // Slitscan instead assembles the ring in chronological order (oldest row first): source row
+            // (head + d) % ring_rows for output row d. The head advances by a whole Bayer period each frame
+            // and ring_rows is a multiple of that period, so reordering whole rows preserves the CFA phase
+            // (output row d gets a row whose phase is d % period) - the assembled strip is a valid raw image.
+            let mut raw_slot: Vec<u16> = if is_slitscan {
+                let rr = save_height;
+                let w = save_width;
+                let head = (self.header[SLITSCAN_HEAD_IDX] as usize) % rr.max(1);
+                let mut v = vec![0u16; w * rr];
+                for d in 0..rr {
+                    let src = (head + d) % rr;
+                    v[d * w..d * w + w].copy_from_slice(&self.image_buffer[src * w..src * w + w]);
+                }
+                v
+            } else {
+                self.image_buffer[data_offset..data_offset + data_length].to_vec()
+            };
 
-            let width = self.width;
-            let height = self.height;
+            let width = save_width;
+            let height = save_height;
             let display_orientation = device_orientation; // 0/1/2/3 -> 0/90/180/270 below
 
             // Calibration apply inputs for the save thread: dup the cal fds (the thread owns its copies, freed when read), the light's effective ISO + integration time (so the dark-current/offset terms scale right), and the cal->light value scale (65535/sensor_white). cal_bias_fd<0 = no cal loaded -> skip, save uncorrected.
@@ -767,7 +813,7 @@ impl CameraIntegrator {
                 };
 
                 // CALIBRATION: if a cal is loaded, decode the bias+dark VSFs (streamed from the dup'd fds, freed at end of scope - NOT held resident, which OOM-killed the process) and correct the avg region of raw_slot IN PLACE, before any format branch. So DNG (raw) and JPEG/TIFF/JXL (demosaiced from this same raw) are all calibrated from one corrected buffer. Motion mode (current_mode==2) uses the diff half and isn't a straight light frame, so skip it.
-                if cal_bias_fd >= 0 && cal_dark_fd >= 0 && current_mode != 2 {
+                if cal_bias_fd >= 0 && cal_dark_fd >= 0 && current_mode != 2 && current_mode != 3 {
                     use crate::image::calibration::{CalFile, LoadedCalibration};
                     let pc = width * height;
                     let bias = read_fd_bytes(cal_bias_fd);
@@ -827,7 +873,7 @@ impl CameraIntegrator {
                         cfa: bayer_pattern_vec.clone(),
                         cfaw: if raw10 { 4 } else { 2 },
                         cfah: if raw10 { 4 } else { 2 },
-                        black: if current_mode == 0 {
+                        black: if current_mode == 0 || current_mode == 3 {
                             image_black_level as f32
                         } else {
                             0.
@@ -961,6 +1007,49 @@ impl CameraIntegrator {
             self.header[EXPOSURE_START_SECS_IDX] = t.as_secs();
             self.header[EXPOSURE_START_NANOS_IDX] = t.subsec_nanos() as u64;
         }
+    }
+
+    /// One frame of a slitscan capture: copy a Bayer-period-tall slice from the frame CENTRE into the ring
+    /// (carved from the shared image_buffer) and advance the write-head. The ring is width x (2*width) - a
+    /// 2:1 strip - with the head wrapping to overwrite the oldest slice, no data shuffling. The slice scales
+    /// raw -> 16-bit exactly like the normal average path, so the existing demosaic/preview/save read it at
+    /// the same scale.
+    fn process_slitscan_frame(&mut self, frame_data: &[u8]) {
+        let w = self.width;
+        let h = self.height;
+        // Slice height = one full Bayer period so the assembled strip stays a valid demosaicable raw image
+        // (4 rows for the quad 4x4 Tetracell, 2 for standard Bayer).
+        let period = if self.header[QUAD_BAYER_IDX] != 0 { 4 } else { 2 };
+        // Time axis = 2x the slit length (width) for a 2:1 strip, bounded by the shared buffer it lives in
+        // (the ring can't exceed image_buffer; for any real sensor w <= 4h so this is exactly 2*w).
+        let ring_rows = (2 * w).min(self.image_buffer.len() / w.max(1));
+        if ring_rows == 0 || frame_data.len() < h * w * 2 {
+            return;
+        }
+        // Centre band, aligned DOWN to the Bayer period so the colour phase is identical every frame.
+        let center = ((h / 2) / period) * period;
+        let white = (self.white_level as u32).max(1);
+        let mut head = (self.header[SLITSCAN_HEAD_IDX] as usize) % ring_rows;
+        for r in 0..period {
+            let src_row = center + r;
+            if src_row >= h {
+                break;
+            }
+            let dst_row = (head + r) % ring_rows;
+            let src_off = src_row * w * 2; // bytes into frame_data
+            let dst_off = dst_row * w; // u16 index into the ring (image_buffer)
+            for x in 0..w {
+                let pixel = u16::from_le_bytes([
+                    frame_data[src_off + x * 2],
+                    frame_data[src_off + x * 2 + 1],
+                ]) as u32;
+                self.image_buffer[dst_off + x] = ((pixel << 16) / white).min(65535) as u16;
+            }
+        }
+        head = (head + period) % ring_rows;
+        self.header[SLITSCAN_HEAD_IDX] = head as u64;
+        // Bump the image counter so the UI does a full redraw and picks up the new slice.
+        self.header[IMAGE_COUNTER_IDX] += 1;
     }
 
     fn process_calibration_frame(&mut self, frame_data: &[u8], captured_iso: i32, captured_shutter_ns: i64) {

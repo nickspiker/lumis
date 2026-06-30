@@ -597,6 +597,7 @@ impl UserInterface {
                     RawMode::Average => "AVERAGE",
                     RawMode::Difference => "DIFFERENCE",
                     RawMode::Motion => "MOTION",
+                    RawMode::Slitscan => "SLITSCAN",
                 };
                 mode_name.to_string()
             }
@@ -640,9 +641,12 @@ impl UserInterface {
                 let next_mode = match current_mode {
                     RawMode::Average => RawMode::Difference,
                     RawMode::Difference => RawMode::Motion,
-                    RawMode::Motion => RawMode::Average,
+                    RawMode::Motion => RawMode::Slitscan,
+                    RawMode::Slitscan => RawMode::Average,
                 };
                 self.header[CURRENT_MODE_IDX] = next_mode as u64;
+                // Reset the slitscan write-head when entering/leaving the mode so the strip starts fresh.
+                self.header[crate::shared_memory::SLITSCAN_HEAD_IDX] = 0;
             }
             3 => {
                 // Exit - clear continuous save and signal camera thread then kill the UserInterface process

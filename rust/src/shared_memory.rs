@@ -68,6 +68,12 @@ pub const DISPLAY_GAIN_IDX: usize = 61;
 // baked RGB exports), so saved files are oriented the way the phone was held. Sensor pixels stay native.
 pub const DEVICE_ROTATION_IDX: usize = 62;
 
+// Slitscan write-head: the ring row index (0..2*width) where the NEXT per-frame Bayer-period slice will be
+// written. The camera process advances it each frame; the UI reads it to know "now" so it can scroll the
+// strip and the save can assemble slices in chronological order (oldest = head, wrapping). Only meaningful
+// in RawMode::Slitscan. Last free header slot before IMAGE_START.
+pub const SLITSCAN_HEAD_IDX: usize = 63;
+
 pub const IMAGE_START: usize = 64;
 
 // Save format values (SAVE_FORMAT_IDX). Numbered to match the tap-cycle order JXL -> JPEG -> DNG -> TIFF, and JXL is 0 so it's the zero-initialized default.
@@ -103,6 +109,7 @@ pub enum RawMode {
     Average = 0,
     Difference = 1,
     Motion = 2,
+    Slitscan = 3,
 }
 
 impl From<u8> for RawMode {
@@ -111,6 +118,7 @@ impl From<u8> for RawMode {
             0 => RawMode::Average,
             1 => RawMode::Difference,
             2 => RawMode::Motion,
+            3 => RawMode::Slitscan,
             _ => RawMode::Average, // Default fallback
         }
     }

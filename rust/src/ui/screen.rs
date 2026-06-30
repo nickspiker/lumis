@@ -22,6 +22,91 @@ fn apply_display_matrix(ui: &UserInterface, r: f32, g: f32, b: f32) -> (f32, f32
     )
 }
 
+/// Slitscan preview: render the time-strip ring buffer fit-to-screen, scrolled by the write head (oldest at the top, newest at the bottom). The ring is `image_buffer[0 .. w*ring_rows]`, a W x ring_rows Bayer image in the same (value<<16)/white domain as the Average slots, so the same black-subtract / scale / matrix / sqrt encode applies. Each Bayer (or quad) tile is binned to one RGB sample for a cheap, full-colour strip.
+fn draw_slitscan(ui: &UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_Buffer) {
+    let sw = ui.screen_run;
+    let sh = ui.screen_rise;
+    let stride = buffer.stride as usize;
+    let w = ui.sensor_x_size;
+    let bk = ui.raw_black_level as f32;
+    let scale = ui.display_gain as f32 * (65536. / (65536. - bk));
+    let ring_rows = (2 * w).min(ui.image_buffer.len() / w.max(1));
+    // Bin to whole Bayer (2) or quad (4) tiles so a binned cell is full colour, not grey.
+    let tile = if ui.header[crate::shared_memory::QUAD_BAYER_IDX] != 0 { 4 } else { 2 };
+    let tiles_x = w / tile;
+    let tiles_t = ring_rows / tile;
+    if tiles_x == 0 || tiles_t == 0 {
+        return;
+    }
+    // base[(row%2)*2 + col%2] = colour (0=R,1=G,2=B) of each pixel of the 2x2 Bayer cell; for quad it is the colour of each 2x2 CLUSTER of the 4x4 tile.
+    let base = match ui.bayer_pattern {
+        0 => [0usize, 1, 1, 2],
+        1 => [1, 0, 2, 1],
+        2 => [1, 2, 0, 1],
+        3 => [2, 1, 1, 0],
+        _ => [0, 1, 1, 2],
+    };
+    // The head is the next ring row to be written; it is a tile boundary because it advances by `tile` each frame. Oldest data sits at `head`, newest just before it, so display top->bottom maps to oldest->newest.
+    let head_tile = (ui.header[crate::shared_memory::SLITSCAN_HEAD_IDX] as usize / tile) % tiles_t;
+    // Fit the (tiles_x wide x tiles_t tall) strip into the screen, letterboxed, preserving aspect.
+    let strip_aspect = tiles_x as f32 / tiles_t as f32;
+    let screen_aspect = sw as f32 / sh as f32;
+    let (fit_w, fit_h) = if strip_aspect > screen_aspect {
+        (sw, ((sw as f32) / strip_aspect) as usize)
+    } else {
+        (((sh as f32) * strip_aspect) as usize, sh)
+    };
+    let off_x = (sw - fit_w) / 2;
+    let off_y = (sh - fit_h) / 2;
+    let buf = ui.image_buffer;
+    for sy in 0..sh {
+        for sx in 0..sw {
+            let dst = (sy * stride + sx) * 3;
+            if sx < off_x || sx >= off_x + fit_w || sy < off_y || sy >= off_y + fit_h {
+                pixels[dst] = 0;
+                pixels[dst + 1] = 0;
+                pixels[dst + 2] = 0;
+                continue;
+            }
+            let tx = (sx - off_x) * tiles_x / fit_w;
+            let td = (sy - off_y) * tiles_t / fit_h; // 0 = oldest (top)
+            let src_t = (head_tile + td) % tiles_t;
+            let row0 = src_t * tile;
+            let col0 = tx * tile;
+            // Bin the tile to one RGB sample.
+            let mut r = 0f32;
+            let mut g = 0f32;
+            let mut b = 0f32;
+            let mut gn = 0f32;
+            for dy in 0..tile {
+                for dx in 0..tile {
+                    let v = (buf[(row0 + dy) * w + col0 + dx] as f32 - bk).max(0.);
+                    let c = if tile == 4 {
+                        base[(dy / 2) * 2 + dx / 2]
+                    } else {
+                        base[(dy % 2) * 2 + dx % 2]
+                    };
+                    match c {
+                        0 => r += v,
+                        2 => b += v,
+                        _ => {
+                            g += v;
+                            gn += 1.;
+                        }
+                    }
+                }
+            }
+            // R and B each come from one 2x2 cluster (quad: 4 px) or one pixel (standard: 1 px); G from the rest.
+            let cluster = if tile == 4 { 4. } else { 1. };
+            let (r, g, b) = (r / cluster, g / gn.max(1.), b / cluster);
+            let (lr, lg, lb) = apply_display_matrix(ui, r * scale, g * scale, b * scale);
+            pixels[dst] = (lr.max(0.).sqrt()) as u8;
+            pixels[dst + 1] = (lg.max(0.).sqrt()) as u8;
+            pixels[dst + 2] = (lb.max(0.).sqrt()) as u8;
+        }
+    }
+}
+
 pub fn draw_screen(ui: &mut UserInterface, window: &NativeWindow, mut full_draw: bool) {
     // Check for new image by comparing counters - determines full vs partial draw
     let current_image_counter = ui.header[IMAGE_COUNTER_IDX];
@@ -579,6 +664,15 @@ fn draw_camera_or_histogram(
     // Draw histogram if visible and available, otherwise draw image
     let draw_histogram = ui.histogram_visible && ui.histogram_buffer.load().is_some();
 
+    // Slitscan has its own preview: a fit-to-screen time-strip of the ring buffer, scrolled by the write head. It bypasses the slot-based camera path entirely.
+    if !draw_histogram
+        && RawMode::from(ui.header[crate::shared_memory::CURRENT_MODE_IDX] as u8)
+            == RawMode::Slitscan
+    {
+        draw_slitscan(ui, pixels, buffer);
+        return;
+    }
+
     if draw_histogram {
         let histogram_data = ui.histogram_buffer.load();
         if let Some(ref histogram) = **histogram_data {
@@ -697,7 +791,7 @@ fn draw_camera_or_histogram(
 
                     let idx = sensor_y * ui.sensor_x_size + sensor_x;
                     match current_mode {
-                        RawMode::Average => {
+                        RawMode::Average | RawMode::Slitscan => {
                             let last = ui.sensor_x_size * ui.sensor_y_size - 1;
                             // Black-level subtract, mirroring the fit-to-screen path EXACTLY so both clip indicators match: controls visible -> white-clip zeros over-threshold channels (-> dark/false colour) AND black-clip uses a WRAPPING sub so a pixel below black_level underflows to a huge u16 -> renders WHITE (the crushed-shadow indicator). Controls hidden -> saturating sub (no overlay).
                             let bk = ui.raw_black_level;
@@ -838,7 +932,7 @@ fn draw_camera_or_histogram(
 
                     // Get the raw values based on mode
                     let (tl, tr, bl, br) = match current_mode {
-                        RawMode::Average => (
+                        RawMode::Average | RawMode::Slitscan => (
                             raw_average[idx_base],
                             raw_average[idx_base + 1],
                             raw_average[idx_base + ui.sensor_x_size],
@@ -871,7 +965,7 @@ fn draw_camera_or_histogram(
 
                     // Apply clipping and black level adjustments based on mode
                     let (tl, tr, bl, br) = match current_mode {
-                        RawMode::Average => {
+                        RawMode::Average | RawMode::Slitscan => {
                             // Clipping overlay (controls visible): white-clip zeros over-threshold channels (-> dark/false colour), and black-clip uses a WRAPPING subtract so a pixel below black_level underflows to a huge value -> renders WHITE. That flash-white-on-crushed-shadow IS the black-clip indicator. Controls hidden: plain saturating subtract (no overlay).
                             if ui.controls_visible {
                                 (
@@ -1030,7 +1124,7 @@ fn draw_camera_or_histogram(
 
                     // Apply display scaling based on mode
                     let scale = match current_mode {
-                        RawMode::Average => {
+                        RawMode::Average | RawMode::Slitscan => {
                             ui.display_gain as f32 * (65536. / (65536. - ui.raw_black_level as f32))
                         }
                         RawMode::Difference | RawMode::Motion => ui.display_gain as f32,
