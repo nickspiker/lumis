@@ -116,6 +116,10 @@ pub const CAL_SHOW_RESULT_BIT: u64 = 1 << 7;
 // = verify not done yet (e.g. still writing).
 pub const CAL_VERIFY_OK_BIT: u64 = 1 << 8;
 pub const CAL_VERIFY_FAIL_BIT: u64 = 1 << 9;
+// Slitscan run/pause: the Bluetooth remote toggles this in slitscan mode. While set, the integrator freezes
+// the ring (no integration, no head advance) so the captured strip holds still to inspect/zoom/save; toggling
+// it off resumes capture from where it stopped. Cleared on entry to the mode so slitscan always starts running.
+pub const SLITSCAN_PAUSED_BIT: u64 = 1 << 10;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum RawMode {

@@ -1053,13 +1053,13 @@ impl CameraIntegrator {
             let off = (center + r) * w * 2 + x * 2;
             u16::from_le_bytes([frame_data[off], frame_data[off + 1]]) as u32
         };
-        // Entry: start the strip fresh - black ring, head at 0, and seed the accumulator with this frame as
-        // the live column's first frame (exactly as a completed column seeds the next, so the per-column
-        // frame_count divides the right number of frames). Restart the per-column exposure clock and consume
-        // this frame as the seed.
+        // First frame after (re-)entering slitscan: RESUME from wherever the ring left off. Do NOT clear the
+        // strip or reset the head - switching to another mode and back must preserve the captured strip (the
+        // whole point of the dedicated buffer; the ring just keeps rolling and overwrites the oldest columns in
+        // time). Only seed the live column from this frame and restart the per-column exposure clock (the gap
+        // spent in another mode must not instantly complete a column), and resume running.
         if !self.was_slitscan {
-            self.slitscan_buffer.fill(0);
-            self.header[SLITSCAN_HEAD_IDX] = 0;
+            self.header[FLAGS_IDX] &= !SLITSCAN_PAUSED_BIT; // re-entry resumes running
             if self.slitscan_accum.len() != strip_len {
                 self.slitscan_accum = vec![0u32; strip_len];
             }
@@ -1073,7 +1073,28 @@ impl CameraIntegrator {
             self.was_slitscan = true;
             return;
         }
-        if elapsed_ms >= self.exposure_time_ms || force_completion {
+        // Bluetooth remote (force_completion) toggles run/pause. Pausing freezes the ring as-is so the strip
+        // holds still to inspect/zoom/save; resuming re-seeds the live column from THIS frame (without clearing
+        // the captured strip) and restarts the per-column clock, so the long paused gap doesn't instantly
+        // complete a column.
+        if force_completion {
+            self.header[FLAGS_IDX] ^= SLITSCAN_PAUSED_BIT;
+            if (self.header[FLAGS_IDX] & SLITSCAN_PAUSED_BIT) == 0 {
+                for r in 0..period {
+                    for x in 0..w {
+                        self.slitscan_accum[r * w + x] = band_px(frame_data, r, x);
+                    }
+                }
+                self.exposure_start_time = Instant::now();
+                self.header[FRAME_COUNTER_IDX] = 0;
+            }
+            return;
+        }
+        // Paused: freeze - keep the ring and accumulator untouched.
+        if (self.header[FLAGS_IDX] & SLITSCAN_PAUSED_BIT) != 0 {
+            return;
+        }
+        if elapsed_ms >= self.exposure_time_ms {
             // Column complete: average (sum / frame_count) and scale to 16-bit EXACTLY like process_frame's
             // Average branch, write it at the head, advance, then seed the next column with this frame.
             let frame_count = self.header[FRAME_COUNTER_IDX].max(1);

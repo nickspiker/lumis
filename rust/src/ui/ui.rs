@@ -604,13 +604,21 @@ impl UserInterface {
             1 => self.time_base.clone().as_str().to_string(),
             2 => {
                 let current_mode = RawMode::from(self.header[CURRENT_MODE_IDX] as u8);
-                let mode_name = match current_mode {
-                    RawMode::Average => "AVERAGE",
-                    RawMode::Difference => "DIFFERENCE",
-                    RawMode::Motion => "MOTION",
-                    RawMode::Slitscan => "SLITSCAN",
-                };
-                mode_name.to_string()
+                // In slitscan the Bluetooth remote pauses capture; reflect that on the mode button so the
+                // frozen strip isn't mistaken for a stall.
+                if current_mode == RawMode::Slitscan
+                    && (self.header[FLAGS_IDX] & crate::shared_memory::SLITSCAN_PAUSED_BIT) != 0
+                {
+                    "STOPPED".to_string()
+                } else {
+                    match current_mode {
+                        RawMode::Average => "AVERAGE",
+                        RawMode::Difference => "DIFFERENCE",
+                        RawMode::Motion => "MOTION",
+                        RawMode::Slitscan => "SLITSCAN",
+                    }
+                    .to_string()
+                }
             }
             3 => "EXIT".to_string(),
             _ => "".to_string(),
@@ -656,8 +664,8 @@ impl UserInterface {
                     RawMode::Slitscan => RawMode::Average,
                 };
                 self.header[CURRENT_MODE_IDX] = next_mode as u64;
-                // Reset the slitscan write-head when entering/leaving the mode so the strip starts fresh.
-                self.header[crate::shared_memory::SLITSCAN_HEAD_IDX] = 0;
+                // Do NOT reset the slitscan write-head here: the dedicated ring persists across mode switches so
+                // the captured strip survives a trip through the other modes. Capture resumes where it left off.
             }
             3 => {
                 // Exit - clear continuous save and signal camera thread then kill the UserInterface process
