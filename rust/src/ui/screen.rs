@@ -128,10 +128,13 @@ pub fn draw_screen(ui: &mut UserInterface, window: &NativeWindow, mut full_draw:
 fn spawn_histogram_calculation(ui: &UserInterface, image_counter: u64) {
     ui.calculating_histogram.store(true, Ordering::Release);
 
-    // Clone the raw data directly from shared memory
+    // Clone the raw data directly from shared memory. The image buffer interleaves avg+diff PER slot:
+    // [slot0_avg, slot0_diff, slot1_avg, slot1_diff, ...], stride 2*pixel_count - so slot N's average is at
+    // (slot*2)*pixel_count (same as the live camera view + integrator). Using slot*pixel_count read the diff
+    // half / a neighbouring slot for slots 1-3, making the histogram jump around as the counter cycled 0..3.
     let current_slot = (image_counter & 3) as usize;
     let pixel_count = ui.sensor_x_size * ui.sensor_y_size;
-    let avg_offset = current_slot * pixel_count; // Left half is average
+    let avg_offset = (current_slot * 2) * pixel_count;
     let raw_data: Vec<u16> = ui.image_buffer[avg_offset..avg_offset + pixel_count].to_vec();
 
     // Clone only what the thread needs
