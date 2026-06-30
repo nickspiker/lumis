@@ -285,8 +285,12 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
        // Initialize sensors
        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
        gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
-       
-       // Initialize power management  
+
+       // Register the self-managed Telecom account once, so we can place the silent "I'm on a call" session
+       // that suppresses notification sound+vibration while Lumis is focused (see CallSilencer).
+       CallSilencer.register(this)
+
+       // Initialize power management
        powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
        wakeLock = powerManager.newWakeLock(
            PowerManager.PARTIAL_WAKE_LOCK or PowerManager.ON_AFTER_RELEASE,
@@ -489,10 +493,14 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
 
     override fun onResume() {
         super.onResume()
-        
+
         // Cancel auto-nuke timer if user returns quickly
         autoNukeHandler?.removeCallbacks(autoNukeRunnable)
         Log.i("UserInterface", "Focus regained - auto-nuke timer cancelled")
+
+        // Lumis is focused: place the silent self-managed call so the phone won't sound/vibrate for
+        // notifications while shooting (media unaffected). Released on pause / on process death.
+        CallSilencer.start(this)
         
         gravitySensor?.let {
             sensorManager.registerListener(gravityListener, it, SensorManager.SENSOR_DELAY_UI)
@@ -520,6 +528,10 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
     override fun onPause() {
         super.onPause()
         sensorManager.unregisterListener(gravityListener)
+        // End the silent call so normal alerting resumes the moment Lumis backgrounds (runs BEFORE the 2s
+        // auto-nuke timer started below, so the call is released before the process dies; Telecom would also
+        // auto-release it on death as a backstop).
+        CallSilencer.stop()
         renderLoopActive = false  // Stop render loop - UI will auto-nuke after 2 seconds
         
         // Start 2-second auto-nuke timer

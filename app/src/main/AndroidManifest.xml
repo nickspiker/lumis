@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Self-managed Telecom call ("I'm on a call, don't bother me") to silence notification sound+vibration while focused. Normal install-time permission, no runtime prompt. -->
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -62,6 +64,16 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="camera" />
+
+        <!-- Self-managed Telecom ConnectionService: Telecom binds to this when Lumis places its silent "call" to suppress notification alerts while focused. Runs in the main (UI) process (no android:process). Requires BIND_TELECOM_CONNECTION_SERVICE + the ConnectionService intent action. -->
+        <service
+            android:name=".LumisConnectionService"
+            android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.telecom.ConnectionService" />
+            </intent-filter>
+        </service>
 
     </application>
 
