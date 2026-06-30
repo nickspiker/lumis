@@ -173,7 +173,10 @@ pub extern "C" fn Java_com_lumis_camera_CameraInterface_nativeCameraInit(
     let pixel_count = (width * height) as usize;
     let raw_buffer_size_bytes = pixel_count * 16; // 2 u16 arrays, 4 bytes per pixel, quad rolling buffer
     let header_size_bytes = crate::shared_memory::IMAGE_START * 8; // header u64s
-    let total_size = header_size_bytes + raw_buffer_size_bytes;
+    // Slitscan ring lives in its own region after the slot buffer (isolated, never tramples a held stack).
+    // The Kotlin UI side recomputes the same value (UserInterface.kt) so both processes map the same size.
+    let slitscan_bytes = crate::shared_memory::slitscan_ring_bytes(width as usize);
+    let total_size = header_size_bytes + raw_buffer_size_bytes + slitscan_bytes;
 
     if crate::DEBUG {
         info!(

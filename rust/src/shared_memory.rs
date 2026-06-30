@@ -76,6 +76,19 @@ pub const SLITSCAN_HEAD_IDX: usize = 63;
 
 pub const IMAGE_START: usize = 64;
 
+/// Slitscan ring length in u16 elements: a width x (2*width) strip (2:1 aspect). The ring lives in its OWN
+/// region immediately after the 8 image_buffer planes, so the live slitscan capture never tramples a held
+/// Average/Difference/Motion stack (those share the slots; slitscan does not touch them).
+pub fn slitscan_ring_u16(width: usize) -> usize {
+    2 * width * width
+}
+
+/// Slitscan ring size in bytes, rounded up to the segment's 8-byte alignment. The Kotlin UI side recomputes
+/// the identical value (UserInterface.kt onCameraReady) so both processes map the same total segment size.
+pub fn slitscan_ring_bytes(width: usize) -> usize {
+    (slitscan_ring_u16(width) * 2 + 7) & !7
+}
+
 // Save format values (SAVE_FORMAT_IDX). Numbered to match the tap-cycle order JXL -> JPEG -> DNG -> TIFF, and JXL is 0 so it's the zero-initialized default.
 pub const SAVE_FORMAT_JPEGXL: u64 = 0;
 pub const SAVE_FORMAT_JPEG: u64 = 1;
@@ -390,6 +403,17 @@ impl SharedMemory {
         unsafe {
             let image_ptr = &mut mem[IMAGE_START] as *mut u64 as *mut u16;
             std::slice::from_raw_parts_mut(image_ptr, pixel_count * 8)
+        }
+    }
+
+    /// The slitscan ring: a width x (2*width) u16 region immediately AFTER the 8 image_buffer planes.
+    /// Isolated from the slots, so slitscan capture and a held Average/Difference/Motion stack never collide.
+    pub fn slitscan_buffer(&mut self, pixel_count: usize, width: usize) -> &mut [u16] {
+        let mem = self.as_slice();
+        unsafe {
+            let image_ptr = &mut mem[IMAGE_START] as *mut u64 as *mut u16;
+            let ring_ptr = image_ptr.add(pixel_count * 8);
+            std::slice::from_raw_parts_mut(ring_ptr, slitscan_ring_u16(width))
         }
     }
 }

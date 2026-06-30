@@ -154,6 +154,11 @@ pub struct CameraIntegrator {
     shared_memory: SharedMemory, // Keep SharedMemory alive
     pub header: &'static mut [u64],
     image_buffer: &'static mut [u16],
+    // Slitscan ring (width x 2*width), in its own segment region after image_buffer. Written per-frame in
+    // RawMode::Slitscan; never touched by the slot/accumulate path, so a held stack survives a trip into the
+    // strip and back. `was_slitscan` tracks the previous frame's mode so the ring is zeroed once on entry.
+    slitscan_buffer: &'static mut [u16],
+    was_slitscan: bool,
     pub magic_9_display: &'static mut [f32; 9],
     pub magic_9_display_gamma: &'static mut f32,
     pub magic_9_dng_xyz: &'static mut [f32; 9],
@@ -233,6 +238,11 @@ impl CameraIntegrator {
                 shared_memory.image_buffer(pixel_count),
             )
         };
+        let slitscan_buffer = unsafe {
+            std::mem::transmute::<&mut [u16], &'static mut [u16]>(
+                shared_memory.slitscan_buffer(pixel_count, width),
+            )
+        };
 
         // Initialize shared memory header
         header[IMAGE_COUNTER_IDX] = 0;
@@ -303,6 +313,8 @@ impl CameraIntegrator {
             shared_memory,
             header,
             image_buffer,
+            slitscan_buffer,
+            was_slitscan: false,
             magic_9_display,
             magic_9_display_gamma,
             magic_9_dng_xyz,
@@ -455,6 +467,8 @@ impl CameraIntegrator {
                 f64::from_bits(self.header[FOCUS_IDX]) as f32,
             );
         }
+        // Past here is a non-slitscan frame: clear the entry latch so re-entering slitscan zeroes the ring.
+        self.was_slitscan = false;
 
         if elapsed_ms >= self.exposure_time_ms || force_completion {
             // Exposure complete - write to SharedMemory
@@ -567,7 +581,7 @@ impl CameraIntegrator {
             // native frame.
             let is_slitscan = current_mode == 3;
             let (save_width, save_height) = if is_slitscan {
-                let rr = (2 * self.width).min(self.image_buffer.len() / self.width.max(1));
+                let rr = self.slitscan_buffer.len() / self.width.max(1);
                 (self.width, rr)
             } else {
                 (self.width, self.height)
@@ -778,7 +792,7 @@ impl CameraIntegrator {
                 let mut v = vec![0u16; w * rr];
                 for d in 0..rr {
                     let src = (head + d) % rr;
-                    v[d * w..d * w + w].copy_from_slice(&self.image_buffer[src * w..src * w + w]);
+                    v[d * w..d * w + w].copy_from_slice(&self.slitscan_buffer[src * w..src * w + w]);
                 }
                 v
             } else {
@@ -1010,19 +1024,26 @@ impl CameraIntegrator {
     }
 
     /// One frame of a slitscan capture: copy a Bayer-period-tall slice from the frame CENTRE into the ring
-    /// (carved from the shared image_buffer) and advance the write-head. The ring is width x (2*width) - a
-    /// 2:1 strip - with the head wrapping to overwrite the oldest slice, no data shuffling. The slice scales
+    /// (in the dedicated slitscan_buffer region) and advance the write-head. The ring is width x (2*width) -
+    /// a 2:1 strip - with the head wrapping to overwrite the oldest slice, no data shuffling. The slice scales
     /// raw -> 16-bit exactly like the normal average path, so the existing demosaic/preview/save read it at
-    /// the same scale.
+    /// the same scale. The ring is isolated from the slots, so it never disturbs a held Average/Difference/
+    /// Motion stack.
     fn process_slitscan_frame(&mut self, frame_data: &[u8]) {
         let w = self.width;
         let h = self.height;
+        // First frame after entering slitscan: zero the ring so the strip starts black instead of scrolling
+        // in stale slices from a previous slitscan session (the head is also reset to 0 by the UI on entry).
+        if !self.was_slitscan {
+            self.slitscan_buffer.fill(0);
+            self.header[SLITSCAN_HEAD_IDX] = 0;
+            self.was_slitscan = true;
+        }
         // Slice height = one full Bayer period so the assembled strip stays a valid demosaicable raw image
         // (4 rows for the quad 4x4 Tetracell, 2 for standard Bayer).
         let period = if self.header[QUAD_BAYER_IDX] != 0 { 4 } else { 2 };
-        // Time axis = 2x the slit length (width) for a 2:1 strip, bounded by the shared buffer it lives in
-        // (the ring can't exceed image_buffer; for any real sensor w <= 4h so this is exactly 2*w).
-        let ring_rows = (2 * w).min(self.image_buffer.len() / w.max(1));
+        // Time axis = the ring's own height: slitscan_buffer is exactly width x (2*width), so this is 2*w.
+        let ring_rows = self.slitscan_buffer.len() / w.max(1);
         if ring_rows == 0 || frame_data.len() < h * w * 2 {
             return;
         }
@@ -1037,13 +1058,13 @@ impl CameraIntegrator {
             }
             let dst_row = (head + r) % ring_rows;
             let src_off = src_row * w * 2; // bytes into frame_data
-            let dst_off = dst_row * w; // u16 index into the ring (image_buffer)
+            let dst_off = dst_row * w; // u16 index into the ring
             for x in 0..w {
                 let pixel = u16::from_le_bytes([
                     frame_data[src_off + x * 2],
                     frame_data[src_off + x * 2 + 1],
                 ]) as u32;
-                self.image_buffer[dst_off + x] = ((pixel << 16) / white).min(65535) as u16;
+                self.slitscan_buffer[dst_off + x] = ((pixel << 16) / white).min(65535) as u16;
             }
         }
         head = (head + period) % ring_rows;

@@ -384,11 +384,14 @@ class UserInterface : Activity(), SurfaceHolder.Callback {
        val height = surfaceView.holder.surfaceFrame.height()
        val density = resources.displayMetrics.densityDpi
        
-       // Calculate SharedMemory size - SAME calculation as camera integrator
+       // Calculate SharedMemory size - SAME calculation as camera integrator (jni_camera.rs + shared_memory.rs)
        val pixelCount = cameraWidth * cameraHeight
        val rawBufferSizeBytes = pixelCount * 16  // 2 u16 arrays, 4 bytes per pixel, quad rolling buffer
        val headerSizeBytes = 64 * 8  // IMAGE_START (64 u64s) * 8 bytes - must match jni_camera.rs
-       val sharedMemorySize = (headerSizeBytes + rawBufferSizeBytes).toLong()
+       // Slitscan ring: width x (2*width) u16 region after the slot buffer, 8-byte aligned. Must match
+       // shared_memory.rs slitscan_ring_bytes(width) exactly so both processes map the same segment size.
+       val slitscanRingBytes = ((2 * cameraWidth * cameraWidth * 2) + 7) and 7.inv()
+       val sharedMemorySize = (headerSizeBytes + rawBufferSizeBytes + slitscanRingBytes).toLong()
        
        Log.i("UserInterface", "UI dimensions: ${width}x${height} @ ${density}dpi, SharedMemory size: $sharedMemorySize")
        

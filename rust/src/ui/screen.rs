@@ -30,7 +30,7 @@ fn draw_slitscan(ui: &UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_B
     let w = ui.sensor_x_size;
     let bk = ui.raw_black_level as f32;
     let scale = ui.display_gain as f32 * (65536. / (65536. - bk));
-    let ring_rows = (2 * w).min(ui.image_buffer.len() / w.max(1));
+    let ring_rows = ui.slitscan_buffer.len() / w.max(1);
     // Bin to whole Bayer (2) or quad (4) tiles so a binned cell is full colour, not grey.
     let tile = if ui.header[crate::shared_memory::QUAD_BAYER_IDX] != 0 { 4 } else { 2 };
     let tiles_x = w / tile;
@@ -58,7 +58,7 @@ fn draw_slitscan(ui: &UserInterface, pixels: &mut [u8], buffer: &ANativeWindow_B
     };
     let off_x = (sw - fit_w) / 2;
     let off_y = (sh - fit_h) / 2;
-    let buf = ui.image_buffer;
+    let buf = ui.slitscan_buffer;
     for sy in 0..sh {
         for sx in 0..sw {
             let dst = (sy * stride + sx) * 3;

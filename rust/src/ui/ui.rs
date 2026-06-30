@@ -183,6 +183,9 @@ pub struct UserInterface {
     // Shared memory access - direct slices like camera integrator
     pub header: &'static mut [u64],   // Mutable for writing settings
     pub image_buffer: &'static [u16], // Read-only for reading image data
+    // Slitscan ring (width x 2*width), read-only view of the dedicated region after image_buffer. Only the
+    // slitscan preview/save read it; in other modes it is simply untouched.
+    pub slitscan_buffer: &'static [u16],
     pub magic_9_display: &'static mut [f32; 9],
     pub magic_9_display_gamma: &'static mut f32,
     pub magic_9_dng_xyz: &'static mut [f32; 9],
@@ -284,6 +287,13 @@ impl UserInterface {
             std::slice::from_raw_parts(
                 shared_memory_ptr.add(IMAGE_START * 8) as *const u16,
                 pixel_count * 8, // quad rolling buffer: 4 slots * 2 arrays per slot
+            )
+        };
+        // Slitscan ring: the width x (2*width) region right after the 8 image_buffer planes. Read-only view.
+        let slitscan_buffer = unsafe {
+            std::slice::from_raw_parts(
+                shared_memory_ptr.add(IMAGE_START * 8 + pixel_count * 16) as *const u16,
+                crate::shared_memory::slitscan_ring_u16(sensor_width),
             )
         };
 
@@ -554,6 +564,7 @@ impl UserInterface {
             slider_thickness: 0.0,
             header,
             image_buffer,
+            slitscan_buffer,
             magic_9_display,
             magic_9_display_gamma,
             magic_9_dng_xyz,
