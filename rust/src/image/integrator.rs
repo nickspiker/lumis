@@ -163,6 +163,9 @@ pub struct CameraIntegrator {
     // the set exposure time exactly like a normal Average exposure, then averages + scales into the ring and
     // advances the head. Keeps slitscan's frame_count / effective-ISO metadata identical to the other modes.
     slitscan_accum: Vec<u32>,
+    // Count of completed full ring rotations (the head wrapping back to 0). Continuous-save in slitscan fires
+    // once per rotation off this, instead of once per column like the per-column image counter.
+    slitscan_rotations: u64,
     pub magic_9_display: &'static mut [f32; 9],
     pub magic_9_display_gamma: &'static mut f32,
     pub magic_9_dng_xyz: &'static mut [f32; 9],
@@ -320,6 +323,7 @@ impl CameraIntegrator {
             slitscan_buffer,
             was_slitscan: false,
             slitscan_accum: Vec::new(),
+            slitscan_rotations: 0,
             magic_9_display,
             magic_9_display_gamma,
             magic_9_dng_xyz,
@@ -556,13 +560,21 @@ impl CameraIntegrator {
         let continuous_save = (flags & CONTINUOUS_SAVE_BIT) != 0;
         let already_saving = (flags & CURRENTLY_SAVING) != 0;
 
+        // Continuous-save cadence is "a new image". In slitscan IMAGE_COUNTER ticks every COLUMN (so the
+        // preview scrolls), which would fire a save thousands of times per ring; gate slitscan continuous-save
+        // on the full-rotation counter instead, so it saves one complete strip per ring rotation.
+        let trigger_counter = if self.header[CURRENT_MODE_IDX] as u8 == RawMode::Slitscan as u8 {
+            self.slitscan_rotations
+        } else {
+            self.header[IMAGE_COUNTER_IDX]
+        };
+
         if !already_saving
-            && ((continuous_save && (self.last_saved_counter != self.header[IMAGE_COUNTER_IDX]))
-                || manual_save)
+            && ((continuous_save && (self.last_saved_counter != trigger_counter)) || manual_save)
         {
             // Set the CURRENTLY_SAVING flag immediately to prevent duplicate saves
             self.header[FLAGS_IDX] |= CURRENTLY_SAVING;
-            self.last_saved_counter = self.header[IMAGE_COUNTER_IDX];
+            self.last_saved_counter = trigger_counter;
             log::info!("Save requested");
             let current_slot = (self.header[IMAGE_COUNTER_IDX] & 3) as usize;
             let current_mode = self.header[CURRENT_MODE_IDX] as u8;
@@ -1108,7 +1120,12 @@ impl CameraIntegrator {
                     self.slitscan_accum[r * w + x] = band_px(frame_data, r, x); // seed next column
                 }
             }
-            self.header[SLITSCAN_HEAD_IDX] = ((head + period) % ring_rows) as u64;
+            let new_head = (head + period) % ring_rows;
+            self.header[SLITSCAN_HEAD_IDX] = new_head as u64;
+            // A full ring rotation completes each time the head wraps back to 0; continuous-save keys off this.
+            if new_head == 0 {
+                self.slitscan_rotations += 1;
+            }
             self.exposure_start_time = Instant::now();
             self.header[FRAME_COUNTER_IDX] = 0;
             // Bump the image counter so the UI does a full redraw and picks up the new column.
