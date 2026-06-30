@@ -240,18 +240,44 @@ pub fn draw_screen(ui: &mut UserInterface, window: &NativeWindow, mut full_draw:
 fn spawn_histogram_calculation(ui: &UserInterface, image_counter: u64) {
     ui.calculating_histogram.store(true, Ordering::Release);
 
-    // Clone the raw data directly from shared memory. The image buffer interleaves avg+diff PER slot:
-    // [slot0_avg, slot0_diff, slot1_avg, slot1_diff, ...], stride 2*pixel_count - so slot N's average is at
-    // (slot*2)*pixel_count (same as the live camera view + integrator). Using slot*pixel_count read the diff
-    // half / a neighbouring slot for slots 1-3, making the histogram jump around as the counter cycled 0..3.
-    let current_slot = (image_counter & 3) as usize;
-    let pixel_count = ui.sensor_x_size * ui.sensor_y_size;
-    let avg_offset = (current_slot * 2) * pixel_count;
-    let raw_data: Vec<u16> = ui.image_buffer[avg_offset..avg_offset + pixel_count].to_vec();
-
-    // Clone only what the thread needs
-    let width = ui.sensor_x_size as usize;
-    let height = ui.sensor_y_size as usize;
+    // Histogram the SAME data the screen shows, so it tracks the current view. The image buffer interleaves
+    // avg+diff PER slot: [slot0_avg, slot0_diff, slot1_avg, slot1_diff, ...], stride 2*pixel_count - so slot
+    // N's average is at (slot*2)*pixel_count and its diff at (slot*2+1)*pixel_count (same as the live camera
+    // view + integrator). (Using slot*pixel_count read the diff half / a neighbouring slot for slots 1-3,
+    // making the histogram jump around as the counter cycled 0..3.) Per mode: Average -> avg plane, Difference
+    // -> diff plane, Motion -> the same per-pixel diff/avg the display computes, Slitscan -> its own ring
+    // (the slots are stale in slitscan since it never writes them).
+    let current_mode = RawMode::from(ui.header[crate::shared_memory::CURRENT_MODE_IDX] as u8);
+    let (raw_data, width, height): (Vec<u16>, usize, usize) = match current_mode {
+        RawMode::Slitscan => {
+            let w = ui.sensor_x_size;
+            let rows = ui.slitscan_buffer.len() / w.max(1);
+            (ui.slitscan_buffer.to_vec(), w, rows)
+        }
+        _ => {
+            let current_slot = (image_counter & 3) as usize;
+            let pc = ui.sensor_x_size * ui.sensor_y_size;
+            let avg_off = (current_slot * 2) * pc;
+            let diff_off = (current_slot * 2 + 1) * pc;
+            let data: Vec<u16> = match current_mode {
+                RawMode::Difference => ui.image_buffer[diff_off..diff_off + pc].to_vec(),
+                RawMode::Motion => {
+                    // Match the display: motion = (diff << 16) / (avg - black), per pixel.
+                    let black = ui.raw_black_level as u32;
+                    let avg = &ui.image_buffer[avg_off..avg_off + pc];
+                    let diff = &ui.image_buffer[diff_off..diff_off + pc];
+                    (0..pc)
+                        .map(|i| {
+                            let corrected = (avg[i] as u32).max(black + 1) - black;
+                            (((diff[i] as u32) << 16) / corrected).min(65535) as u16
+                        })
+                        .collect()
+                }
+                _ => ui.image_buffer[avg_off..avg_off + pc].to_vec(), // Average
+            };
+            (data, ui.sensor_x_size, ui.sensor_y_size)
+        }
+    };
     let black_level = ui.raw_black_level;
     let bayer_pattern = ui.bayer_pattern;
     let screen_width = ui.screen_run as usize;
