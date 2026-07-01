@@ -72,7 +72,7 @@ pub fn debayer_to_rgb8(
     (out_w, out_h, rgb)
 }
 
-/// RCD-demosaic the full frame, colour-correct, and sqrt-encode to 8-bit RGB, honouring sensor orientation. Same interface as [debayer_to_rgb8] but with the higher-quality RCD demosaic (used for saved RGB exports — the 2x2 block path stays for the live preview's speed).
+/// RCD-demosaic the full frame, colour-correct, and sqrt-encode to 8-bit RGB in NATIVE sensor orientation. Rotation is not baked into the pixels; it is carried by the container's Orientation/EXIF tag (see encode_jpeg / encode_jpegxl). Used for saved JPEG/JPEG XL exports; the live preview uses the faster 2x2-block path.
 pub fn rcd_to_rgb8(
     raw: &[u16],
     width: usize,
@@ -80,7 +80,6 @@ pub fn rcd_to_rgb8(
     black_level: u16,
     bayer_pattern: u32,
     matrix: &[f32; 9],
-    orientation: u16,
     gain: f32,
 ) -> (usize, usize, Vec<u8>) {
     use crate::debayer::region::rcd_region;
@@ -101,38 +100,23 @@ pub fn rcd_to_rgb8(
         bayer_pattern,
     );
 
-    let (out_w, out_h) = match orientation {
-        90 | 270 => (height, width),
-        _ => (width, height),
-    };
-    let mut rgb = vec![0u8; out_w * out_h * 3];
-    for oy in 0..out_h {
-        for ox in 0..out_w {
-            let (sx, sy) = match orientation {
-                90 => (oy, out_w - 1 - ox),
-                180 => (width - 1 - ox, height - 1 - oy),
-                270 => (height - 1 - oy, ox),
-                _ => (ox, oy),
-            };
-            if sx >= width || sy >= height {
-                continue;
-            }
-            let px = demosaiced[sy * width + sx];
-            let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
-            let lr = matrix[0] * r + matrix[1] * g + matrix[2] * b;
-            let lg = matrix[3] * r + matrix[4] * g + matrix[5] * b;
-            let lb = matrix[6] * r + matrix[7] * g + matrix[8] * b;
-            let o = (oy * out_w + ox) * 3;
-            // sqrt then cast to u8. No clamps: `as u8` saturates (>255 -> 255), and a negative matrix result -> sqrt = NaN -> 0 (black), which is the desired output. Verified equivalent to max(0)/min(255) over all f32.
-            rgb[o] = lr.sqrt() as u8;
-            rgb[o + 1] = lg.sqrt() as u8;
-            rgb[o + 2] = lb.sqrt() as u8;
-        }
+    let mut rgb = vec![0u8; width * height * 3];
+    for i in 0..width * height {
+        let px = demosaiced[i];
+        let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
+        let lr = matrix[0] * r + matrix[1] * g + matrix[2] * b;
+        let lg = matrix[3] * r + matrix[4] * g + matrix[5] * b;
+        let lb = matrix[6] * r + matrix[7] * g + matrix[8] * b;
+        let o = i * 3;
+        // sqrt then cast to u8. No clamps: `as u8` saturates (>255 -> 255), and a negative matrix result -> sqrt = NaN -> 0 (black), which is the desired output. Verified equivalent to max(0)/min(255) over all f32.
+        rgb[o] = lr.sqrt() as u8;
+        rgb[o + 1] = lg.sqrt() as u8;
+        rgb[o + 2] = lb.sqrt() as u8;
     }
-    (out_w, out_h, rgb)
+    (width, height, rgb)
 }
 
-/// Quad-Bayer (Tetracell, max-res 50MP) demosaic to colour-corrected sqrt-encoded 8-bit RGB, honouring orientation. Same interface as [rcd_to_rgb8] but for the 4x4 quad-Bayer CFA. See [crate::debayer::quad].
+/// Quad-Bayer (Tetracell, max-res 50MP) demosaic to colour-corrected sqrt-encoded 8-bit RGB in NATIVE sensor orientation (rotation carried by the container's Orientation/EXIF tag, not baked into the pixels). The 4x4 quad-Bayer sibling of [rcd_to_rgb8]. See [crate::debayer::quad].
 pub fn quad_to_rgb8(
     raw: &[u16],
     width: usize,
@@ -140,7 +124,6 @@ pub fn quad_to_rgb8(
     black_level: u16,
     bayer_pattern: u32,
     matrix: &[f32; 9],
-    orientation: u16,
     gain: f32,
 ) -> (usize, usize, Vec<u8>) {
     use crate::debayer::quad::quad_demosaic;
@@ -158,35 +141,20 @@ pub fn quad_to_rgb8(
         bayer_pattern,
     );
 
-    let (out_w, out_h) = match orientation {
-        90 | 270 => (height, width),
-        _ => (width, height),
-    };
-    let mut rgb = vec![0u8; out_w * out_h * 3];
-    for oy in 0..out_h {
-        for ox in 0..out_w {
-            let (sx, sy) = match orientation {
-                90 => (oy, out_w - 1 - ox),
-                180 => (width - 1 - ox, height - 1 - oy),
-                270 => (height - 1 - oy, ox),
-                _ => (ox, oy),
-            };
-            if sx >= width || sy >= height {
-                continue;
-            }
-            let px = demosaiced[sy * width + sx];
-            let (r, g, b) = (px[0], px[1], px[2]);
-            let lr = matrix[0] * r + matrix[1] * g + matrix[2] * b;
-            let lg = matrix[3] * r + matrix[4] * g + matrix[5] * b;
-            let lb = matrix[6] * r + matrix[7] * g + matrix[8] * b;
-            let o = (oy * out_w + ox) * 3;
-            // sqrt then cast to u8. No clamps: `as u8` saturates (>255 -> 255), and a negative matrix result -> sqrt = NaN -> 0 (black), which is the desired output. Verified equivalent to max(0)/min(255) over all f32.
-            rgb[o] = lr.sqrt() as u8;
-            rgb[o + 1] = lg.sqrt() as u8;
-            rgb[o + 2] = lb.sqrt() as u8;
-        }
+    let mut rgb = vec![0u8; width * height * 3];
+    for i in 0..width * height {
+        let px = demosaiced[i];
+        let (r, g, b) = (px[0], px[1], px[2]);
+        let lr = matrix[0] * r + matrix[1] * g + matrix[2] * b;
+        let lg = matrix[3] * r + matrix[4] * g + matrix[5] * b;
+        let lb = matrix[6] * r + matrix[7] * g + matrix[8] * b;
+        let o = i * 3;
+        // sqrt then cast to u8. No clamps: `as u8` saturates (>255 -> 255), and a negative matrix result -> sqrt = NaN -> 0 (black), which is the desired output. Verified equivalent to max(0)/min(255) over all f32.
+        rgb[o] = lr.sqrt() as u8;
+        rgb[o + 1] = lg.sqrt() as u8;
+        rgb[o + 2] = lb.sqrt() as u8;
     }
-    (out_w, out_h, rgb)
+    (width, height, rgb)
 }
 
 /// Quantize one sqrt-encoded f32 sample (already scaled to the 0..65535 16-bit range) to u16 with
@@ -205,8 +173,9 @@ fn dither16(target: f32, acc: &mut f32) -> u16 {
 }
 
 /// RCD-demosaic the full frame, colour-correct, and sqrt-encode to 16-bit RGB with error-diffusion dither,
-/// honouring sensor orientation. The 16-bit sibling of [rcd_to_rgb8] (used for the lossless 16-bit TIFF
-/// export): same sqrt (gamma 2) transfer scaled to fill 16-bit, with per-channel, per-row dithering.
+/// in NATIVE sensor orientation (rotation carried by the TIFF Orientation tag, not baked into the pixels).
+/// The 16-bit sibling of [rcd_to_rgb8] (used for the lossless 16-bit TIFF export): same sqrt (gamma 2)
+/// transfer scaled to fill 16-bit, with per-channel, per-row dithering.
 pub fn rcd_to_rgb16(
     raw: &[u16],
     width: usize,
@@ -214,7 +183,6 @@ pub fn rcd_to_rgb16(
     black_level: u16,
     bayer_pattern: u32,
     matrix: &[f32; 9],
-    orientation: u16,
     gain: f32,
 ) -> (usize, usize, Vec<u16>) {
     use crate::debayer::region::rcd_region;
@@ -224,42 +192,30 @@ pub fn rcd_to_rgb16(
         raw, width, height, 0, 0, width, height, black_level, scale, bayer_pattern,
     );
 
-    let (out_w, out_h) = match orientation {
-        90 | 270 => (height, width),
-        _ => (width, height),
-    };
-    let mut rgb = vec![0u16; out_w * out_h * 3];
-    for oy in 0..out_h {
+    let mut rgb = vec![0u16; width * height * 3];
+    for y in 0..height {
         // Per-row, per-channel dither accumulator: 1D error diffusion along the scanline, reset each row so
-        // the carried error never streaks vertically.
+        // the carried error never streaks vertically. Native rows are the sensor scanlines.
         let mut acc = [0f32; 3];
-        for ox in 0..out_w {
-            let (sx, sy) = match orientation {
-                90 => (oy, out_w - 1 - ox),
-                180 => (width - 1 - ox, height - 1 - oy),
-                270 => (height - 1 - oy, ox),
-                _ => (ox, oy),
-            };
-            if sx >= width || sy >= height {
-                continue;
-            }
-            let px = demosaiced[sy * width + sx];
+        for x in 0..width {
+            let px = demosaiced[y * width + x];
             let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
             let lr = matrix[0] * r + matrix[1] * g + matrix[2] * b;
             let lg = matrix[3] * r + matrix[4] * g + matrix[5] * b;
             let lb = matrix[6] * r + matrix[7] * g + matrix[8] * b;
-            let o = (oy * out_w + ox) * 3;
+            let o = (y * width + x) * 3;
             // sqrt (gamma 2) then *256 to fill 16-bit (sqrt is 0..256 for a 0..65536 linear value).
             rgb[o] = dither16(lr.sqrt() * 256.0, &mut acc[0]);
             rgb[o + 1] = dither16(lg.sqrt() * 256.0, &mut acc[1]);
             rgb[o + 2] = dither16(lb.sqrt() * 256.0, &mut acc[2]);
         }
     }
-    (out_w, out_h, rgb)
+    (width, height, rgb)
 }
 
 /// Quad-Bayer (Tetracell, max-res 50MP) demosaic to colour-corrected sqrt-encoded 16-bit RGB with
-/// error-diffusion dither, honouring orientation. The 16-bit sibling of [quad_to_rgb8].
+/// error-diffusion dither, in NATIVE sensor orientation (rotation carried by the TIFF Orientation tag, not
+/// baked into the pixels). The 16-bit sibling of [quad_to_rgb8].
 pub fn quad_to_rgb16(
     raw: &[u16],
     width: usize,
@@ -267,42 +223,28 @@ pub fn quad_to_rgb16(
     black_level: u16,
     bayer_pattern: u32,
     matrix: &[f32; 9],
-    orientation: u16,
     gain: f32,
 ) -> (usize, usize, Vec<u16>) {
     use crate::debayer::quad::quad_demosaic;
 
     let demosaiced = quad_demosaic(raw, width, height, black_level, 65535, 65536.0 * gain, bayer_pattern);
 
-    let (out_w, out_h) = match orientation {
-        90 | 270 => (height, width),
-        _ => (width, height),
-    };
-    let mut rgb = vec![0u16; out_w * out_h * 3];
-    for oy in 0..out_h {
+    let mut rgb = vec![0u16; width * height * 3];
+    for y in 0..height {
         let mut acc = [0f32; 3];
-        for ox in 0..out_w {
-            let (sx, sy) = match orientation {
-                90 => (oy, out_w - 1 - ox),
-                180 => (width - 1 - ox, height - 1 - oy),
-                270 => (height - 1 - oy, ox),
-                _ => (ox, oy),
-            };
-            if sx >= width || sy >= height {
-                continue;
-            }
-            let px = demosaiced[sy * width + sx];
+        for x in 0..width {
+            let px = demosaiced[y * width + x];
             let (r, g, b) = (px[0], px[1], px[2]);
             let lr = matrix[0] * r + matrix[1] * g + matrix[2] * b;
             let lg = matrix[3] * r + matrix[4] * g + matrix[5] * b;
             let lb = matrix[6] * r + matrix[7] * g + matrix[8] * b;
-            let o = (oy * out_w + ox) * 3;
+            let o = (y * width + x) * 3;
             rgb[o] = dither16(lr.sqrt() * 256.0, &mut acc[0]);
             rgb[o + 1] = dither16(lg.sqrt() * 256.0, &mut acc[1]);
             rgb[o + 2] = dither16(lb.sqrt() * 256.0, &mut acc[2]);
         }
     }
-    (out_w, out_h, rgb)
+    (width, height, rgb)
 }
 
 /// Encode RGB8 to JPEG bytes (quality 95), tagged with the Rec.2020 ICC profile (APP2 marker).
@@ -393,6 +335,11 @@ pub fn encode_tiff16(
             .new_image_with_compression::<RGB16, _>(width, height, Deflate::default())
             .ok()?;
         image.encoder().write_tag(Tag::Unknown(34675), rec2020_icc()).ok()?;
+        // Orientation (0x0112): the samples are written in native sensor orientation, so this tag is how a
+        // viewer knows to rotate them for display. 1=normal/3=180/6=90 CW/8=90 CCW; 0 = omit (unknown).
+        if exif.orientation != 0 {
+            image.encoder().write_tag(Tag::Unknown(0x0112), exif.orientation).ok()?;
+        }
         if !description.is_empty() {
             image.encoder().write_tag(Tag::Unknown(270), description).ok()?;
         }
@@ -431,7 +378,7 @@ pub fn encode_tiff16(
     }
     // The thumbnail builder is 8-bit; down-convert the high byte of each 16-bit sample for it.
     let rgb8: Vec<u8> = rgb16.iter().map(|&v| (v >> 8) as u8).collect();
-    match embed_tiff_thumbnail(tiff.clone(), &rgb8, width, height) {
+    match embed_tiff_thumbnail(tiff.clone(), &rgb8, width, height, exif.orientation) {
         Some(with_thumb) => Some(with_thumb),
         None => Some(tiff),
     }
@@ -478,12 +425,13 @@ fn embed_tiff_gps(mut tiff: Vec<u8>, exif: &crate::image::dng::ExifData) -> Opti
     Some(tiff)
 }
 
-/// Downscale a u8 RGB image so the longest side is <= `target`, preserving aspect, and JPEG-encode it (quality 85). Returns (JPEG bytes, thumb_width, thumb_height) or None on failure.
+/// Downscale a u8 RGB image so the longest side is <= `target`, preserving aspect, bake in the device rotation (`orient_deg` = 0/90/180/270; 90/270 swap the returned dims), and JPEG-encode it (quality 85). Returns (JPEG bytes, thumb_width, thumb_height) or None on failure.
 fn build_tiff_thumbnail(
     rgb: &[u8],
     width: u32,
     height: u32,
     target: u32,
+    orient_deg: u16,
 ) -> Option<(Vec<u8>, u32, u32)> {
     if width == 0 || height == 0 {
         return None;
@@ -524,11 +472,14 @@ fn build_tiff_thumbnail(
             }
         }
     }
+    // Bake the device rotation into the downscaled thumbnail (matches the DNG preview convention). 90/270
+    // swap the dimensions; the caller writes these rotated dims into IFD1's ImageWidth/ImageLength.
+    let (ftw, fth, small) = crate::image::thumbnail::rotate_rgb8(&small, tw, th, orient_deg);
     let mut out = Cursor::new(Vec::new());
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
-    enc.encode(&small, tw as u32, th as u32, image::ColorType::Rgb8)
+    enc.encode(&small, ftw as u32, fth as u32, image::ColorType::Rgb8)
         .ok()?;
-    Some((out.into_inner(), tw as u32, th as u32))
+    Some((out.into_inner(), ftw as u32, fth as u32))
 }
 
 /// Post-process the crate's single-IFD TIFF: append a thumbnail JPEG and a chained IFD1, then patch IFD0's next-IFD pointer to it. Returns the augmented TIFF, or None if the thumbnail could not be generated or the header didn't match the expected little-endian classic-TIFF layout.
@@ -537,9 +488,18 @@ fn embed_tiff_thumbnail(
     rgb: &[u8],
     width: u32,
     height: u32,
+    orientation_exif: u16,
 ) -> Option<Vec<u8>> {
+    // The main image is stored native (rotation lives in IFD0's Orientation tag), but the thumbnail is baked
+    // upright so file-manager icons that ignore the tag still show it the right way up. EXIF value -> degrees.
+    let orient_deg: u16 = match orientation_exif {
+        6 => 90,
+        3 => 180,
+        8 => 270,
+        _ => 0,
+    };
     // Thumbnail: max 512px longest side, JPEG quality 85.
-    let (jpeg, tw, th) = build_tiff_thumbnail(rgb, width, height, 512)?;
+    let (jpeg, tw, th) = build_tiff_thumbnail(rgb, width, height, 512, orient_deg)?;
 
     // Parse the classic-TIFF header: "II" (little-endian), magic 0x2A, then a u32 offset to IFD0. We only support the little-endian layout the `tiff` crate emits.
     if tiff.len() < 8 || &tiff[0..2] != b"II" {
@@ -583,13 +543,14 @@ fn embed_tiff_thumbnail(
     // The chained IFD1 (thumbnail) starts here.
     let ifd1_offset = tiff.len() as u32;
     // TIFF tags (LE): tag(2) type(2) count(4) value/offset(4). Types: 3=SHORT, 4=LONG.
-    let entries: [(u16, u16, u32, u32); 8] = [
+    let entries: [(u16, u16, u32, u32); 9] = [
         (254, 4, 1, 1),                 // NewSubfileType = 1 (reduced-resolution / thumbnail)
         (256, 4, 1, tw),                // ImageWidth
         (257, 4, 1, th),                // ImageLength
         (258, 3, 1, 8),                 // BitsPerSample = 8
         (259, 3, 1, 7),                 // Compression = 7 (JPEG)
         (262, 3, 1, 6),                 // PhotometricInterpretation = 6 (YCbCr, JPEG)
+        (274, 3, 1, 1),                 // Orientation = 1 (thumbnail baked upright; must not re-rotate)
         (513, 4, 1, jpeg_offset),       // JPEGInterchangeFormat (offset to JPEG)
         (514, 4, 1, jpeg.len() as u32), // JPEGInterchangeFormatLength
     ];
@@ -622,14 +583,23 @@ pub fn encode_jpegxl(
     use zune_jpegxl::JxlSimpleEncoder;
 
     let opts = EncoderOptions::new(width, height, ColorSpace::RGB, BitDepth::Eight);
-    // Lumis fork of zune-jpegxl: signal Rec.2020 in the codestream's ColourEncoding so the wide-gamut output is interpreted correctly (upstream hardcodes sRGB).
-    let encoder = JxlSimpleEncoder::new(rgb, opts).set_rec2020(true);
+    // Lumis fork of zune-jpegxl: signal Rec.2020 in the codestream's ColourEncoding so the wide-gamut output
+    // is interpreted correctly (upstream hardcodes sRGB), and carry the orientation in the codestream image
+    // metadata. The pixels stay native; JXL decoders apply the codestream orientation on display. (set_orientation clamps 0/out-of-range to 1 = identity.)
+    let encoder = JxlSimpleEncoder::new(rgb, opts)
+        .set_rec2020(true)
+        .set_orientation(exif.orientation as u32);
     let mut codestream: Vec<u8> = Vec::new();
     encoder.encode(&mut codestream).ok()?;
 
     // The encoder emits a RAW JXL codestream (starts FF 0A), which can't hold metadata. To embed EXIF we
     // wrap it in the ISOBMFF box container. If there's no EXIF, return the raw codestream unchanged.
-    let exif_block = crate::image::dng::build_exif_block(exif);
+    // JXL decoders treat the codestream orientation as authoritative and IGNORE EXIF orientation, so the
+    // rotation is carried by set_orientation above; reset the embedded EXIF box's Orientation to 1 (normal)
+    // so a tool reading the box can't apply a second, conflicting rotation (per the JXL Exif guidance).
+    let mut exif_for_box = exif.clone();
+    exif_for_box.orientation = 1;
+    let exif_block = crate::image::dng::build_exif_block(&exif_for_box);
     if exif_block.is_empty() {
         return Some(codestream);
     }

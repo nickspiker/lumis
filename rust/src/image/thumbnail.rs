@@ -8,7 +8,7 @@
 
 use std::io::Cursor;
 
-/// Build an embedded-preview JPEG from a raw Bayer/quad-Bayer frame. `target` is the max thumbnail dimension (longest side). `quad` selects 4x4 quad-Bayer binning vs standard 2x2. `matrix` is the camera->Rec.2020 3x3 (row-major). Returns (JPEG bytes, width, height), or None on encode failure.
+/// Build an embedded-preview JPEG from a raw Bayer/quad-Bayer frame. `target` is the max thumbnail dimension (longest side). `quad` selects 4x4 quad-Bayer binning vs standard 2x2. `matrix` is the camera->Rec.2020 3x3 (row-major). `orientation` is the device rotation in degrees (0/90/180/270), baked into the preview pixels so file-manager icons/thumbnailers that ignore the DNG Orientation tag still show it upright. Returns (JPEG bytes, width, height), or None on encode failure.
 pub fn build_preview_jpeg(
     raw: &[u16],
     width: usize,
@@ -19,6 +19,7 @@ pub fn build_preview_jpeg(
     matrix: &[f32; 9],
     target: usize,
     gain: f32,
+    orientation: u16,
 ) -> Option<(Vec<u8>, u32, u32)> {
     // --- 1. Bin to half-res linear RGB (no demosaic) ---
     // Quad: one RGB pixel per 4x4 tile (R/B = one cluster, G = mean of the two G clusters).
@@ -75,17 +76,47 @@ pub fn build_preview_jpeg(
         }
     }
 
-    // The preview is left in NATIVE sensor orientation (not rotated). The DNG's IFD0 Orientation tag
-    // applies to BOTH the raw and this SubIFD preview, so rotating the preview here too would make
-    // tag-honouring viewers rotate it twice (the crop/black-extension bug). Native preview + the correct
-    // Orientation tag = consistent for every viewer (upright if it honours the tag, sideways if not, but
-    // never doubled). The raw can't be rotated anyway (breaks the CFA), so the tag is the only mechanism.
-    // --- 6. JPEG encode ---
+    // --- 6. Bake the device rotation into the preview pixels ---
+    // The raw CFA can't be rotated (it would scramble the Bayer grid), so the DNG records the device
+    // rotation as IFD0's Orientation tag and raw developers rotate the developed image to match. But an
+    // embedded preview is just a JPEG: OS thumbnailers / file-manager icons draw it directly and many of
+    // them ignore the DNG Orientation tag, so a native-orientation preview shows up sideways as the file
+    // icon even though the developed raw is upright (the reported bug). So we bake the rotation into the
+    // preview pixels here, and mark the preview's OWN SubIFD Orientation = 1 (normal) in dng.rs so a
+    // tag-honouring viewer won't rotate this already-upright preview a second time (the earlier
+    // double-rotation / crop-black bug came from rotating the pixels while leaving the tag non-normal).
+    let (fw, fh, rgb8) = rotate_rgb8(&rgb8, tw, th, orientation);
+
+    // --- 7. JPEG encode ---
     let mut out = Cursor::new(Vec::new());
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
-    enc.encode(&rgb8, tw as u32, th as u32, image::ColorType::Rgb8)
+    enc.encode(&rgb8, fw as u32, fh as u32, image::ColorType::Rgb8)
         .ok()?;
-    Some((out.into_inner(), tw as u32, th as u32))
+    Some((out.into_inner(), fw as u32, fh as u32))
+}
+
+/// Rotate a packed RGB8 buffer to bake the device orientation into the pixels. `orientation` is the device rotation in degrees (0/90/180/270); 90/270 swap width and height. The mapping matches the EXIF Orientation the DNG writer records (90->6 rotate 90 CW, 180->3, 270->8 rotate 90 CCW), so the baked preview lands the same way up as a raw developer renders the file. Each branch is a bijection over the output rectangle, so every source index is in range without a bounds guard. Returns (out_w, out_h, rotated). Shared with the TIFF thumbnail path (save_encode).
+pub(crate) fn rotate_rgb8(src: &[u8], width: usize, height: usize, orientation: u16) -> (usize, usize, Vec<u8>) {
+    let (out_w, out_h) = match orientation {
+        90 | 270 => (height, width),
+        _ => (width, height),
+    };
+    let mut out = vec![0u8; out_w * out_h * 3];
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            // Map each upright output pixel back to its native-orientation source pixel.
+            let (sx, sy) = match orientation {
+                90 => (oy, height - 1 - ox),
+                180 => (width - 1 - ox, height - 1 - oy),
+                270 => (width - 1 - oy, ox),
+                _ => (ox, oy),
+            };
+            let s = (sy * width + sx) * 3;
+            let o = (oy * out_w + ox) * 3;
+            out[o..o + 3].copy_from_slice(&src[s..s + 3]);
+        }
+    }
+    (out_w, out_h, out)
 }
 
 /// Quad-Bayer -> half(quarter)-res linear RGB. One RGB pixel per 4x4 tile: each 2x2 cluster sums to its channel; the two green clusters are averaged. Black-subtracted, no gain (auto-white handles exposure later).

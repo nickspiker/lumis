@@ -17,6 +17,10 @@ pub struct ExifData {
     pub gps_alt: f64,              // metres (signed)
     pub image_width: u32,          // for ExifImageWidth/Height (0 = omit)
     pub image_height: u32,
+    /// TIFF/EXIF Orientation (0x0112) value: 1=normal, 3=180, 6=90 CW, 8=90 CCW. 0 = omit the tag. This is
+    /// an IFD0 tag (not an EXIF-subIFD tag), so build_exif_block writes it into the block's IFD0; the DNG
+    /// writer sets its own IFD0 Orientation from RawInfo instead and ignores this field.
+    pub orientation: u16,
 }
 
 // One EXIF IFD entry: (tag, type, count, inline_value, optional out-of-line payload). SHORT/UNDEFINED
@@ -179,11 +183,20 @@ pub fn build_exif_block(exif: &ExifData) -> Vec<u8> {
     // ExifIFD (0x8769) and GPS IFD (0x8825) pointers - all in strict ascending tag-id order. The pointer
     // value fields are patched once those sub-IFDs are written. 72/1 dpi, inch units, centered YCbCr.
     let res72 = || -> Vec<u8> { let mut b = 72u32.to_le_bytes().to_vec(); b.extend(1u32.to_le_bytes()); b };
-    // 4 fixed IFD0 tags (XRes, YRes, ResUnit, YCbCrPos) + the ExifIFD/GPS pointers when present.
+    // 4 fixed IFD0 tags (XRes, YRes, ResUnit, YCbCrPos) + optional Orientation + the ExifIFD/GPS pointers.
+    let write_orientation = exif.orientation != 0;
     let mut ifd0_count = 4u16;
+    if write_orientation { ifd0_count += 1; }
     if !exif_entries.is_empty() { ifd0_count += 1; }
     if !gps_entries.is_empty() { ifd0_count += 1; }
     out.extend(ifd0_count.to_le_bytes());
+    // Orientation (0x0112) SHORT, inline. Must be the first IFD0 entry (lowest tag id, before XResolution).
+    // 1=normal, 3=180, 6=90 CW, 8=90 CCW. The image samples stay in native sensor orientation; this tag is
+    // how a viewer knows to rotate them for display.
+    if write_orientation {
+        out.extend([0x12, 0x01, 3, 0, 1, 0, 0, 0]);
+        out.extend((exif.orientation as u32).to_le_bytes());
+    }
     // XResolution (0x011A) / YResolution (0x011B) RATIONAL (out-of-line, patched).
     out.extend([0x1A, 0x01, 5, 0, 1, 0, 0, 0]);
     let xres_pos = out.len(); out.extend([0, 0, 0, 0]);
@@ -702,13 +715,18 @@ pub fn make_base_dng(rawinfo: &mut RawInfo) -> Vec<u8> {
 
         // Build the preview sub-IFD. TIFF tags (LE): tag(2) type(2) count(4) value/offset(4). Types: 3=SHORT, 4=LONG.
         let (pw, ph) = rawinfo.preview_dims;
-        let entries: [(u16, u16, u32, u32); 8] = [
+        let entries: [(u16, u16, u32, u32); 9] = [
             (254, 4, 1, 1),                 // NewSubfileType = 1 (reduced-resolution / preview)
             (256, 4, 1, pw),                // ImageWidth
             (257, 4, 1, ph),                // ImageLength
             (258, 3, 1, 8),                 // BitsPerSample = 8
             (259, 3, 1, 7),                 // Compression = 7 (JPEG)
             (262, 3, 1, 6),                 // PhotometricInterpretation = 6 (YCbCr, JPEG)
+            // Orientation = 1 (normal). The preview pixels are already rotated upright by the preview
+            // builder (build_preview_jpeg bakes in the device rotation), so this preview must NOT inherit
+            // IFD0's non-normal Orientation - a tag-honouring viewer would otherwise rotate it a second
+            // time. pw/ph above are the post-rotation dimensions to match.
+            (274, 3, 1, 1),                 // Orientation = 1 (normal / already upright)
             (513, 4, 1, jpeg_offset),       // JPEGInterchangeFormat (offset to JPEG)
             (514, 4, 1, jpeg.len() as u32), // JPEGInterchangeFormatLength
         ];

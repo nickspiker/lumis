@@ -689,6 +689,15 @@ impl CameraIntegrator {
                 gps_alt: f64::from_bits(self.header[GPS_ALT_IDX]),
                 image_width: save_width as u32,
                 image_height: save_height as u32,
+                // TIFF/EXIF Orientation for the JPEG/TIFF/JXL writers (the DNG sets its own from RawInfo).
+                // Device rotation degrees -> EXIF value: 90->6 (90 CW), 180->3, 270->8 (90 CCW), else normal.
+                // The exported samples stay in native sensor orientation; this tag is how viewers rotate them.
+                orientation: match device_orientation {
+                    90 => 6,
+                    180 => 3,
+                    270 => 8,
+                    _ => 1,
+                },
             };
             // XYZ matrix for RGB exports, and the magic9inv bytes for the DNG ColorMatrix1. magic_9_dng_xyz lives in zero-initialized shared memory and is only populated by a calibration scan. Pre-calibration it is all zeros, which would multiply every exported pixel to black; fall back to identity so uncalibrated RGB exports show the raw debayered scene (accuracy doesn't matter until calibrated anyway).
             let xyz_matrix = {
@@ -899,6 +908,7 @@ impl CameraIntegrator {
                             &display_matrix,
                             1024,
                             display_gain as f32,
+                            orient_deg,
                         ) {
                             Some((bytes, pw, ph)) => (Some(bytes), (pw, ph)),
                             None => (None, (0, 0)),
@@ -992,12 +1002,12 @@ impl CameraIntegrator {
                         let (ow, oh, rgb16) = if raw10 {
                             quad_to_rgb16(
                                 avg, width, height, image_black_level, bayer_pattern,
-                                &display_matrix, orient_deg, display_gain as f32,
+                                &display_matrix, display_gain as f32,
                             )
                         } else {
                             rcd_to_rgb16(
                                 avg, width, height, image_black_level, bayer_pattern,
-                                &display_matrix, orient_deg, display_gain as f32,
+                                &display_matrix, display_gain as f32,
                             )
                         };
                         encode_tiff16(&rgb16, ow as u32, oh as u32, &exposure_desc, &exif).map(|b| (b, "tiff"))
@@ -1005,12 +1015,12 @@ impl CameraIntegrator {
                         let (ow, oh, rgb) = if raw10 {
                             quad_to_rgb8(
                                 avg, width, height, image_black_level, bayer_pattern,
-                                &display_matrix, orient_deg, display_gain as f32,
+                                &display_matrix, display_gain as f32,
                             )
                         } else {
                             rcd_to_rgb8(
                                 avg, width, height, image_black_level, bayer_pattern,
-                                &display_matrix, orient_deg, display_gain as f32,
+                                &display_matrix, display_gain as f32,
                             )
                         };
                         match save_format {
